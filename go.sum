@@ -1,2 +1,4 @@
 github.com/bool64/dev v0.2.43 h1:yQ7qiZVef6WtCl2vDYU0Y+qSq+0aBrQzY8KXkklk9cQ=
 github.com/bool64/dev v0.2.43/go.mod h1:iJbh1y/HkunEPhgebWRNcs8wfGq7sjvJ6W5iabL8ACg=
+github.com/bool64/progress v0.3.20 h1:JB92cp6VbVyqJBX1A8zyCxlTtJeP1ntdcDvqB4GYjOw=
+github.com/bool64/progress v0.3.20/go.mod h1:RDA6eCBncCZnQ26pLuEKcRTKVdj0we0sMmX1nPz4G+Y=
