@@ -5,9 +5,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	_ "github.com/bool64/progress"
 	"github.com/vearutop/gocacheprogd/internal/cacheprog"
-	"github.com/vearutop/gocacheprogd/internal/disk"
+	"github.com/vearutop/gocacheprogd/internal/local"
 	"io"
 	"log"
 	"os"
@@ -60,7 +59,7 @@ func run() error {
 
 	resps := make(chan cacheprog.Response, 100)
 
-	dc, err := disk.NewCache(*dir, resps)
+	dc, err := local.NewProxy(*dir, resps)
 	if err != nil {
 		return fmt.Errorf("new cache: %w", err)
 	}
@@ -75,16 +74,6 @@ func run() error {
 	if err := je.Encode(&cacheprog.Response{KnownCommands: []cacheprog.Cmd{cacheprog.CmdPut, cacheprog.CmdGet, cacheprog.CmdClose}}); err != nil {
 		return fmt.Errorf("encode known commands: %w", err)
 	}
-
-	//pr := &progress.Progress{
-	//	Interval: 5 * time.Second,
-	//	Print: func(status progress.Status) {
-	//		println(progress.DefaultStatus(status))
-	//	},
-	//}
-	//
-	//pr.AddMetrics()
-	//pr.Start()
 
 	go func() {
 		for {
@@ -150,20 +139,7 @@ func run() error {
 				}
 			}
 
-			diskPath, err := dc.Put(req.ActionID, req.OutputID, req.BodySize, body)
-			if err != nil {
-				return fmt.Errorf("put: %w", err)
-			}
-
-			res := cacheprog.Response{ID: req.ID}
-			res.DiskPath = diskPath
-			res.OutputID = req.OutputID
-			res.Size = req.BodySize
-
-			now := time.Now().UTC()
-			res.Time = &now
-
-			resps <- res
+			resps <- dc.Put(req, body)
 		}
 	}
 
@@ -171,6 +147,8 @@ func run() error {
 		return fmt.Errorf("close cache: %w", err)
 	}
 	close(resps)
+
+	dc.PrintStats()
 
 	return nil
 }
