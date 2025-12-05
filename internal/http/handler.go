@@ -21,6 +21,12 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == "/preload" {
+		println("preload")
+		h.Preload(rw, r)
+		return
+	}
+
 	if r.URL.Path == "/put" {
 		//println("put")
 		h.Put(rw, r)

@@ -27,6 +27,8 @@ func run() error {
 	dir := flag.String("cache-dir", "", "cache directory; empty means automatic")
 	dumpLogs := flag.String("dump-log", "", "dump req/resp logs to file")
 	remoteURL := flag.String("remote-url", "", "remote HTTP server cache source, e.g. https://example.com:8080")
+	preload := flag.Bool("preload", false, "preload cache from remote server")
+	preloadSize := flag.Int64("preload-size", 1000000, "preload cache from remote server fo items up to this size")
 
 	flag.Parse()
 
@@ -87,6 +89,18 @@ func run() error {
 
 	if err := je.Encode(&cacheprog.Response{KnownCommands: []cacheprog.Cmd{cacheprog.CmdPut, cacheprog.CmdGet, cacheprog.CmdClose}}); err != nil {
 		return fmt.Errorf("encode known commands: %w", err)
+	}
+
+	if *preload {
+		st := time.Now()
+		println("preloading cache up to", *preloadSize, "bytes per item from remote server ...")
+		if err := dc.Preload(cache.PreloadRequest{
+			MaxSize: *preloadSize,
+		}); err != nil {
+			return fmt.Errorf("preload cache: %w", err)
+		}
+
+		println("preload done in", time.Since(st).String())
 	}
 
 	go func() {

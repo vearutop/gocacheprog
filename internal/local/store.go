@@ -97,14 +97,16 @@ func (dc *Store) getOne(actionID string) cache.ResponseItem {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	res := cache.ResponseItem{ActionID: actionID}
-
 	ie, ok := dc.index[actionID]
 	if !ok {
-		res.Miss = true
-
-		return res
+		return cache.ResponseItem{ActionID: actionID, Miss: true}
 	}
+
+	return dc.responseItem(actionID, ie)
+}
+
+func (dc *Store) responseItem(actionID string, ie indexEntry) cache.ResponseItem {
+	res := cache.ResponseItem{ActionID: actionID}
 
 	res.OutputID = ie.OutputID
 	res.Size = ie.Size
@@ -183,4 +185,28 @@ func (dc *Store) Close() error {
 
 func (dc *Store) OutputFilename(outputID string) string {
 	return filepath.Join(dc.dir, strings.ReplaceAll(outputID, "/", "_"))
+}
+
+func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
+	var res []cache.ResponseItem
+
+	if req.MaxSize == 0 {
+		req.MaxSize = 600_000
+	}
+
+	dc.mu.Lock()
+	for k, v := range dc.index {
+		if v.Size > req.MaxSize {
+			continue
+		}
+
+		res = append(res, dc.responseItem(k, v))
+	}
+	dc.mu.Unlock()
+
+	for _, item := range res {
+		cb(item)
+	}
+
+	return nil
 }

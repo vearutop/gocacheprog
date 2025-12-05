@@ -166,6 +166,40 @@ func (dc *Proxy) consumePut() {
 	}
 }
 
+func (dc *Proxy) Preload(req cache.PreloadRequest) error {
+	if dc.upstream == nil {
+		return fmt.Errorf("upstream is not set")
+	}
+
+	p, ok := dc.upstream.(cache.Preloader)
+	if !ok {
+		return fmt.Errorf("upstream is not preloader")
+	}
+
+	return p.Preload(req, func(resp cache.ResponseItem) {
+		br, err := resp.UncompressedBodyReader()
+		if err != nil {
+			log.Printf("prepare uncompressed body %v: %s", resp, err.Error())
+			return
+		}
+
+		var b []byte
+		if br != nil {
+			defer br.Close()
+
+			b, err = io.ReadAll(br)
+			if err != nil {
+				log.Printf("read uncompressed body %v: %s", resp, err.Error())
+				return
+			}
+		}
+
+		if err := dc.putRespItem(resp, b); err != nil {
+			log.Printf("put resp item: %s", err.Error())
+		}
+	})
+}
+
 func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 	atomic.AddInt64(&dc.batches, 1)
 
@@ -259,6 +293,20 @@ func (dc *Proxy) PrintStats() {
 		"puts:", atomic.LoadInt64(&dc.puts))
 }
 
+func (dc *Proxy) putRespItem(item cache.ResponseItem, body []byte) error {
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	})
+
+	if err := dc.disk.Put(cache.Response{
+		Items: []cache.ResponseItem{item},
+	}); err != nil {
+		return fmt.Errorf("write file: %s", err.Error())
+	}
+
+	return nil
+}
+
 func (dc *Proxy) putOne(req cacheprog.Request, body []byte) cacheprog.Response {
 	atomic.AddInt64(&dc.puts, 1)
 
@@ -268,13 +316,7 @@ func (dc *Proxy) putOne(req cacheprog.Request, body []byte) cacheprog.Response {
 		Size:     req.BodySize,
 	}
 
-	item.SetBodyReader(func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
-	})
-
-	if err := dc.disk.Put(cache.Response{
-		Items: []cache.ResponseItem{item},
-	}); err != nil {
+	if err := dc.putRespItem(item, body); err != nil {
 		return cacheprog.Response{
 			ID:  req.ID,
 			Err: fmt.Sprintf("write file: %s", err.Error()),

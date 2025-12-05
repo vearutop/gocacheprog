@@ -8,7 +8,9 @@ import (
 	"log"
 	http2 "net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 )
 
 func main() {
@@ -46,6 +48,18 @@ func run() error {
 	defer store.Close()
 
 	h := http.NewHandler(store)
+
+	// Channel to listen for OS signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		<-stop
+		println("Shutting down ...")
+		store.Close()
+
+		os.Exit(0)
+	}()
 
 	log.Printf("Listening on %s ...", *listen)
 	if err := http2.ListenAndServe(*listen, h); err != nil {

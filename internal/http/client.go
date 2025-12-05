@@ -41,6 +41,45 @@ func NewClient(baseURL string) (*Client, error) {
 	return &Client{baseURL: baseURL}, nil
 }
 
+func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
+	j, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	r, err := http.NewRequest(http.MethodPost, c.baseURL+"/preload", bytes.NewReader(j))
+	if err != nil {
+		return err
+	}
+	r.Header.Set("Content-Type", "application/json")
+
+	res, err := http.DefaultTransport.RoundTrip(r)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	var resp cache.Response
+
+	_, err = resp.ReaderFrom(res.Body, func(item cache.ResponseItem, body io.Reader) error {
+		if item.Size != 0 {
+			if body == nil {
+				return fmt.Errorf("empty body, item: %v", item)
+			}
+
+			item.SetBodyReader(func() (io.ReadCloser, error) {
+				return io.NopCloser(body), nil
+			})
+		}
+
+		cb(item)
+
+		return nil
+	})
+
+	return err
+}
+
 func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
 	j, err := json.Marshal(req)
 	if err != nil {

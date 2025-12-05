@@ -18,6 +18,10 @@ type Store interface {
 	Put(values Response) error
 }
 
+type Preloader interface {
+	Preload(req PreloadRequest, cb func(resp ResponseItem)) error
+}
+
 type ResponseItem struct {
 	ActionID     string     `json:",omitempty"`
 	Miss         bool       `json:",omitempty"` // cache miss
@@ -37,6 +41,10 @@ type Response struct {
 
 type Request struct {
 	ActionIDs []string `json:",omitempty"`
+}
+
+type PreloadRequest struct {
+	MaxSize int64 `json:",omitempty"`
 }
 
 func (ri *ResponseItem) SetBodyReader(bodyReader func() (io.ReadCloser, error)) {
