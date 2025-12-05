@@ -7,18 +7,10 @@ import (
 	"github.com/vearutop/gocacheprogd/internal/cacheprog"
 	"io"
 	"log"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-// indexEntry is the metadata that Proxy stores on disk for an ActionID.
-type indexEntry struct {
-	OutputID  string `json:"o"`
-	Size      int64  `json:"n"`
-	TimeMicro int64  `json:"t"`
-}
 
 type Proxy struct {
 	Verbose bool
@@ -32,18 +24,20 @@ type Proxy struct {
 	resps  chan cacheprog.Response
 	put    chan cacheprog.Request
 
-	batches int64
-	lookups int64
-	hits    int64
-	misses  int64
-	puts    int64
+	batches   int64
+	lookups   int64
+	hits      int64
+	misses    int64
+	puts      int64
+	batchPuts int64
 }
 
-func NewProxy(dir string, resps chan cacheprog.Response) (*Proxy, error) {
+func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response) (*Proxy, error) {
 	c := &Proxy{
-		resps:  resps,
-		lookup: make(chan cacheprog.Request, 1000),
-		put:    make(chan cacheprog.Request, 1000),
+		resps:    resps,
+		lookup:   make(chan cacheprog.Request, 1000),
+		put:      make(chan cacheprog.Request, 1000),
+		upstream: upstream,
 	}
 
 	disk, err := NewStore(dir)
@@ -82,8 +76,9 @@ func (dc *Proxy) Lookup(req cacheprog.Request) {
 }
 
 const (
-	batchBarrierTick = 50 * time.Millisecond
-	batchBarrierSize = 100
+	batchBarrierTick  = 50 * time.Millisecond
+	batchBarrierItems = 100  // Number of items to flush the queue.
+	batchBarrierSize  = 10e7 // Total size of items to flush the queue.
 )
 
 func (dc *Proxy) resolve() {
@@ -106,7 +101,7 @@ func (dc *Proxy) resolve() {
 			resp := dc.Get(req)
 			if resp.Miss {
 				batch = append(batch, req)
-				if len(batch) >= batchBarrierSize {
+				if len(batch) >= batchBarrierItems {
 					dc.resolveBatch(batch)
 					batch = batch[:0]
 				}
@@ -127,7 +122,8 @@ func (dc *Proxy) resolve() {
 func (dc *Proxy) consumePut() {
 	defer dc.wg.Done()
 
-	puts := make([]cache.ResponseItem, 0, batchBarrierSize)
+	puts := make([]cache.ResponseItem, 0, batchBarrierItems)
+	sumSize := 0
 
 	for req := range dc.put {
 		resp := dc.Get(req)
@@ -139,19 +135,22 @@ func (dc *Proxy) consumePut() {
 		item.WireSize = resp.Size
 		item.Time = resp.Time
 		item.IsCompressed = false
-		item.SetBodyReader(func() io.ReadCloser {
-			f, err := os.Open(resp.DiskPath)
-			if err != nil {
-				return nil
-			}
+		item.DiskPath = resp.DiskPath
 
-			return f
-		})
+		if req.Body != nil {
+			item.SetBodyReader(func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(req.Body)), nil
+			})
+		}
 
 		puts = append(puts, item)
+		sumSize += int(item.Size)
 
-		if len(puts) >= batchBarrierSize {
+		if len(puts) >= batchBarrierItems || sumSize >= batchBarrierSize {
+			sumSize = 0
 			if dc.upstream != nil {
+				atomic.AddInt64(&dc.batchPuts, 1)
+
 				if err := dc.upstream.Put(cache.Response{Items: puts}); err != nil {
 					dc.logf("upstream put failed: %s", err.Error())
 				}
@@ -162,7 +161,7 @@ func (dc *Proxy) consumePut() {
 
 	if len(puts) > 0 && dc.upstream != nil {
 		if err := dc.upstream.Put(cache.Response{Items: puts}); err != nil {
-			dc.logf("upstream put failed: %s", err.Error())
+			dc.logf("upstream final put failed: %s", err.Error())
 		}
 	}
 }
@@ -173,35 +172,63 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 	if dc.upstream != nil {
 		m := make(map[string]cacheprog.Response, len(batch))
 		r := cache.Request{ActionIDs: make([]string, 0, len(batch))}
+		reqs := map[string]cacheprog.Request{}
 
 		for _, req := range batch {
 			m[req.ActionID] = cacheprog.Response{ID: req.ID, Miss: true}
 			r.ActionIDs = append(r.ActionIDs, req.ActionID)
+			reqs[req.ActionID] = req
 		}
 
-		resp, err := dc.upstream.Get(r)
+		err := dc.upstream.Get(r, func(resp cache.ResponseItem) {
+			rs := m[resp.ActionID]
+			defer func() {
+				dc.resps <- rs
+			}()
+
+			if resp.Miss {
+				rs.Miss = true
+
+				atomic.AddInt64(&dc.misses, 1)
+				return
+			}
+
+			br, err := resp.UncompressedBodyReader()
+			if err != nil {
+				rs.Err = err.Error()
+				return
+			}
+
+			var b []byte
+			if br != nil {
+				defer br.Close()
+
+				b, err = io.ReadAll(br)
+				if err != nil {
+					dc.logf("read item uncompressed body %v: %s", resp, err.Error())
+
+					rs.Err = err.Error()
+					return
+				}
+			}
+
+			atomic.AddInt64(&dc.hits, 1)
+
+			rs = dc.putOne(reqs[resp.ActionID], b)
+		})
 		if err != nil {
 			dc.logf("upstream get failed: %s", err.Error())
 		}
 
-		for _, res := range resp.Items {
-			r := m[res.ActionID]
-			r.Miss = res.Miss
-			r.OutputID = res.OutputID
-			r.Size = res.Size
-			r.Time = res.Time
-			r.DiskPath = res.DiskPath
+		return
+	}
 
-			dc.resps <- r
-		}
-	} else {
-		for _, req := range batch {
-			atomic.AddInt64(&dc.misses, 1)
+	for _, req := range batch {
+		atomic.AddInt64(&dc.misses, 1)
 
-			dc.resps <- cacheprog.Response{
-				ID:   req.ID,
-				Miss: true,
-			}
+		dc.resps <- cacheprog.Response{
+			ID:   req.ID,
+			Miss: true,
 		}
 	}
 }
@@ -216,18 +243,23 @@ func (dc *Proxy) Get(req cacheprog.Request) cacheprog.Response {
 	resp.DiskPath = rs.DiskPath
 	resp.Miss = rs.Miss
 
+	if rs.Size > 0 && rs.DiskPath == "" {
+		log.Printf("disk path is empty for %s", req.ActionID)
+	}
+
 	return resp
 }
 
 func (dc *Proxy) PrintStats() {
-	println("batches:", atomic.LoadInt64(&dc.batches), ""+
+	println("batchGets:", atomic.LoadInt64(&dc.batches),
+		"batchPuts:", atomic.LoadInt64(&dc.batchPuts),
 		"lookups:", atomic.LoadInt64(&dc.lookups),
 		"hits:", atomic.LoadInt64(&dc.hits),
 		"misses:", atomic.LoadInt64(&dc.misses),
 		"puts:", atomic.LoadInt64(&dc.puts))
 }
 
-func (dc *Proxy) Put(req cacheprog.Request, body []byte) cacheprog.Response {
+func (dc *Proxy) putOne(req cacheprog.Request, body []byte) cacheprog.Response {
 	atomic.AddInt64(&dc.puts, 1)
 
 	item := cache.ResponseItem{
@@ -236,21 +268,30 @@ func (dc *Proxy) Put(req cacheprog.Request, body []byte) cacheprog.Response {
 		Size:     req.BodySize,
 	}
 
-	item.SetBodyReader(func() io.ReadCloser {
-		return io.NopCloser(bytes.NewReader(body))
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
 	})
-
-	resp := cacheprog.Response{
-		ID: req.ID,
-	}
 
 	if err := dc.disk.Put(cache.Response{
 		Items: []cache.ResponseItem{item},
 	}); err != nil {
-		resp.Err = fmt.Sprintf("write file: %s", err.Error())
+		return cacheprog.Response{
+			ID:  req.ID,
+			Err: fmt.Sprintf("write file: %s", err.Error()),
+		}
+	}
+
+	return dc.Get(req)
+}
+
+func (dc *Proxy) Put(req cacheprog.Request, body []byte) cacheprog.Response {
+	resp := dc.putOne(req, body)
+
+	if len(body) < 1e5 {
+		req.Body = body
 	}
 
 	dc.put <- req
 
-	return dc.Get(req)
+	return resp
 }

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/vearutop/gocacheprogd/internal/cache"
 	"github.com/vearutop/gocacheprogd/internal/cacheprog"
+	"github.com/vearutop/gocacheprogd/internal/http"
 	"github.com/vearutop/gocacheprogd/internal/local"
 	"io"
 	"log"
@@ -24,6 +26,7 @@ func main() {
 func run() error {
 	dir := flag.String("cache-dir", "", "cache directory; empty means automatic")
 	dumpLogs := flag.String("dump-log", "", "dump req/resp logs to file")
+	remoteURL := flag.String("remote-url", "", "remote HTTP server cache source, e.g. https://example.com:8080")
 
 	flag.Parse()
 
@@ -43,8 +46,12 @@ func run() error {
 
 	println("starting at dir", *dir)
 
-	var mu sync.Mutex
-	var logDump io.Writer
+	var (
+		mu       sync.Mutex
+		logDump  io.Writer
+		upstream cache.Store
+		err      error
+	)
 
 	if *dumpLogs != "" {
 		f, err := os.Create(*dumpLogs)
@@ -59,7 +66,14 @@ func run() error {
 
 	resps := make(chan cacheprog.Response, 100)
 
-	dc, err := local.NewProxy(*dir, resps)
+	if *remoteURL != "" {
+		upstream, err = http.NewClient(*remoteURL)
+		if err != nil {
+			return fmt.Errorf("remote client: %w", err)
+		}
+	}
+
+	dc, err := local.NewProxy(*dir, upstream, resps)
 	if err != nil {
 		return fmt.Errorf("new cache: %w", err)
 	}

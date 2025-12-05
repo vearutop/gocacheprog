@@ -13,33 +13,74 @@ import (
 )
 
 type Store struct {
-	Dir string
+	dir string
 
 	mu    sync.Mutex
 	index map[string]indexEntry
 }
 
+// indexEntry is the metadata that Store stores on disk for an ActionID.
+type indexEntry struct {
+	OutputID  string `json:"o"`
+	Size      int64  `json:"n"`
+	TimeMicro int64  `json:"t"`
+}
+
 func NewStore(dir string) (*Store, error) {
+	dir, err := toAbsPath(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	dc := &Store{
-		Dir:   dir,
+		dir:   dir,
 		index: make(map[string]indexEntry),
 	}
 
-	d, err := os.ReadFile(filepath.Join(dir, "index.json"))
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
+	indexPath := filepath.Join(dir, "index.json")
+	d, err := os.ReadFile(indexPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return dc, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", indexPath, err)
 	}
 
 	err = json.Unmarshal(d, &dc.index)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unmarshal %s: %w", indexPath, err)
 	}
 
 	return dc, nil
 }
 
-func (dc *Store) Get(req cache.Request) (cache.Response, error) {
-	return dc.get(req), nil
+func toAbsPath(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("empty path")
+	}
+
+	// If it's already absolute, return it (cleaned)
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+
+	// Get current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	// Join and clean the path
+	abs := filepath.Join(cwd, path)
+	return filepath.Clean(abs), nil
+}
+
+func (dc *Store) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
+	for _, resp := range dc.get(req).Items {
+		cb(resp)
+	}
+
+	return nil
 }
 
 func (dc *Store) get(req cache.Request) cache.Response {
@@ -68,6 +109,7 @@ func (dc *Store) getOne(actionID string) cache.ResponseItem {
 	res.OutputID = ie.OutputID
 	res.Size = ie.Size
 	res.DiskPath = dc.OutputFilename(ie.OutputID)
+
 	t := time.UnixMicro(ie.TimeMicro)
 	res.Time = &t
 
@@ -88,18 +130,13 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 	outputFile := dc.OutputFilename(item.OutputID)
 	now := time.Now().UTC()
 
-	rd := item.UncompressedBodyReader()
-	defer rd.Close()
-
-	f, err := os.Create(outputFile)
+	rd, err := item.UncompressedBodyReader()
 	if err != nil {
-		return fmt.Errorf("create file: %w", err)
+		return fmt.Errorf("get reader for put: %w", err)
 	}
-	defer f.Close()
 
-	_, err = io.Copy(f, rd)
-	if err != nil {
-		return fmt.Errorf("copy to file: %w", err)
+	if err := writeAtomic(outputFile, rd); err != nil {
+		return fmt.Errorf("atomic write: %w", err)
 	}
 
 	dc.mu.Lock()
@@ -114,15 +151,36 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 	return nil
 }
 
+func writeAtomic(outputFile string, rd io.Reader) (err error) {
+	f, err := os.Create(outputFile + ".tmp")
+	if err != nil {
+		return fmt.Errorf("create file: %w", err)
+	}
+
+	if rd != nil {
+		_, err = io.Copy(f, rd)
+		if err != nil {
+			f.Close()
+			return fmt.Errorf("copy to file: %w", err)
+		}
+	}
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close file: %w", err)
+	}
+
+	return os.Rename(outputFile+".tmp", outputFile)
+}
+
 func (dc *Store) Close() error {
 	d, err := json.Marshal(dc.index)
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(dc.Dir, "index.json"), d, 0600)
+	return os.WriteFile(filepath.Join(dc.dir, "index.json"), d, 0600)
 }
 
 func (dc *Store) OutputFilename(outputID string) string {
-	return filepath.Join(dc.Dir, strings.Replace(outputID, "/", "_", -1))
+	return filepath.Join(dc.dir, strings.ReplaceAll(outputID, "/", "_"))
 }

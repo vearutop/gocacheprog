@@ -83,6 +83,9 @@ type Request struct {
 
 	// BodySize is the number of bytes of Body. If zero, the body isn't written.
 	BodySize int64 `json:",omitempty"`
+
+	// Body is a temporary storage for smaller blobs.
+	Body []byte `json:"-"`
 }
 
 // Response is the JSON response from the child process to the go command.
