@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"github.com/vearutop/gocacheprogd/internal/cache"
 	"io"
+	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,6 +21,14 @@ type Store struct {
 
 	mu    sync.Mutex
 	index map[string]indexEntry
+
+	prevStats     string
+	hits          int64
+	misses        int64
+	puts          int64
+	putsExist     int64
+	putsCompleted int64
+	errors        int64
 }
 
 // indexEntry is the metadata that Store stores on disk for an ActionID.
@@ -26,7 +38,9 @@ type indexEntry struct {
 	TimeMicro int64  `json:"t"`
 }
 
-func NewStore(dir string) (*Store, error) {
+const minCompressionSize = 200 // 200 bytes brings ratio of ~1.5x.
+
+func NewStore(dir string, withCompression bool) (*Store, error) {
 	dir, err := toAbsPath(dir)
 	if err != nil {
 		return nil, err
@@ -99,8 +113,12 @@ func (dc *Store) getOne(actionID string) cache.ResponseItem {
 
 	ie, ok := dc.index[actionID]
 	if !ok {
+		atomic.AddInt64(&dc.misses, 1)
+
 		return cache.ResponseItem{ActionID: actionID, Miss: true}
 	}
+
+	atomic.AddInt64(&dc.hits, 1)
 
 	return dc.responseItem(actionID, ie)
 }
@@ -132,12 +150,29 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 	outputFile := dc.OutputFilename(item.OutputID)
 	now := time.Now().UTC()
 
+	if item.OutputID == "" {
+		atomic.AddInt64(&dc.errors, 1)
+		println("empty output id:", fmt.Sprintf("%+v", item))
+		return fmt.Errorf("empty output id: %+v", item)
+	}
+
+	existing := dc.getOne(item.ActionID)
+	if existing.DiskPath != "" && !existing.Miss {
+		atomic.AddInt64(&dc.putsExist, 1)
+	}
+
+	atomic.AddInt64(&dc.puts, 1)
+
 	rd, err := item.UncompressedBodyReader()
 	if err != nil {
+		atomic.AddInt64(&dc.errors, 1)
+		println("get reader for put:", err.Error())
 		return fmt.Errorf("get reader for put: %w", err)
 	}
 
 	if err := writeAtomic(outputFile, rd); err != nil {
+		atomic.AddInt64(&dc.errors, 1)
+		println("atomic write:", err.Error())
 		return fmt.Errorf("atomic write: %w", err)
 	}
 
@@ -149,6 +184,8 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 		Size:      item.Size,
 		TimeMicro: now.UnixMicro(),
 	}
+
+	atomic.AddInt64(&dc.putsCompleted, 1)
 
 	return nil
 }
@@ -209,4 +246,35 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	}
 
 	return nil
+}
+
+func (dc *Store) Stats() map[string]string {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	return map[string]string{
+		"hits":          fmt.Sprintf("%d", dc.hits),
+		"misses":        fmt.Sprintf("%d", dc.misses),
+		"puts":          fmt.Sprintf("%d", dc.puts),
+		"putsExist":     fmt.Sprintf("%d", dc.putsExist),
+		"putsCompleted": fmt.Sprintf("%d", dc.putsCompleted),
+		"index":         fmt.Sprintf("%d", len(dc.index)),
+		"errors":        fmt.Sprintf("%d", dc.errors),
+	}
+}
+
+func (dc *Store) PrintStats() {
+	st := dc.Stats()
+
+	stats := ""
+	for _, k := range slices.Sorted(maps.Keys(st)) {
+		v := st[k]
+
+		stats += fmt.Sprintf("%s: %s ", k, v)
+	}
+
+	if stats != dc.prevStats {
+		log.Printf(stats)
+		dc.prevStats = stats
+	}
 }

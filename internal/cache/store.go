@@ -51,27 +51,35 @@ func (ri *ResponseItem) SetBodyReader(bodyReader func() (io.ReadCloser, error)) 
 	ri.bodyReader = bodyReader
 }
 
-func (ri *ResponseItem) UncompressedBodyReader() (io.ReadCloser, error) {
+func (ri *ResponseItem) PrepareBodyReader() {
 	if ri.bodyReader != nil {
-		return ri.bodyReader()
+		return
 	}
 
 	if ri.DiskPath != "" {
-		if ri.WireSize < 1e6 {
-			data, err := os.ReadFile(ri.DiskPath)
+		diskPath := ri.DiskPath
+
+		ri.bodyReader = func() (io.ReadCloser, error) {
+			if ri.WireSize < 1e6 {
+				data, err := os.ReadFile(diskPath)
+				if err != nil {
+					return nil, err
+				}
+
+				return io.NopCloser(bytes.NewReader(data)), nil
+			}
+
+			f, err := os.Open(diskPath)
 			if err != nil {
 				return nil, err
 			}
-
-			return io.NopCloser(bytes.NewReader(data)), nil
+			return f, nil
 		}
-
-		f, err := os.Open(ri.DiskPath)
-		if err != nil {
-			return nil, err
-		}
-		return f, nil
 	}
+}
+
+func (ri *ResponseItem) UncompressedBodyReader() (io.ReadCloser, error) {
+	ri.PrepareBodyReader()
 
 	if ri.Size == 0 && ri.WireSize == 0 {
 		return nil, nil

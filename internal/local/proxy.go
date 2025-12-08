@@ -7,6 +7,9 @@ import (
 	"github.com/vearutop/gocacheprogd/internal/cacheprog"
 	"io"
 	"log"
+	"maps"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +32,7 @@ type Proxy struct {
 	hits      int64
 	misses    int64
 	puts      int64
+	putsExist int64
 	batchPuts int64
 }
 
@@ -40,7 +44,7 @@ func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response) (
 		upstream: upstream,
 	}
 
-	disk, err := NewStore(dir)
+	disk, err := NewStore(dir, false)
 	if err != nil {
 		return nil, err
 	}
@@ -48,6 +52,7 @@ func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response) (
 	c.disk = disk
 
 	c.wg.Add(2)
+
 	go c.resolve()
 	go c.consumePut()
 
@@ -71,6 +76,11 @@ func (dc *Proxy) logf(format string, args ...any) {
 }
 
 func (dc *Proxy) Lookup(req cacheprog.Request) {
+	if dc.upstream == nil {
+		dc.resps <- dc.Get(req)
+		return
+	}
+
 	atomic.AddInt64(&dc.lookups, 1)
 	dc.lookup <- req
 }
@@ -176,7 +186,11 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 		return fmt.Errorf("upstream is not preloader")
 	}
 
-	return p.Preload(req, func(resp cache.ResponseItem) {
+	items := 0
+
+	err := p.Preload(req, func(resp cache.ResponseItem) {
+		items++
+
 		br, err := resp.UncompressedBodyReader()
 		if err != nil {
 			log.Printf("prepare uncompressed body %v: %s", resp, err.Error())
@@ -198,6 +212,9 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 			log.Printf("put resp item: %s", err.Error())
 		}
 	})
+
+	println("preloaded", items, "items")
+	return err
 }
 
 func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
@@ -248,7 +265,12 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 
 			atomic.AddInt64(&dc.hits, 1)
 
-			rs = dc.putOne(reqs[resp.ActionID], b)
+			req := reqs[resp.ActionID]
+			req.Command = cacheprog.CmdPut
+			req.OutputID = resp.OutputID
+			req.BodySize = resp.Size
+
+			rs = dc.putOne(req, b)
 		})
 		if err != nil {
 			dc.logf("upstream get failed: %s", err.Error())
@@ -285,12 +307,36 @@ func (dc *Proxy) Get(req cacheprog.Request) cacheprog.Response {
 }
 
 func (dc *Proxy) PrintStats() {
-	println("batchGets:", atomic.LoadInt64(&dc.batches),
-		"batchPuts:", atomic.LoadInt64(&dc.batchPuts),
-		"lookups:", atomic.LoadInt64(&dc.lookups),
-		"hits:", atomic.LoadInt64(&dc.hits),
-		"misses:", atomic.LoadInt64(&dc.misses),
-		"puts:", atomic.LoadInt64(&dc.puts))
+	st := dc.Stats()
+
+	var res string
+	for _, k := range slices.Sorted(maps.Keys(st)) {
+		v := st[k]
+		res += fmt.Sprintf(" %s: %s", k, v)
+	}
+
+	if dc.upstream != nil {
+		if s, ok := dc.upstream.(interface{ Stats() map[string]string }); ok {
+			res += "\nupstream:"
+
+			st := s.Stats()
+			for _, k := range slices.Sorted(maps.Keys(st)) {
+				if k == "preloaded" {
+					continue
+				}
+
+				res += fmt.Sprintf(" %s: %s", k, st[k])
+			}
+		}
+	}
+
+	res += "\ndisk:"
+	st = dc.disk.Stats()
+	for _, k := range slices.Sorted(maps.Keys(st)) {
+		res += fmt.Sprintf(" %s: %s", k, st[k])
+	}
+
+	log.Println(res)
 }
 
 func (dc *Proxy) putRespItem(item cache.ResponseItem, body []byte) error {
@@ -301,7 +347,7 @@ func (dc *Proxy) putRespItem(item cache.ResponseItem, body []byte) error {
 	if err := dc.disk.Put(cache.Response{
 		Items: []cache.ResponseItem{item},
 	}); err != nil {
-		return fmt.Errorf("write file: %s", err.Error())
+		return fmt.Errorf("write resp %+v: %w", item, err)
 	}
 
 	return nil
@@ -319,7 +365,7 @@ func (dc *Proxy) putOne(req cacheprog.Request, body []byte) cacheprog.Response {
 	if err := dc.putRespItem(item, body); err != nil {
 		return cacheprog.Response{
 			ID:  req.ID,
-			Err: fmt.Sprintf("write file: %s", err.Error()),
+			Err: fmt.Sprintf("write file %+v: %s", req, err),
 		}
 	}
 
@@ -327,13 +373,35 @@ func (dc *Proxy) putOne(req cacheprog.Request, body []byte) cacheprog.Response {
 }
 
 func (dc *Proxy) Put(req cacheprog.Request, body []byte) cacheprog.Response {
+	if resp := dc.Get(req); !resp.Miss {
+		atomic.AddInt64(&dc.putsExist, 1)
+
+		return resp
+	}
+
 	resp := dc.putOne(req, body)
 
 	if len(body) < 1e5 {
 		req.Body = body
 	}
 
-	dc.put <- req
+	if dc.upstream != nil {
+		dc.put <- req
+	}
 
 	return resp
+}
+
+func (dc *Proxy) Stats() map[string]string {
+	stats := map[string]string{
+		//"batchGets": strconv.FormatInt(atomic.LoadInt64(&dc.batches), 10),
+		//"batchPuts": strconv.FormatInt(atomic.LoadInt64(&dc.batchPuts), 10),
+		"lookups":   strconv.FormatInt(atomic.LoadInt64(&dc.lookups), 10),
+		"hits":      strconv.FormatInt(atomic.LoadInt64(&dc.hits), 10),
+		"misses":    strconv.FormatInt(atomic.LoadInt64(&dc.misses), 10),
+		"puts":      strconv.FormatInt(atomic.LoadInt64(&dc.puts), 10),
+		"putsExist": strconv.FormatInt(atomic.LoadInt64(&dc.putsExist), 10),
+	}
+
+	return stats
 }

@@ -39,5 +39,11 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == "/head" {
+		//println("head")
+		h.Head(rw, r)
+		return
+	}
+
 	http.NotFound(rw, r)
 }

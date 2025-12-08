@@ -16,6 +16,7 @@ func (h *Handler) Put(rw http.ResponseWriter, r *http.Request) {
 				return fmt.Errorf("empty body, item: %v", item)
 			}
 
+			item.DiskPath = ""
 			item.SetBodyReader(func() (io.ReadCloser, error) {
 				return io.NopCloser(body), nil
 			})

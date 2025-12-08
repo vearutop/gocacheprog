@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -41,13 +42,20 @@ func run() error {
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
 
-	store, err := local.NewStore(*dir)
+	store, err := local.NewStore(*dir, true)
 	if err != nil {
 		return fmt.Errorf("init local storage: %w", err)
 	}
 	defer store.Close()
 
 	h := http.NewHandler(store)
+
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			store.PrintStats()
+		}
+	}()
 
 	// Channel to listen for OS signals
 	stop := make(chan os.Signal, 1)
