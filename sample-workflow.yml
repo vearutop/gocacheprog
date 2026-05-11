@@ -1,0 +1,38 @@
+name: test-unit
+on:
+  pull_request:
+env:
+  GO111MODULE: "on"
+jobs:
+  test:
+    strategy:
+      matrix:
+        go-version: [ stable ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      # Go build and test cache relies on mod timestamps of files in packages.
+      # When repo is cloned, like in CI with actions/checkout, those timestamps are replaced with current time.
+      # This step restores mod timestamps using git history, so that cache keys are consistent across different runs.
+      - name: Restore Mod Time
+        run: |
+          curl -so ./git-restore-mtime "https://raw.githubusercontent.com/MestreLion/git-tools/b5822d297b3ca4a3b6574e78327a464790b14937/git-restore-mtime" 
+          chmod +x ./git-restore-mtime
+          ./git-restore-mtime        
+
+      - name: Setup gocacheprog
+        run: |
+          wget -q -O /tmp/gocacheprog https://github.com/vearutop/gocacheprogd/releases/download/dev/gocacheprog && chmod +x /tmp/gocacheprog
+          export BASE_COMMIT="${{ github.event.pull_request.base.sha }}"
+          export COMMIT="${{ github.event.pull_request.head.sha }}"
+          export PARENT_COMMIT="$(git rev-parse HEAD^)"
+          export LOG_DISCARD=1
+          export GOMAXPROCS=100           
+          export GOCACHEPROG="/tmp/gocacheprog -cache-dir ./build-cache -base-commit ${BASE_COMMIT} -parent-commit ${PARENT_COMMIT} -commit ${COMMIT} -remote-url https://eq.p1cs.art -preload -preload-size 3000000"
+          time go test -parallel 50 ./...

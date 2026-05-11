@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -132,6 +133,10 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	}
 	defer res.Body.Close()
 
+	if err := checkStatus(res, http.StatusOK, "preload"); err != nil {
+		return err
+	}
+
 	var resp cache.Response
 
 	preloadItems := 0
@@ -161,6 +166,34 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	return err
 }
 
+func (c *Client) PostCacheUsed(commit string, actionIDs []string) error {
+	if commit == "" {
+		return nil
+	}
+
+	body := strings.NewReader(strings.Join(actionIDs, "\n"))
+	endpoint := c.baseURL + "/cache-used?commit=" + url.QueryEscape(commit)
+
+	r, err := http.NewRequest(http.MethodPost, endpoint, body)
+	if err != nil {
+		return err
+	}
+	r.Header.Set("Content-Type", "text/plain")
+
+	res, err := c.tr.RoundTrip(r)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("cache-used status %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	return nil
+}
+
 func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
 	atomic.AddInt64(&c.getCnt, 1)
 
@@ -182,6 +215,10 @@ func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error 
 		return err
 	}
 	defer res.Body.Close()
+
+	if err := checkStatus(res, http.StatusOK, "get"); err != nil {
+		return err
+	}
 
 	var resp cache.Response
 
@@ -226,6 +263,10 @@ func (c *Client) head(req cache.Request) (cache.Response, error) {
 		return resp, err
 	}
 	defer res.Body.Close()
+
+	if err := checkStatus(res, http.StatusOK, "head"); err != nil {
+		return resp, err
+	}
 
 	j, err = io.ReadAll(res.Body)
 	if err != nil {
@@ -309,10 +350,29 @@ func (c *Client) Put(values cache.Response) error {
 	if err != nil {
 		return fmt.Errorf("sending request: %w", err)
 	}
+	defer res.Body.Close()
 
 	c.latencyPut.Add(1000 * time.Since(st).Seconds())
 
-	return res.Body.Close()
+	if err := checkStatus(res, http.StatusNoContent, "put"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func checkStatus(res *http.Response, expected int, op string) error {
+	if res.StatusCode == expected {
+		return nil
+	}
+
+	b, _ := io.ReadAll(res.Body)
+	msg := strings.TrimSpace(string(b))
+	if msg == "" {
+		msg = http.StatusText(res.StatusCode)
+	}
+
+	return fmt.Errorf("%s status %d: %s", op, res.StatusCode, msg)
 }
 
 func (c *Client) Stats() map[string]string {

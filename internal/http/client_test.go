@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -61,6 +63,97 @@ func TestNewClient(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, strings.ReplaceAll(item.ActionID, "actionId", "body"), string(b))
 	}))
+}
+
+func TestClient_PostCacheUsed(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, true)
+	require.NoError(t, err)
+
+	h := http.NewHandler(localStore)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL)
+	require.NoError(t, err)
+
+	err = client.PostCacheUsed("abcdef1234", []string{"actionId2", "actionId1", "actionId1"})
+	require.NoError(t, err)
+
+	b, err := os.ReadFile(filepath.Join(dir, "manifests", "ab", "abcdef1234"))
+	require.NoError(t, err)
+	require.Equal(t, "actionId2\nactionId1\n", string(b))
+}
+
+func TestPreload_UsesCommitManifestFilters(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, true)
+	require.NoError(t, err)
+
+	now := time.Now()
+	items := []cache.ResponseItem{
+		makeItem("actionId1", "outputId1", "body-1", &now),
+		makeItem("actionId2", "outputId2", strings.Repeat("body-2", 1000), &now),
+		makeItem("actionId3", "outputId3", "body-3", &now),
+	}
+
+	require.NoError(t, localStore.Put(cache.Response{Items: items}))
+	require.NoError(t, localStore.PostCacheUsed("parent123", []string{"actionId1", "missingAction"}))
+	require.NoError(t, localStore.PostCacheUsed("base123", []string{"actionId3"}))
+
+	h := http.NewHandler(localStore)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL)
+	require.NoError(t, err)
+
+	var got []string
+	err = client.Preload(cache.PreloadRequest{
+		MaxSize:      1000,
+		ParentCommit: "parent123",
+		BaseCommit:   "base123",
+	}, func(item cache.ResponseItem) {
+		got = append(got, item.ActionID)
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"actionId1", "actionId3"}, got)
+}
+
+func TestClient_Preload_HTTPError(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, true)
+	require.NoError(t, err)
+
+	h := http.NewHandler(localStore)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL)
+	require.NoError(t, err)
+
+	err = client.Preload(cache.PreloadRequest{
+		BaseCommit: "'invalid'",
+	}, func(item cache.ResponseItem) {})
+	require.EqualError(t, err, `preload status 500: invalid commit: "'invalid'"`)
+}
+
+func makeItem(actionID, outputID, body string, now *time.Time) cache.ResponseItem {
+	item := cache.ResponseItem{
+		ActionID: actionID,
+		Size:     int64(len(body)),
+		OutputID: outputID,
+		Time:     now,
+		WireSize: int64(len(body)),
+	}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString(body)), nil
+	})
+
+	return item
 }
 
 func TestNewClient_compressed(t *testing.T) {

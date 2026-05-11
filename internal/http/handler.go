@@ -28,6 +28,11 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == "/cache-used" {
+		h.CacheUsed(rw, r)
+		return
+	}
+
 	if r.URL.Path == "/put" {
 		h.Put(rw, r)
 		return

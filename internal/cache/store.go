@@ -26,6 +26,10 @@ type Preloader interface {
 	Preload(req PreloadRequest, cb func(resp ResponseItem)) error
 }
 
+type UsageRecorder interface {
+	PostCacheUsed(commit string, actionIDs []string) error
+}
+
 type ResponseItem struct {
 	ActionID     string     `json:",omitempty"`
 	Miss         bool       `json:",omitempty"` // cache miss
@@ -48,7 +52,9 @@ type Request struct {
 }
 
 type PreloadRequest struct {
-	MaxSize int64 `json:",omitempty"`
+	MaxSize      int64  `json:",omitempty"`
+	BaseCommit   string `json:",omitempty"`
+	ParentCommit string `json:",omitempty"`
 }
 
 func (ri *ResponseItem) SetBodyReader(bodyReader func() (io.ReadCloser, error)) {

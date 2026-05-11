@@ -1,6 +1,7 @@
 package local
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -32,6 +34,8 @@ type Store struct {
 	putsCompleted int64
 	errors        int64
 }
+
+var validCommitName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // indexEntry is the metadata that Store stores on disk for an ActionID.
 type indexEntry struct {
@@ -258,15 +262,37 @@ func (dc *Store) OutputFilename(outputID string) string {
 }
 
 func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
-	var res []cache.ResponseItem
-
 	if req.MaxSize == 0 {
 		req.MaxSize = 600_000
 	}
 
+	var (
+		res             []cache.ResponseItem
+		filterActionIDs map[string]struct{}
+		err             error
+	)
+
+	if req.ParentCommit != "" || req.BaseCommit != "" {
+		filterActionIDs, err = dc.preloadFilterActionIDs(req)
+		if err != nil {
+			return err
+		}
+	}
+
 	dc.mu.Lock()
 	for k, v := range dc.index {
-		if v.WireSize > req.MaxSize {
+		if filterActionIDs != nil {
+			if _, ok := filterActionIDs[k]; !ok {
+				continue
+			}
+		}
+
+		wireSize := v.WireSize
+		if wireSize == 0 {
+			wireSize = v.Size
+		}
+
+		if wireSize > req.MaxSize {
 			continue
 		}
 
@@ -279,6 +305,103 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	}
 
 	return nil
+}
+
+func (dc *Store) PostCacheUsed(commit string, actionIDs []string) error {
+	manifestPath, err := dc.manifestPath(commit)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		return fmt.Errorf("create manifest dir: %w", err)
+	}
+
+	body := strings.Join(actionIDs, "\n")
+	if body != "" {
+		body += "\n"
+	}
+
+	if err := os.WriteFile(manifestPath+".tmp", []byte(body), 0o600); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+
+	if err := os.Rename(manifestPath+".tmp", manifestPath); err != nil {
+		return fmt.Errorf("rename manifest: %w", err)
+	}
+
+	return nil
+}
+
+func (dc *Store) preloadFilterActionIDs(req cache.PreloadRequest) (map[string]struct{}, error) {
+	res := map[string]struct{}{}
+
+	for _, commit := range []string{req.ParentCommit, req.BaseCommit} {
+		if commit == "" {
+			continue
+		}
+
+		actionIDs, err := dc.loadManifest(commit)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+
+			return nil, err
+		}
+
+		for _, actionID := range actionIDs {
+			res[actionID] = struct{}{}
+		}
+	}
+
+	return res, nil
+}
+
+func (dc *Store) loadManifest(commit string) ([]string, error) {
+	manifestPath, err := dc.manifestPath(commit)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.Open(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	res := make([]string, 0)
+	for scanner.Scan() {
+		actionID := strings.TrimSpace(scanner.Text())
+		if actionID == "" {
+			continue
+		}
+
+		res = append(res, actionID)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan manifest %s: %w", commit, err)
+	}
+
+	return res, nil
+}
+
+func (dc *Store) manifestPath(commit string) (string, error) {
+	commit = strings.TrimSpace(commit)
+	if !validCommitName.MatchString(commit) {
+		return "", fmt.Errorf("invalid commit: %q", commit)
+	}
+
+	prefix := commit
+	if len(prefix) > 2 {
+		prefix = prefix[:2]
+	}
+
+	return filepath.Join(dc.dir, "manifests", prefix, commit), nil
 }
 
 func (dc *Store) Stats() map[string]string {

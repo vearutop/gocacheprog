@@ -30,6 +30,9 @@ func run() error {
 	remoteURL := flag.String("remote-url", "", "remote HTTP server cache source, e.g. https://example.com:8080")
 	preload := flag.Bool("preload", false, "preload cache from remote server")
 	preloadSize := flag.Int64("preload-size", 1000000, "preload cache from remote server fo items up to this size")
+	commit := flag.String("commit", "", "current commit SHA used to upload cache usage manifest")
+	baseCommit := flag.String("base-commit", "", "base commit SHA used to scope preload")
+	parentCommit := flag.String("parent-commit", "", "parent commit SHA used to scope preload")
 
 	flag.Parse()
 
@@ -92,11 +95,13 @@ func run() error {
 		return fmt.Errorf("encode known commands: %w", err)
 	}
 
-	if *preload {
+	if *preload || *baseCommit != "" || *parentCommit != "" {
 		st := time.Now()
 		println("preloading cache up to", *preloadSize, "bytes per item from remote server ...")
 		if err := dc.Preload(cache.PreloadRequest{
-			MaxSize: *preloadSize,
+			MaxSize:      *preloadSize,
+			BaseCommit:   *baseCommit,
+			ParentCommit: *parentCommit,
 		}); err != nil {
 			return fmt.Errorf("preload cache: %w", err)
 		}
@@ -174,6 +179,10 @@ func run() error {
 
 	if err := dc.Close(); err != nil {
 		return fmt.Errorf("close cache: %w", err)
+	}
+
+	if err := dc.PostCacheUsed(*commit); err != nil {
+		return fmt.Errorf("post cache-used: %w", err)
 	}
 	close(resps)
 

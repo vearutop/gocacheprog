@@ -35,14 +35,18 @@ type Proxy struct {
 	puts      int64
 	putsExist int64
 	batchPuts int64
+
+	usedMu        sync.Mutex
+	usedActionIDs map[string]struct{}
 }
 
 func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response) (*Proxy, error) {
 	c := &Proxy{
-		resps:    resps,
-		lookup:   make(chan cacheprog.Request, 1000),
-		put:      make(chan cacheprog.Request, 1000),
-		upstream: upstream,
+		resps:         resps,
+		lookup:        make(chan cacheprog.Request, 1000),
+		put:           make(chan cacheprog.Request, 1000),
+		upstream:      upstream,
+		usedActionIDs: map[string]struct{}{},
 	}
 
 	disk, err := NewStore(dir, false)
@@ -77,6 +81,8 @@ func (dc *Proxy) logf(format string, args ...any) {
 }
 
 func (dc *Proxy) Lookup(req cacheprog.Request) {
+	dc.recordUsedActionID(req.ActionID)
+
 	if dc.upstream == nil {
 		dc.resps <- dc.Get(req)
 		return
@@ -84,6 +90,43 @@ func (dc *Proxy) Lookup(req cacheprog.Request) {
 
 	atomic.AddInt64(&dc.lookups, 1)
 	dc.lookup <- req
+}
+
+func (dc *Proxy) recordUsedActionID(actionID string) {
+	if actionID == "" {
+		return
+	}
+
+	dc.usedMu.Lock()
+	dc.usedActionIDs[actionID] = struct{}{}
+	dc.usedMu.Unlock()
+}
+
+func (dc *Proxy) UsedActionIDs() []string {
+	dc.usedMu.Lock()
+	defer dc.usedMu.Unlock()
+
+	res := make([]string, 0, len(dc.usedActionIDs))
+	for actionID := range dc.usedActionIDs {
+		res = append(res, actionID)
+	}
+
+	slices.Sort(res)
+
+	return res
+}
+
+func (dc *Proxy) PostCacheUsed(commit string) error {
+	if commit == "" {
+		return nil
+	}
+
+	recorder, ok := dc.upstream.(cache.UsageRecorder)
+	if !ok {
+		return nil
+	}
+
+	return recorder.PostCacheUsed(commit, dc.UsedActionIDs())
 }
 
 const (
