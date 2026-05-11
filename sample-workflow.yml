@@ -17,19 +17,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      # Go build and test cache relies on mod timestamps of files in packages.
-      # When repo is cloned, like in CI with actions/checkout, those timestamps are replaced with current time.
-      # This step restores mod timestamps using git history, so that cache keys are consistent across different runs.
-      - name: Restore Mod Time
+      - name: Download gocacheprog
         run: |
-          curl -so ./git-restore-mtime "https://raw.githubusercontent.com/MestreLion/git-tools/b5822d297b3ca4a3b6574e78327a464790b14937/git-restore-mtime" 
-          chmod +x ./git-restore-mtime
-          ./git-restore-mtime        
+          wget -q -O /tmp/gocacheprog https://github.com/vearutop/gocacheprogd/releases/download/dev/gocacheprog
+          chmod +x /tmp/gocacheprog
+
+      # Go test cache includes file mtimes for some repo-local inputs.
+      # Canonicalize them so fresh CI checkouts get stable cache keys.
+      - name: Canonicalize Timestamps
+        run: |
+          /tmp/gocacheprog -canonicalize-timestamps .
 
       - name: Setup gocacheprog
         shell: bash
         run: |
-          wget -q -O /tmp/gocacheprog https://github.com/vearutop/gocacheprogd/releases/download/dev/gocacheprog && chmod +x /tmp/gocacheprog
           export BASE_COMMIT="${{ github.event.pull_request.base.sha }}"
           export COMMIT="${{ github.event.pull_request.head.sha }}"
           export CHANGES_ID="${{ github.repository }}#${{ github.event.pull_request.number }}"

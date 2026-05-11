@@ -35,8 +35,13 @@ func run() error {
 	buildType := flag.String("build-type", "", "optional build type label to isolate cache manifests, e.g. unit or race")
 	baseCommit := flag.String("base-commit", "", "base commit SHA used to scope preload")
 	parentCommit := flag.String("parent-commit", "", "parent commit SHA used to scope preload")
+	canonicalize := flag.String("canonicalize-timestamps", "", "canonicalize file and directory timestamps under this repo root and exit")
 
 	flag.Parse()
+
+	if *canonicalize != "" {
+		return canonicalizeTimestamps(*canonicalize)
+	}
 
 	if *dir == "" {
 		d, err := os.UserCacheDir()
