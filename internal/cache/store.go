@@ -27,7 +27,11 @@ type Preloader interface {
 }
 
 type UsageRecorder interface {
-	PostCacheUsed(commit string, actionIDs []string) error
+	PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string) error
+}
+
+type PreloadSourceProvider interface {
+	PreloadSources(req PreloadRequest) ([]string, error)
 }
 
 type ResponseItem struct {
@@ -53,6 +57,9 @@ type Request struct {
 
 type PreloadRequest struct {
 	MaxSize      int64  `json:",omitempty"`
+	Commit       string `json:",omitempty"`
+	ChangesID    string `json:",omitempty"`
+	BuildType    string `json:",omitempty"`
 	BaseCommit   string `json:",omitempty"`
 	ParentCommit string `json:",omitempty"`
 }

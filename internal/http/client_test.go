@@ -78,10 +78,14 @@ func TestClient_PostCacheUsed(t *testing.T) {
 	client, err := http.NewClient(srv.URL)
 	require.NoError(t, err)
 
-	err = client.PostCacheUsed("abcdef1234", []string{"actionId2", "actionId1", "actionId1"})
+	err = client.PostCacheUsed("abcdef1234", "repo/pr-123", "unit", []string{"actionId2", "actionId1", "actionId1"})
 	require.NoError(t, err)
 
-	b, err := os.ReadFile(filepath.Join(dir, "manifests", "ab", "abcdef1234"))
+	b, err := os.ReadFile(filepath.Join(dir, "manifests", "buildtype-unit", "ab", "abcdef1234"))
+	require.NoError(t, err)
+	require.Equal(t, "actionId2\nactionId1\n", string(b))
+
+	b, err = os.ReadFile(filepath.Join(dir, "manifests", "buildtype-unit", "changes", "re", "repo%2Fpr-123"))
 	require.NoError(t, err)
 	require.Equal(t, "actionId2\nactionId1\n", string(b))
 }
@@ -100,8 +104,8 @@ func TestPreload_UsesCommitManifestFilters(t *testing.T) {
 	}
 
 	require.NoError(t, localStore.Put(cache.Response{Items: items}))
-	require.NoError(t, localStore.PostCacheUsed("parent123", []string{"actionId1", "missingAction"}))
-	require.NoError(t, localStore.PostCacheUsed("base123", []string{"actionId3"}))
+	require.NoError(t, localStore.PostCacheUsed("parent123", "", "", []string{"actionId1", "missingAction"}))
+	require.NoError(t, localStore.PostCacheUsed("base123", "", "", []string{"actionId3"}))
 
 	h := http.NewHandler(localStore)
 	srv := httptest.NewServer(h)
@@ -120,6 +124,86 @@ func TestPreload_UsesCommitManifestFilters(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{"actionId1", "actionId3"}, got)
+	require.Equal(t, "parent,base", client.LastPreloadSources())
+}
+
+func TestPreload_UsesCurrentCommitManifestForRerun(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, true)
+	require.NoError(t, err)
+
+	now := time.Now()
+	items := []cache.ResponseItem{
+		makeItem("actionId1", "outputId1", "body-1", &now),
+		makeItem("actionId2", "outputId2", "body-2", &now),
+		makeItem("actionId3", "outputId3", "body-3", &now),
+	}
+
+	require.NoError(t, localStore.Put(cache.Response{Items: items}))
+	require.NoError(t, localStore.PostCacheUsed("current123", "", "", []string{"actionId2"}))
+	require.NoError(t, localStore.PostCacheUsed("parent123", "", "", []string{"actionId1"}))
+	require.NoError(t, localStore.PostCacheUsed("base123", "", "", []string{"actionId3"}))
+
+	h := http.NewHandler(localStore)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL)
+	require.NoError(t, err)
+
+	var got []string
+	err = client.Preload(cache.PreloadRequest{
+		MaxSize:      1000,
+		Commit:       "current123",
+		ParentCommit: "parent123",
+		BaseCommit:   "base123",
+	}, func(item cache.ResponseItem) {
+		got = append(got, item.ActionID)
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"actionId1", "actionId2", "actionId3"}, got)
+	require.Equal(t, "commit,parent,base", client.LastPreloadSources())
+}
+
+func TestPreload_UsesChangesIDBetweenParentAndBase(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, true)
+	require.NoError(t, err)
+
+	now := time.Now()
+	items := []cache.ResponseItem{
+		makeItem("actionId1", "outputId1", "body-1", &now),
+		makeItem("actionId2", "outputId2", "body-2", &now),
+		makeItem("actionId3", "outputId3", "body-3", &now),
+	}
+
+	require.NoError(t, localStore.Put(cache.Response{Items: items}))
+	require.NoError(t, localStore.PostCacheUsed("parent123", "", "unit", []string{"actionId1"}))
+	require.NoError(t, localStore.PostCacheUsed("", "repo/pr-123", "unit", []string{"actionId2"}))
+	require.NoError(t, localStore.PostCacheUsed("base123", "", "unit", []string{"actionId3"}))
+
+	h := http.NewHandler(localStore)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL)
+	require.NoError(t, err)
+
+	var got []string
+	err = client.Preload(cache.PreloadRequest{
+		MaxSize:      1000,
+		ParentCommit: "parent123",
+		ChangesID:    "repo/pr-123",
+		BuildType:    "unit",
+		BaseCommit:   "base123",
+	}, func(item cache.ResponseItem) {
+		got = append(got, item.ActionID)
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"actionId1", "actionId2", "actionId3"}, got)
+	require.Equal(t, "parent,changes,base", client.LastPreloadSources())
 }
 
 func TestClient_Preload_HTTPError(t *testing.T) {

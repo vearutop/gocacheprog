@@ -31,6 +31,8 @@ func run() error {
 	preload := flag.Bool("preload", false, "preload cache from remote server")
 	preloadSize := flag.Int64("preload-size", 1000000, "preload cache from remote server fo items up to this size")
 	commit := flag.String("commit", "", "current commit SHA used to upload cache usage manifest")
+	changesID := flag.String("changes-id", "", "stable change stream label used to upload and preload latest cache usage manifest")
+	buildType := flag.String("build-type", "", "optional build type label to isolate cache manifests, e.g. unit or race")
 	baseCommit := flag.String("base-commit", "", "base commit SHA used to scope preload")
 	parentCommit := flag.String("parent-commit", "", "parent commit SHA used to scope preload")
 
@@ -95,15 +97,24 @@ func run() error {
 		return fmt.Errorf("encode known commands: %w", err)
 	}
 
-	if *preload || *baseCommit != "" || *parentCommit != "" {
+	if *preload || *commit != "" || *changesID != "" || *buildType != "" || *baseCommit != "" || *parentCommit != "" {
 		st := time.Now()
 		println("preloading cache up to", *preloadSize, "bytes per item from remote server ...")
 		if err := dc.Preload(cache.PreloadRequest{
 			MaxSize:      *preloadSize,
+			Commit:       *commit,
+			ChangesID:    *changesID,
+			BuildType:    *buildType,
 			BaseCommit:   *baseCommit,
 			ParentCommit: *parentCommit,
 		}); err != nil {
 			return fmt.Errorf("preload cache: %w", err)
+		}
+
+		if s, ok := upstream.(interface{ LastPreloadSources() string }); ok {
+			if sources := s.LastPreloadSources(); sources != "" {
+				println("preload sources:", sources)
+			}
 		}
 
 		println("preload done in", time.Since(st).String())
@@ -181,7 +192,7 @@ func run() error {
 		return fmt.Errorf("close cache: %w", err)
 	}
 
-	if err := dc.PostCacheUsed(*commit); err != nil {
+	if err := dc.PostCacheUsed(*commit, *changesID, *buildType); err != nil {
 		return fmt.Errorf("post cache-used: %w", err)
 	}
 	close(resps)

@@ -27,12 +27,17 @@ jobs:
           ./git-restore-mtime        
 
       - name: Setup gocacheprog
+        shell: bash
         run: |
           wget -q -O /tmp/gocacheprog https://github.com/vearutop/gocacheprogd/releases/download/dev/gocacheprog && chmod +x /tmp/gocacheprog
           export BASE_COMMIT="${{ github.event.pull_request.base.sha }}"
           export COMMIT="${{ github.event.pull_request.head.sha }}"
-          export PARENT_COMMIT="$(git rev-parse HEAD^)"
+          export CHANGES_ID="${{ github.repository }}#${{ github.event.pull_request.number }}"
+          export BUILD_TYPE="unit"
           export LOG_DISCARD=1
-          export GOMAXPROCS=100           
-          export GOCACHEPROG="/tmp/gocacheprog -cache-dir ./build-cache -base-commit ${BASE_COMMIT} -parent-commit ${PARENT_COMMIT} -commit ${COMMIT} -remote-url https://eq.p1cs.art -preload -preload-size 3000000"
+          export GOMAXPROCS=100
+
+          EXTRA_FLAGS="-commit ${COMMIT} -changes-id ${CHANGES_ID} -build-type ${BUILD_TYPE} -base-commit ${BASE_COMMIT}"
+
+          export GOCACHEPROG="/tmp/gocacheprog -cache-dir ./build-cache ${EXTRA_FLAGS} -remote-url https://eq.p1cs.art -preload -preload-size 3000000"
           time go test -parallel 50 ./...

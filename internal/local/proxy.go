@@ -28,25 +28,32 @@ type Proxy struct {
 	resps  chan cacheprog.Response
 	put    chan cacheprog.Request
 
-	batches   int64
-	lookups   int64
-	hits      int64
-	misses    int64
-	puts      int64
-	putsExist int64
-	batchPuts int64
+	batches     int64
+	lookups     int64
+	hits        int64
+	preloadHits int64
+	regularHits int64
+	misses      int64
+	puts        int64
+	putsExist   int64
+	batchPuts   int64
 
-	usedMu        sync.Mutex
-	usedActionIDs map[string]struct{}
+	usedMu             sync.Mutex
+	usedActionIDs      map[string]struct{}
+	preloadedMu        sync.Mutex
+	preloadedActionIDs map[string]struct{}
+	usedPreloadedIDs   map[string]struct{}
 }
 
 func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response) (*Proxy, error) {
 	c := &Proxy{
-		resps:         resps,
-		lookup:        make(chan cacheprog.Request, 1000),
-		put:           make(chan cacheprog.Request, 1000),
-		upstream:      upstream,
-		usedActionIDs: map[string]struct{}{},
+		resps:              resps,
+		lookup:             make(chan cacheprog.Request, 1000),
+		put:                make(chan cacheprog.Request, 1000),
+		upstream:           upstream,
+		usedActionIDs:      map[string]struct{}{},
+		preloadedActionIDs: map[string]struct{}{},
+		usedPreloadedIDs:   map[string]struct{}{},
 	}
 
 	disk, err := NewStore(dir, false)
@@ -116,8 +123,8 @@ func (dc *Proxy) UsedActionIDs() []string {
 	return res
 }
 
-func (dc *Proxy) PostCacheUsed(commit string) error {
-	if commit == "" {
+func (dc *Proxy) PostCacheUsed(commit string, changesID string, buildType string) error {
+	if commit == "" && changesID == "" {
 		return nil
 	}
 
@@ -126,7 +133,7 @@ func (dc *Proxy) PostCacheUsed(commit string) error {
 		return nil
 	}
 
-	return recorder.PostCacheUsed(commit, dc.UsedActionIDs())
+	return recorder.PostCacheUsed(commit, changesID, buildType, dc.UsedActionIDs())
 }
 
 const (
@@ -161,6 +168,7 @@ func (dc *Proxy) resolve() {
 				}
 			} else {
 				atomic.AddInt64(&dc.hits, 1)
+				dc.recordHitKind(req.ActionID)
 				dc.resps <- resp
 			}
 
@@ -254,7 +262,10 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 
 		if err := dc.putRespItem(resp, b); err != nil {
 			log.Printf("put resp item: %s", err.Error())
+			return
 		}
+
+		dc.markPreloaded(resp.ActionID)
 	})
 
 	println("preloaded", items, "items")
@@ -308,6 +319,7 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 			}
 
 			atomic.AddInt64(&dc.hits, 1)
+			atomic.AddInt64(&dc.regularHits, 1)
 
 			req := reqs[resp.ActionID]
 			req.Command = cacheprog.CmdPut
@@ -437,15 +449,96 @@ func (dc *Proxy) Put(req cacheprog.Request, body []byte) cacheprog.Response {
 }
 
 func (dc *Proxy) Stats() map[string]string {
+	lookups := atomic.LoadInt64(&dc.lookups)
+	hits := atomic.LoadInt64(&dc.hits)
+	preloadHits := atomic.LoadInt64(&dc.preloadHits)
+	regularHits := atomic.LoadInt64(&dc.regularHits)
+	misses := atomic.LoadInt64(&dc.misses)
+	preloadedItems, preloadUsed := dc.preloadUsageStats()
+	preloadUnused := preloadedItems - preloadUsed
+
 	stats := map[string]string{
 		//"batchGets": strconv.FormatInt(atomic.LoadInt64(&dc.batches), 10),
 		//"batchPuts": strconv.FormatInt(atomic.LoadInt64(&dc.batchPuts), 10),
-		"lookups":   strconv.FormatInt(atomic.LoadInt64(&dc.lookups), 10),
-		"hits":      strconv.FormatInt(atomic.LoadInt64(&dc.hits), 10),
-		"misses":    strconv.FormatInt(atomic.LoadInt64(&dc.misses), 10),
-		"puts":      strconv.FormatInt(atomic.LoadInt64(&dc.puts), 10),
-		"putsExist": strconv.FormatInt(atomic.LoadInt64(&dc.putsExist), 10),
+		"lookups":             strconv.FormatInt(lookups, 10),
+		"hits":                strconv.FormatInt(hits, 10),
+		"hit_rate":            percent(hits, lookups),
+		"preload_hits":        strconv.FormatInt(preloadHits, 10),
+		"preload_hit_rate":    percent(preloadHits, lookups),
+		"preloaded_items":     strconv.Itoa(preloadedItems),
+		"preload_used":        strconv.Itoa(preloadUsed),
+		"preload_unused":      strconv.Itoa(preloadUnused),
+		"preload_unused_rate": percentInt(preloadUnused, preloadedItems),
+		"regular_hits":        strconv.FormatInt(regularHits, 10),
+		"regular_hit_rate":    percent(regularHits, lookups),
+		"misses":              strconv.FormatInt(misses, 10),
+		"miss_rate":           percent(misses, lookups),
+		"puts":                strconv.FormatInt(atomic.LoadInt64(&dc.puts), 10),
+		"putsExist":           strconv.FormatInt(atomic.LoadInt64(&dc.putsExist), 10),
 	}
 
 	return stats
+}
+
+func (dc *Proxy) markPreloaded(actionID string) {
+	if actionID == "" {
+		return
+	}
+
+	dc.preloadedMu.Lock()
+	dc.preloadedActionIDs[actionID] = struct{}{}
+	dc.preloadedMu.Unlock()
+}
+
+func (dc *Proxy) isPreloaded(actionID string) bool {
+	dc.preloadedMu.Lock()
+	_, ok := dc.preloadedActionIDs[actionID]
+	dc.preloadedMu.Unlock()
+
+	return ok
+}
+
+func (dc *Proxy) recordHitKind(actionID string) {
+	if dc.isPreloaded(actionID) {
+		dc.markUsedPreloaded(actionID)
+		atomic.AddInt64(&dc.preloadHits, 1)
+		return
+	}
+
+	atomic.AddInt64(&dc.regularHits, 1)
+}
+
+func percent(num, denom int64) string {
+	if denom == 0 {
+		return "0.0%"
+	}
+
+	return fmt.Sprintf("%.1f%%", 100*float64(num)/float64(denom))
+}
+
+func percentInt(num, denom int) string {
+	if denom == 0 {
+		return "0.0%"
+	}
+
+	return fmt.Sprintf("%.1f%%", 100*float64(num)/float64(denom))
+}
+
+func (dc *Proxy) markUsedPreloaded(actionID string) {
+	if actionID == "" {
+		return
+	}
+
+	dc.preloadedMu.Lock()
+	if _, ok := dc.preloadedActionIDs[actionID]; ok {
+		dc.usedPreloadedIDs[actionID] = struct{}{}
+	}
+	dc.preloadedMu.Unlock()
+}
+
+func (dc *Proxy) preloadUsageStats() (preloadedItems int, preloadUsed int) {
+	dc.preloadedMu.Lock()
+	defer dc.preloadedMu.Unlock()
+
+	return len(dc.preloadedActionIDs), len(dc.usedPreloadedIDs)
 }

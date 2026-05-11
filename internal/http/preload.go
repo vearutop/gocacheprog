@@ -7,11 +7,15 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/vearutop/gocacheprogd/internal/cache"
 )
 
 func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
+
 	bb, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -36,6 +40,20 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		http.Error(rw, "preload is not supported", http.StatusNotImplemented)
 		return
+	}
+
+	preloadSources := ""
+	if s, ok := h.store.(cache.PreloadSourceProvider); ok {
+		sources, err := s.PreloadSources(req)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if len(sources) > 0 {
+			preloadSources = strings.Join(sources, ",")
+			rw.Header().Set("X-GoCacheProgD-Preload-Sources", preloadSources)
+		}
 	}
 
 	err = p.Preload(req, func(item cache.ResponseItem) {
@@ -68,7 +86,7 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	println("preload content length:", cl, "items:", len(resp.Items))
+	log.Printf("preload prepared in %s; sources=%s; items=%d; content_length=%d", time.Since(startedAt), preloadSources, len(resp.Items), cl)
 
 	rw.Header().Set("Content-Type", "application/octet-stream")
 	rw.Header().Set("Content-Length", strconv.Itoa(int(cl)))

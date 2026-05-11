@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,6 +37,7 @@ type Store struct {
 }
 
 var validCommitName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var validBuildTypeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // indexEntry is the metadata that Store stores on disk for an ActionID.
 type indexEntry struct {
@@ -272,8 +274,8 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 		err             error
 	)
 
-	if req.ParentCommit != "" || req.BaseCommit != "" {
-		filterActionIDs, err = dc.preloadFilterActionIDs(req)
+	if req.Commit != "" || req.ParentCommit != "" || req.ChangesID != "" || req.BaseCommit != "" {
+		filterActionIDs, _, err = dc.preloadFilterActionIDs(req)
 		if err != nil {
 			return err
 		}
@@ -307,14 +309,14 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	return nil
 }
 
-func (dc *Store) PostCacheUsed(commit string, actionIDs []string) error {
-	manifestPath, err := dc.manifestPath(commit)
-	if err != nil {
-		return err
-	}
+func (dc *Store) PreloadSources(req cache.PreloadRequest) ([]string, error) {
+	_, sources, err := dc.preloadFilterActionIDs(req)
+	return sources, err
+}
 
-	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
-		return fmt.Errorf("create manifest dir: %w", err)
+func (dc *Store) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string) error {
+	if commit == "" && changesID == "" {
+		return nil
 	}
 
 	body := strings.Join(actionIDs, "\n")
@@ -322,47 +324,97 @@ func (dc *Store) PostCacheUsed(commit string, actionIDs []string) error {
 		body += "\n"
 	}
 
-	if err := os.WriteFile(manifestPath+".tmp", []byte(body), 0o600); err != nil {
-		return fmt.Errorf("write manifest: %w", err)
+	if commit != "" {
+		manifestPath, err := dc.commitManifestPath(commit, buildType)
+		if err != nil {
+			return err
+		}
+
+		if err := dc.writeManifest(manifestPath, body); err != nil {
+			return err
+		}
 	}
 
-	if err := os.Rename(manifestPath+".tmp", manifestPath); err != nil {
-		return fmt.Errorf("rename manifest: %w", err)
+	if changesID != "" {
+		manifestPath, err := dc.changesManifestPath(changesID, buildType)
+		if err != nil {
+			return err
+		}
+
+		if err := dc.writeManifest(manifestPath, body); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (dc *Store) preloadFilterActionIDs(req cache.PreloadRequest) (map[string]struct{}, error) {
+func (dc *Store) preloadFilterActionIDs(req cache.PreloadRequest) (map[string]struct{}, []string, error) {
+	if req.Commit == "" && req.ParentCommit == "" && req.ChangesID == "" && req.BaseCommit == "" {
+		return nil, []string{"all"}, nil
+	}
+
 	res := map[string]struct{}{}
+	sources := make([]string, 0, 4)
 
-	for _, commit := range []string{req.ParentCommit, req.BaseCommit} {
-		if commit == "" {
-			continue
-		}
-
-		actionIDs, err := dc.loadManifest(commit)
+	for _, candidate := range []struct {
+		name string
+		load func() ([]string, error)
+	}{
+		{name: "commit", load: func() ([]string, error) { return dc.loadCommitManifest(req.Commit, req.BuildType) }},
+		{name: "parent", load: func() ([]string, error) { return dc.loadCommitManifest(req.ParentCommit, req.BuildType) }},
+		{name: "changes", load: func() ([]string, error) { return dc.loadChangesManifest(req.ChangesID, req.BuildType) }},
+		{name: "base", load: func() ([]string, error) { return dc.loadCommitManifest(req.BaseCommit, req.BuildType) }},
+	} {
+		actionIDs, err := candidate.load()
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 
-			return nil, err
+			return nil, nil, err
 		}
 
+		sources = append(sources, candidate.name)
 		for _, actionID := range actionIDs {
 			res[actionID] = struct{}{}
 		}
 	}
 
-	return res, nil
+	if len(sources) == 0 {
+		sources = []string{"none"}
+	}
+
+	return res, sources, nil
 }
 
-func (dc *Store) loadManifest(commit string) ([]string, error) {
-	manifestPath, err := dc.manifestPath(commit)
+func (dc *Store) loadCommitManifest(commit string, buildType string) ([]string, error) {
+	if strings.TrimSpace(commit) == "" {
+		return nil, os.ErrNotExist
+	}
+
+	manifestPath, err := dc.commitManifestPath(commit, buildType)
 	if err != nil {
 		return nil, err
 	}
+
+	return dc.loadManifest(manifestPath, commit)
+}
+
+func (dc *Store) loadChangesManifest(changesID string, buildType string) ([]string, error) {
+	if strings.TrimSpace(changesID) == "" {
+		return nil, os.ErrNotExist
+	}
+
+	manifestPath, err := dc.changesManifestPath(changesID, buildType)
+	if err != nil {
+		return nil, err
+	}
+
+	return dc.loadManifest(manifestPath, changesID)
+}
+
+func (dc *Store) loadManifest(manifestPath string, name string) ([]string, error) {
 
 	f, err := os.Open(manifestPath)
 	if err != nil {
@@ -384,13 +436,13 @@ func (dc *Store) loadManifest(commit string) ([]string, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan manifest %s: %w", commit, err)
+		return nil, fmt.Errorf("scan manifest %s: %w", name, err)
 	}
 
 	return res, nil
 }
 
-func (dc *Store) manifestPath(commit string) (string, error) {
+func (dc *Store) commitManifestPath(commit string, buildType string) (string, error) {
 	commit = strings.TrimSpace(commit)
 	if !validCommitName.MatchString(commit) {
 		return "", fmt.Errorf("invalid commit: %q", commit)
@@ -401,7 +453,60 @@ func (dc *Store) manifestPath(commit string) (string, error) {
 		prefix = prefix[:2]
 	}
 
-	return filepath.Join(dc.dir, "manifests", prefix, commit), nil
+	scopeDir, err := dc.manifestScopeDir(buildType)
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dc.dir, "manifests", scopeDir, prefix, commit), nil
+}
+
+func (dc *Store) changesManifestPath(changesID string, buildType string) (string, error) {
+	changesID = strings.TrimSpace(changesID)
+	if changesID == "" {
+		return "", fmt.Errorf("invalid changes-id: %q", changesID)
+	}
+
+	escaped := url.QueryEscape(changesID)
+	prefix := escaped
+	if len(prefix) > 2 {
+		prefix = prefix[:2]
+	}
+
+	scopeDir, err := dc.manifestScopeDir(buildType)
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(dc.dir, "manifests", scopeDir, "changes", prefix, escaped), nil
+}
+
+func (dc *Store) manifestScopeDir(buildType string) (string, error) {
+	buildType = strings.TrimSpace(buildType)
+	if buildType == "" {
+		return "default", nil
+	}
+	if !validBuildTypeName.MatchString(buildType) {
+		return "", fmt.Errorf("invalid build-type: %q", buildType)
+	}
+
+	return "buildtype-" + buildType, nil
+}
+
+func (dc *Store) writeManifest(manifestPath string, body string) error {
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		return fmt.Errorf("create manifest dir: %w", err)
+	}
+
+	if err := os.WriteFile(manifestPath+".tmp", []byte(body), 0o600); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+
+	if err := os.Rename(manifestPath+".tmp", manifestPath); err != nil {
+		return fmt.Errorf("rename manifest: %w", err)
+	}
+
+	return nil
 }
 
 func (dc *Store) Stats() map[string]string {

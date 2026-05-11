@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +33,9 @@ type Client struct {
 	preloadItems int64
 	getCnt       int64
 	putCnt       int64
+
+	mu                 sync.Mutex
+	lastPreloadSources string
 }
 
 func NewClient(baseURL string) (*Client, error) {
@@ -137,6 +141,10 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 		return err
 	}
 
+	c.mu.Lock()
+	c.lastPreloadSources = strings.TrimSpace(res.Header.Get("X-GoCacheProgD-Preload-Sources"))
+	c.mu.Unlock()
+
 	var resp cache.Response
 
 	preloadItems := 0
@@ -166,13 +174,23 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	return err
 }
 
-func (c *Client) PostCacheUsed(commit string, actionIDs []string) error {
-	if commit == "" {
+func (c *Client) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string) error {
+	if commit == "" && changesID == "" {
 		return nil
 	}
 
 	body := strings.NewReader(strings.Join(actionIDs, "\n"))
-	endpoint := c.baseURL + "/cache-used?commit=" + url.QueryEscape(commit)
+	v := url.Values{}
+	if commit != "" {
+		v.Set("commit", commit)
+	}
+	if changesID != "" {
+		v.Set("changes-id", changesID)
+	}
+	if buildType != "" {
+		v.Set("build-type", buildType)
+	}
+	endpoint := c.baseURL + "/cache-used?" + v.Encode()
 
 	r, err := http.NewRequest(http.MethodPost, endpoint, body)
 	if err != nil {
@@ -376,15 +394,28 @@ func checkStatus(res *http.Response, expected int, op string) error {
 }
 
 func (c *Client) Stats() map[string]string {
+	c.mu.Lock()
+	lastPreloadSources := c.lastPreloadSources
+	c.mu.Unlock()
+
 	return map[string]string{
-		"bytes_read":    byteSize(atomic.LoadInt64(&c.bytesRead)),
-		"bytes_written": byteSize(atomic.LoadInt64(&c.bytesWritten)),
-		"preloaded":     fmt.Sprintf("%d", atomic.LoadInt64(&c.preloadItems)),
-		"get_95%":       fmt.Sprintf("%.2fms", c.latencyGet.Percentile(95)),
-		"get_cnt":       fmt.Sprintf("%d", atomic.LoadInt64(&c.getCnt)),
-		"put_95%":       fmt.Sprintf("%.2fms", c.latencyPut.Percentile(95)),
-		"put_cnt":       fmt.Sprintf("%d", atomic.LoadInt64(&c.putCnt)),
+		"bytes_read":      byteSize(atomic.LoadInt64(&c.bytesRead)),
+		"bytes_written":   byteSize(atomic.LoadInt64(&c.bytesWritten)),
+		"preload_bytes":   byteSize(atomic.LoadInt64(&c.preloadBytes)),
+		"preload_sources": lastPreloadSources,
+		"preloaded":       fmt.Sprintf("%d", atomic.LoadInt64(&c.preloadItems)),
+		"get_95%":         fmt.Sprintf("%.2fms", c.latencyGet.Percentile(95)),
+		"get_cnt":         fmt.Sprintf("%d", atomic.LoadInt64(&c.getCnt)),
+		"put_95%":         fmt.Sprintf("%.2fms", c.latencyPut.Percentile(95)),
+		"put_cnt":         fmt.Sprintf("%d", atomic.LoadInt64(&c.putCnt)),
 	}
+}
+
+func (c *Client) LastPreloadSources() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.lastPreloadSources
 }
 
 // Bytes.
