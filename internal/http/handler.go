@@ -1,9 +1,10 @@
 package http
 
 import (
+	"net/http"
+
 	"github.com/bool64/dev/version"
 	"github.com/vearutop/gocacheprogd/internal/cache"
-	"net/http"
 )
 
 type Handler struct {
@@ -28,19 +29,16 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.URL.Path == "/put" {
-		//println("put")
 		h.Put(rw, r)
 		return
 	}
 
 	if r.URL.Path == "/get" {
-		//println("get")
 		h.Get(rw, r)
 		return
 	}
 
 	if r.URL.Path == "/head" {
-		//println("head")
 		h.Head(rw, r)
 		return
 	}

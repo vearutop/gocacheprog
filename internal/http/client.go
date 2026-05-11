@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/vearutop/dynhist-go"
-	"github.com/vearutop/gocacheprogd/internal/cache"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +12,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/vearutop/dynhist-go"
+	"github.com/vearutop/gocacheprogd/internal/cache"
 )
 
 type Client struct {
@@ -26,6 +27,7 @@ type Client struct {
 
 	bytesRead    int64
 	bytesWritten int64
+	preloadBytes int64
 	preloadItems int64
 	getCnt       int64
 	putCnt       int64
@@ -152,6 +154,9 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	})
 
 	atomic.AddInt64(&c.preloadItems, int64(preloadItems))
+	atomic.AddInt64(&c.preloadBytes, atomic.LoadInt64(&c.bytesRead))
+	atomic.StoreInt64(&c.bytesRead, 0)
+	atomic.StoreInt64(&c.bytesWritten, 0)
 
 	return err
 }
@@ -258,8 +263,13 @@ func (c *Client) filterPutItems(values cache.Response) (cache.Response, error) {
 			continue
 		}
 
-		item.PrepareBodyReader()
-		item.DiskPath = ""
+		if item.Size >= cache.MinCompressionSize {
+			rd, err := item.CompressedBodyReader()
+
+			item.SetBodyReader(func() (io.ReadCloser, error) {
+				return rd, err
+			})
+		}
 
 		filteredItems = append(filteredItems, item)
 	}

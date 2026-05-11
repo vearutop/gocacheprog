@@ -3,8 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/vearutop/gocacheprogd/internal/http"
-	"github.com/vearutop/gocacheprogd/internal/local"
 	"log"
 	http2 "net/http"
 	"os"
@@ -12,6 +10,9 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/vearutop/gocacheprogd/internal/http"
+	"github.com/vearutop/gocacheprogd/internal/local"
 )
 
 func main() {
@@ -38,7 +39,7 @@ func run() error {
 		*dir = d
 	}
 
-	if err := os.MkdirAll(*dir, 0755); err != nil {
+	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
 

@@ -5,16 +5,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/vearutop/gocacheprogd/internal/cache"
-	"github.com/vearutop/gocacheprogd/internal/cacheprog"
-	"github.com/vearutop/gocacheprogd/internal/http"
-	"github.com/vearutop/gocacheprogd/internal/local"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprogd/internal/cacheprog"
+	"github.com/vearutop/gocacheprogd/internal/http"
+	"github.com/vearutop/gocacheprogd/internal/local"
 )
 
 func main() {
@@ -42,7 +43,7 @@ func run() error {
 		*dir = d
 	}
 
-	if err := os.MkdirAll(*dir, 0755); err != nil {
+	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
 

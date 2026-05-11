@@ -3,8 +3,6 @@ package local
 import (
 	"bytes"
 	"fmt"
-	"github.com/vearutop/gocacheprogd/internal/cache"
-	"github.com/vearutop/gocacheprogd/internal/cacheprog"
 	"io"
 	"log"
 	"maps"
@@ -13,6 +11,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprogd/internal/cacheprog"
 )
 
 type Proxy struct {
@@ -86,7 +87,7 @@ func (dc *Proxy) Lookup(req cacheprog.Request) {
 }
 
 const (
-	batchBarrierTick  = 50 * time.Millisecond
+	batchBarrierTick  = 20 * time.Millisecond
 	batchBarrierItems = 100  // Number of items to flush the queue.
 	batchBarrierSize  = 10e7 // Total size of items to flush the queue.
 )
@@ -191,7 +192,7 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 	err := p.Preload(req, func(resp cache.ResponseItem) {
 		items++
 
-		br, err := resp.UncompressedBodyReader()
+		br, err := resp.WireBodyReader()
 		if err != nil {
 			log.Printf("prepare uncompressed body %v: %s", resp, err.Error())
 			return

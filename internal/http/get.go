@@ -2,12 +2,13 @@ package http
 
 import (
 	"encoding/json"
-	"github.com/vearutop/gocacheprogd/internal/cache"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+
+	"github.com/vearutop/gocacheprogd/internal/cache"
 )
 
 func (h *Handler) Get(rw http.ResponseWriter, r *http.Request) {
@@ -69,5 +70,4 @@ func (h *Handler) Get(rw http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Println("get error:", err.Error(), "; bytes written:", n, "; content length:", cl)
 	}
-	//println("get done", "content length:", cl, "; bytes written:", n)
 }

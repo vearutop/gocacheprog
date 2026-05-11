@@ -2,9 +2,10 @@ package http
 
 import (
 	"fmt"
-	"github.com/vearutop/gocacheprogd/internal/cache"
 	"io"
 	"net/http"
+
+	"github.com/vearutop/gocacheprogd/internal/cache"
 )
 
 func (h *Handler) Put(rw http.ResponseWriter, r *http.Request) {

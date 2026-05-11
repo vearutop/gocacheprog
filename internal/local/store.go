@@ -3,7 +3,6 @@ package local
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/vearutop/gocacheprogd/internal/cache"
 	"io"
 	"log"
 	"maps"
@@ -14,10 +13,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/vearutop/gocacheprogd/internal/cache"
 )
 
 type Store struct {
-	dir string
+	dir      string
+	compress bool
 
 	mu    sync.Mutex
 	index map[string]indexEntry
@@ -33,12 +35,12 @@ type Store struct {
 
 // indexEntry is the metadata that Store stores on disk for an ActionID.
 type indexEntry struct {
-	OutputID  string `json:"o"`
-	Size      int64  `json:"n"`
-	TimeMicro int64  `json:"t"`
+	OutputID   string `json:"o"`
+	Size       int64  `json:"n"`
+	TimeMicro  int64  `json:"t,omitempty"`
+	Compressed int64  `json:"c,omitempty"`
+	WireSize   int64  `json:"w,omitempty"`
 }
-
-const minCompressionSize = 200 // 200 bytes brings ratio of ~1.5x.
 
 func NewStore(dir string, withCompression bool) (*Store, error) {
 	dir, err := toAbsPath(dir)
@@ -47,8 +49,9 @@ func NewStore(dir string, withCompression bool) (*Store, error) {
 	}
 
 	dc := &Store{
-		dir:   dir,
-		index: make(map[string]indexEntry),
+		dir:      dir,
+		compress: withCompression,
+		index:    make(map[string]indexEntry),
 	}
 
 	indexPath := filepath.Join(dir, "index.json")
@@ -129,6 +132,8 @@ func (dc *Store) responseItem(actionID string, ie indexEntry) cache.ResponseItem
 	res.OutputID = ie.OutputID
 	res.Size = ie.Size
 	res.DiskPath = dc.OutputFilename(ie.OutputID)
+	res.IsCompressed = ie.Compressed == 1
+	res.WireSize = ie.WireSize
 
 	t := time.UnixMicro(ie.TimeMicro)
 	res.Time = &t
@@ -163,7 +168,39 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 
 	atomic.AddInt64(&dc.puts, 1)
 
-	rd, err := item.UncompressedBodyReader()
+	ie := indexEntry{
+		OutputID:  item.OutputID,
+		Size:      item.Size,
+		TimeMicro: now.UnixMicro(),
+	}
+
+	var (
+		rd  io.Reader
+		err error
+	)
+
+	if item.IsCompressed {
+		if !dc.compress {
+			// Decompress a compressed body.
+			rd, err = item.UncompressedBodyReader()
+		} else {
+			// Pass compressed body as is.
+			rd, err = item.WireBodyReader()
+			ie.Compressed = 1
+			ie.WireSize = item.WireSize
+		}
+	} else {
+		if dc.compress && item.Size >= cache.MinCompressionSize {
+			// Enable compression if it is not there.
+			rd, err = item.CompressedBodyReader()
+			ie.Compressed = 1
+			ie.WireSize = item.WireSize
+		} else {
+			// Pass uncompressed body as is.
+			rd, err = item.UncompressedBodyReader()
+		}
+	}
+
 	if err != nil {
 		atomic.AddInt64(&dc.errors, 1)
 		println("get reader for put:", err.Error())
@@ -179,11 +216,7 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	dc.index[item.ActionID] = indexEntry{
-		OutputID:  item.OutputID,
-		Size:      item.Size,
-		TimeMicro: now.UnixMicro(),
-	}
+	dc.index[item.ActionID] = ie
 
 	atomic.AddInt64(&dc.putsCompleted, 1)
 
@@ -217,7 +250,7 @@ func (dc *Store) Close() error {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(dc.dir, "index.json"), d, 0600)
+	return os.WriteFile(filepath.Join(dc.dir, "index.json"), d, 0o600)
 }
 
 func (dc *Store) OutputFilename(outputID string) string {
@@ -233,7 +266,7 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 
 	dc.mu.Lock()
 	for k, v := range dc.index {
-		if v.Size > req.MaxSize {
+		if v.WireSize > req.MaxSize {
 			continue
 		}
 

@@ -11,7 +11,11 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
+
+const MinCompressionSize = 200 // 200 bytes brings ratio of ~1.5x.
 
 type Store interface {
 	Get(req Request, cb func(resp ResponseItem)) error
@@ -89,12 +93,71 @@ func (ri *ResponseItem) UncompressedBodyReader() (io.ReadCloser, error) {
 		return nil, fmt.Errorf("no body reader for item: %+v", ri)
 	}
 
+	// Dynamically decompress the body.
+	if ri.IsCompressed {
+		rd, err := ri.bodyReader()
+		if err != nil {
+			return nil, err
+		}
+		defer rd.Close()
+
+		zrd, err := zstd.NewReader(rd)
+		if err != nil {
+			return nil, err
+		}
+
+		return zrd.IOReadCloser(), nil
+	}
+
 	return ri.bodyReader()
+}
+
+// CompressedBodyReader updates item with compression.
+func (ri *ResponseItem) CompressedBodyReader() (io.ReadCloser, error) {
+	ri.PrepareBodyReader()
+
+	if ri.Size == 0 && ri.WireSize == 0 {
+		return nil, nil
+	}
+
+	if ri.bodyReader == nil {
+		return nil, fmt.Errorf("no body reader for item: %+v", ri)
+	}
+
+	if ri.IsCompressed {
+		return ri.bodyReader()
+	}
+
+	rd, err := ri.bodyReader()
+	if err != nil {
+		return nil, err
+	}
+	defer rd.Close()
+
+	data, err := io.ReadAll(rd)
+
+	buf := make([]byte, 0, len(data)/2)
+	buf = zstd.EncodeTo(buf, data)
+
+	ri.WireSize = int64(len(buf))
+	ri.IsCompressed = true
+
+	return io.NopCloser(bytes.NewReader(buf)), nil
 }
 
 // WireBodyReader can be encoded or compressed.
 func (ri *ResponseItem) WireBodyReader() (io.ReadCloser, error) {
-	return ri.UncompressedBodyReader()
+	ri.PrepareBodyReader()
+
+	if ri.Size == 0 && ri.WireSize == 0 {
+		return nil, nil
+	}
+
+	if ri.bodyReader == nil {
+		return nil, fmt.Errorf("no body reader for item: %+v", ri)
+	}
+
+	return ri.bodyReader()
 }
 
 func (ri *ResponseItem) WriteTo(w io.Writer) (int64, error) {
@@ -149,11 +212,6 @@ func (ri *ResponseItem) WriteTo(w io.Writer) (int64, error) {
 	if err != nil {
 		return int64(n), fmt.Errorf("write item %T (written %d bytes) %+v: %w", bodyReader, n, ri, err)
 	}
-
-	//n, err := io.Copy(w, bodyReader)
-	//if err != nil {
-	//	return n, fmt.Errorf("write item %+v: %w", ri, err)
-	//}
 
 	if int64(n) != ri.WireSize {
 		return int64(n), fmt.Errorf("unexpected item write: %d bytes, expected %d, %T, %+v", n, ri.WireSize, bodyReader, ri)

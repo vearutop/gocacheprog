@@ -2,12 +2,13 @@ package http
 
 import (
 	"encoding/json"
-	"github.com/vearutop/gocacheprogd/internal/cache"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+
+	"github.com/vearutop/gocacheprogd/internal/cache"
 )
 
 func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
