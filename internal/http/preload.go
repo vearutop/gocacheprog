@@ -8,13 +8,24 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/vearutop/gocacheprogd/internal/cache"
 )
 
 func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
-	startedAt := time.Now()
+	atomic.AddInt64(&h.preloadStarted, 1)
+	waitStartedAt := time.Now()
+	h.preloadSem <- struct{}{}
+	queueWait := time.Since(waitStartedAt)
+	prepareStartedAt := time.Now()
+	atomic.AddInt64(&h.preloadInFlight, 1)
+	defer func() {
+		atomic.AddInt64(&h.preloadInFlight, -1)
+		atomic.AddInt64(&h.preloadCompleted, 1)
+		<-h.preloadSem
+	}()
 
 	bb, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -94,7 +105,23 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("preload prepared in %s; sources=%s; items=%d; content_length=%d", time.Since(startedAt), preloadSources, len(resp.Items), cl)
+	prepareTime := time.Since(prepareStartedAt)
+	totalTime := queueWait + prepareTime
+
+	log.Printf(
+		"preload queue_wait=%s prepare_time=%s total_time=%s; remote=%s; commit=%q; parent=%q; changes=%q; build_type=%q; sources=%s; items=%d; content_length=%d",
+		queueWait,
+		prepareTime,
+		totalTime,
+		r.RemoteAddr,
+		req.Commit,
+		req.ParentCommit,
+		req.ChangesID,
+		req.BuildType,
+		preloadSources,
+		len(resp.Items),
+		cl,
+	)
 
 	rw.Header().Set("Content-Type", "application/octet-stream")
 	rw.Header().Set("Content-Length", strconv.Itoa(int(cl)))

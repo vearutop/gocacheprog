@@ -67,6 +67,51 @@ func TestNewClient(t *testing.T) {
 	}))
 }
 
+func TestNewClientWithSession_SendsVersionSessionHeaders(t *testing.T) {
+	var gotHeaders map[string]string
+
+	srv := httptest.NewServer(nethttp.HandlerFunc(func(rw nethttp.ResponseWriter, r *nethttp.Request) {
+		gotHeaders = map[string]string{
+			"session":    r.Header.Get("X-GoCacheProg-Session-Id"),
+			"started_at": r.Header.Get("X-GoCacheProg-Started-At"),
+			"pid":        r.Header.Get("X-GoCacheProg-Pid"),
+			"cache_dir":  r.Header.Get("X-GoCacheProg-Cache-Dir"),
+			"commit":     r.Header.Get("X-GoCacheProg-Commit"),
+			"parent":     r.Header.Get("X-GoCacheProg-Parent"),
+			"changes":    r.Header.Get("X-GoCacheProg-Changes"),
+			"build_type": r.Header.Get("X-GoCacheProg-Build-Type"),
+			"base":       r.Header.Get("X-GoCacheProg-Base"),
+		}
+
+		_, _ = rw.Write([]byte("gocacheprogd test"))
+	}))
+	t.Cleanup(srv.Close)
+
+	startedAt := time.Date(2026, time.May, 12, 0, 20, 0, 123, time.UTC)
+	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{
+		SessionID:  "session-123",
+		StartedAt:  startedAt,
+		PID:        42,
+		CacheDir:   "/tmp/build-cache",
+		Commit:     "commit123",
+		Parent:     "parent123",
+		ChangesID:  "repo/pr-123",
+		BuildType:  "unit",
+		BaseCommit: "base123",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	require.Equal(t, "session-123", gotHeaders["session"])
+	require.Equal(t, startedAt.Format(time.RFC3339Nano), gotHeaders["started_at"])
+	require.Equal(t, "42", gotHeaders["pid"])
+	require.Equal(t, "/tmp/build-cache", gotHeaders["cache_dir"])
+	require.Equal(t, "commit123", gotHeaders["commit"])
+	require.Equal(t, "parent123", gotHeaders["parent"])
+	require.Equal(t, "repo/pr-123", gotHeaders["changes"])
+	require.Equal(t, "unit", gotHeaders["build_type"])
+	require.Equal(t, "base123", gotHeaders["base"])
+}
+
 func TestClient_PostCacheUsed(t *testing.T) {
 	dir := t.TempDir()
 
@@ -80,16 +125,18 @@ func TestClient_PostCacheUsed(t *testing.T) {
 	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
-	err = client.PostCacheUsed("abcdef1234", "repo/pr-123", "unit", []string{"actionId2", "actionId1", "actionId1"})
+	err = client.PostCacheUsed("abcdef1234", "repo/pr-123", "unit", []string{"actionId2", "actionId1", "actionId1"}, false)
+	require.NoError(t, err)
+	err = client.PostCacheUsed("abcdef1234", "repo/pr-123", "unit", []string{"actionId3", "actionId1"}, false)
 	require.NoError(t, err)
 
 	b, err := os.ReadFile(filepath.Join(dir, "manifests", "buildtype-unit", "ab", "abcdef1234"))
 	require.NoError(t, err)
-	require.Equal(t, "actionId2\nactionId1\n", string(b))
+	require.Equal(t, "actionId2\nactionId1\nactionId3\n", string(b))
 
 	b, err = os.ReadFile(filepath.Join(dir, "manifests", "buildtype-unit", "changes", "re", "repo%2Fpr-123"))
 	require.NoError(t, err)
-	require.Equal(t, "actionId2\nactionId1\n", string(b))
+	require.Equal(t, "actionId2\nactionId1\nactionId3\n", string(b))
 }
 
 func TestPreload_UsesCommitManifestFilters(t *testing.T) {
@@ -106,8 +153,8 @@ func TestPreload_UsesCommitManifestFilters(t *testing.T) {
 	}
 
 	require.NoError(t, localStore.Put(cache.Response{Items: items}))
-	require.NoError(t, localStore.PostCacheUsed("parent123", "", "", []string{"actionId1", "missingAction"}))
-	require.NoError(t, localStore.PostCacheUsed("base123", "", "", []string{"actionId3"}))
+	require.NoError(t, localStore.PostCacheUsed("parent123", "", "", []string{"actionId1", "missingAction"}, false))
+	require.NoError(t, localStore.PostCacheUsed("base123", "", "", []string{"actionId3"}, false))
 
 	h := http.NewHandler(localStore, "")
 	srv := httptest.NewServer(h)
@@ -143,9 +190,9 @@ func TestPreload_UsesCurrentCommitManifestForRerun(t *testing.T) {
 	}
 
 	require.NoError(t, localStore.Put(cache.Response{Items: items}))
-	require.NoError(t, localStore.PostCacheUsed("current123", "", "", []string{"actionId2"}))
-	require.NoError(t, localStore.PostCacheUsed("parent123", "", "", []string{"actionId1"}))
-	require.NoError(t, localStore.PostCacheUsed("base123", "", "", []string{"actionId3"}))
+	require.NoError(t, localStore.PostCacheUsed("current123", "", "", []string{"actionId2"}, false))
+	require.NoError(t, localStore.PostCacheUsed("parent123", "", "", []string{"actionId1"}, false))
+	require.NoError(t, localStore.PostCacheUsed("base123", "", "", []string{"actionId3"}, false))
 
 	h := http.NewHandler(localStore, "")
 	srv := httptest.NewServer(h)
@@ -182,9 +229,9 @@ func TestPreload_UsesChangesIDBetweenParentAndBase(t *testing.T) {
 	}
 
 	require.NoError(t, localStore.Put(cache.Response{Items: items}))
-	require.NoError(t, localStore.PostCacheUsed("parent123", "", "unit", []string{"actionId1"}))
-	require.NoError(t, localStore.PostCacheUsed("", "repo/pr-123", "unit", []string{"actionId2"}))
-	require.NoError(t, localStore.PostCacheUsed("base123", "", "unit", []string{"actionId3"}))
+	require.NoError(t, localStore.PostCacheUsed("parent123", "", "unit", []string{"actionId1"}, false))
+	require.NoError(t, localStore.PostCacheUsed("", "repo/pr-123", "unit", []string{"actionId2"}, false))
+	require.NoError(t, localStore.PostCacheUsed("base123", "", "unit", []string{"actionId3"}, false))
 
 	h := http.NewHandler(localStore, "")
 	srv := httptest.NewServer(h)
@@ -240,7 +287,7 @@ func TestClient_PostCacheUsed_HTTPError(t *testing.T) {
 	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
-	err = client.PostCacheUsed("", strings.Repeat("a", 101), "", []string{"actionId1"})
+	err = client.PostCacheUsed("", strings.Repeat("a", 101), "", []string{"actionId1"}, false)
 	require.EqualError(t, err, "cache-used status 400: changes-id too long: 101 > 100")
 }
 
@@ -260,7 +307,7 @@ func TestClient_AuthToken(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	_, err = http.NewClient(srv.URL, "")
-	require.EqualError(t, err, "unexpected version: unauthorized\n")
+	require.EqualError(t, err, "authentication failed: -auth-token <value> is missing or incorrect")
 
 	client, err := http.NewClient(srv.URL, "secret-token")
 	require.NoError(t, err)
@@ -301,6 +348,13 @@ func TestStatus(t *testing.T) {
 	require.True(t, ok)
 	require.Contains(t, runtimeStats, "heapInuseBytes")
 	require.Contains(t, runtimeStats, "heapInuse")
+
+	httpStats, ok := body["http"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "2", httpStats["preloadLimit"])
+	require.Contains(t, httpStats, "preloadInFlight")
+	require.Contains(t, httpStats, "preloadStarted")
+	require.Contains(t, httpStats, "preloadCompleted")
 }
 
 func makeItem(actionID, outputID, body string, now *time.Time) cache.ResponseItem {

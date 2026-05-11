@@ -27,6 +27,7 @@ func run() error {
 		dir          = flag.String("dir", "", "Cache store")
 		maxDiskBytes = flag.Int64("max-disk-bytes", 0, "Optional total on-disk cache size limit in bytes; 0 disables eviction")
 		authToken    = flag.String("auth-token", "", "Optional bearer token required by clients")
+		preloadLimit = flag.Int("preload-limit", 2, "Maximum number of concurrent preload preparations")
 	)
 
 	flag.Parse()
@@ -51,7 +52,7 @@ func run() error {
 	}
 	defer store.Close()
 
-	h := http.NewHandler(store, *authToken)
+	h := http.NewHandlerWithPreloadLimit(store, *authToken, *preloadLimit)
 
 	go func() {
 		for {

@@ -61,7 +61,7 @@ func TestStorePreload_CurrentCommitManifestUsedForSameCommitRestart(t *testing.T
 		testItem("actionId1", "outputId1", "body-1", &now),
 		testItem("actionId2", "outputId2", "body-2", &now),
 	}}))
-	require.NoError(t, store.PostCacheUsed("current123", "", "", []string{"actionId2"}))
+	require.NoError(t, store.PostCacheUsed("current123", "", "", []string{"actionId2"}, false))
 
 	var got []string
 	err = store.Preload(cache.PreloadRequest{
@@ -84,9 +84,9 @@ func TestStorePreload_ChangesIDManifestUsedAfterParent(t *testing.T) {
 		testItem("actionId2", "outputId2", "body-2", &now),
 		testItem("actionId3", "outputId3", "body-3", &now),
 	}}))
-	require.NoError(t, store.PostCacheUsed("parent123", "", "", []string{"actionId1"}))
-	require.NoError(t, store.PostCacheUsed("", "repo/pr-123", "", []string{"actionId2"}))
-	require.NoError(t, store.PostCacheUsed("base123", "", "", []string{"actionId3"}))
+	require.NoError(t, store.PostCacheUsed("parent123", "", "", []string{"actionId1"}, false))
+	require.NoError(t, store.PostCacheUsed("", "repo/pr-123", "", []string{"actionId2"}, false))
+	require.NoError(t, store.PostCacheUsed("base123", "", "", []string{"actionId3"}, false))
 
 	var got []string
 	err = store.Preload(cache.PreloadRequest{
@@ -118,8 +118,8 @@ func TestStorePreload_BuildTypeIsolated(t *testing.T) {
 		testItem("actionId1", "outputId1", "body-1", &now),
 		testItem("actionId2", "outputId2", "body-2", &now),
 	}}))
-	require.NoError(t, store.PostCacheUsed("current123", "", "unit", []string{"actionId1"}))
-	require.NoError(t, store.PostCacheUsed("current123", "", "race", []string{"actionId2"}))
+	require.NoError(t, store.PostCacheUsed("current123", "", "unit", []string{"actionId1"}, false))
+	require.NoError(t, store.PostCacheUsed("current123", "", "race", []string{"actionId2"}, false))
 
 	var gotUnit []string
 	err = store.Preload(cache.PreloadRequest{
@@ -142,6 +142,43 @@ func TestStorePreload_BuildTypeIsolated(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"actionId2"}, gotRace)
+}
+
+func TestStorePostCacheUsed_MergesWithExistingManifest(t *testing.T) {
+	store, err := NewStore(t.TempDir(), true)
+	require.NoError(t, err)
+
+	require.NoError(t, store.PostCacheUsed("current123", "", "", []string{"actionId1", "actionId2"}, false))
+	require.NoError(t, store.PostCacheUsed("current123", "", "", []string{"actionId2", "actionId3"}, false))
+
+	got, err := store.loadCommitManifest("current123", "")
+	require.NoError(t, err)
+	require.Equal(t, []string{"actionId1", "actionId2", "actionId3"}, got)
+}
+
+func TestStorePostCacheUsed_ReplaceChangesManifestOnColdStart(t *testing.T) {
+	store, err := NewStore(t.TempDir(), true)
+	require.NoError(t, err)
+
+	require.NoError(t, store.PostCacheUsed("", "repo/pr-123", "", []string{"oldAction", "sharedAction"}, false))
+	require.NoError(t, store.PostCacheUsed("", "repo/pr-123", "", []string{"newAction", "sharedAction"}, true))
+
+	got, err := store.loadChangesManifest("repo/pr-123", "")
+	require.NoError(t, err)
+	require.Equal(t, []string{"newAction", "sharedAction"}, got)
+}
+
+func TestStoreHasEntries(t *testing.T) {
+	store, err := NewStore(t.TempDir(), true)
+	require.NoError(t, err)
+	require.False(t, store.HasEntries())
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "body-1", &now),
+	}}))
+
+	require.True(t, store.HasEntries())
 }
 
 func TestStorePut_WritesEntriesUnderPrefixedDir(t *testing.T) {

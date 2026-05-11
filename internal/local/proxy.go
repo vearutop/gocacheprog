@@ -123,7 +123,7 @@ func (dc *Proxy) UsedActionIDs() []string {
 	return res
 }
 
-func (dc *Proxy) PostCacheUsed(commit string, changesID string, buildType string) error {
+func (dc *Proxy) PostCacheUsed(commit string, changesID string, buildType string, replaceChanges bool) error {
 	if commit == "" && changesID == "" {
 		return nil
 	}
@@ -133,7 +133,11 @@ func (dc *Proxy) PostCacheUsed(commit string, changesID string, buildType string
 		return nil
 	}
 
-	return recorder.PostCacheUsed(commit, changesID, buildType, dc.UsedActionIDs())
+	return recorder.PostCacheUsed(commit, changesID, buildType, dc.UsedActionIDs(), replaceChanges)
+}
+
+func (dc *Proxy) HasLocalEntries() bool {
+	return dc.disk.HasEntries()
 }
 
 const (

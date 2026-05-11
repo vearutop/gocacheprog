@@ -17,8 +17,13 @@ func (h *Handler) Status(rw http.ResponseWriter, r *http.Request) {
 
 	if s, ok := h.store.(statsProvider); ok {
 		stats := s.Stats()
-		resp["store"] = stats
 		augmentStatusStats(stats)
+		resp["store"] = stats
+	}
+
+	httpStats := h.Stats()
+	if len(httpStats) > 0 {
+		resp["http"] = httpStats
 	}
 
 	var ms runtime.MemStats

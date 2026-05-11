@@ -81,7 +81,18 @@ func run() error {
 	resps := make(chan cacheprog.Response, 100)
 
 	if *remoteURL != "" {
-		upstream, err = http.NewClient(*remoteURL, *authToken)
+		sessionStartedAt := time.Now().UTC()
+		upstream, err = http.NewClientWithSession(*remoteURL, *authToken, &http.SessionInfo{
+			SessionID:  fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano()),
+			StartedAt:  sessionStartedAt,
+			PID:        os.Getpid(),
+			CacheDir:   *dir,
+			Commit:     *commit,
+			Parent:     *parentCommit,
+			ChangesID:  *changesID,
+			BuildType:  *buildType,
+			BaseCommit: *baseCommit,
+		})
 		if err != nil {
 			return fmt.Errorf("remote client: %w", err)
 		}
@@ -93,6 +104,7 @@ func run() error {
 	}
 
 	dc.Verbose = true
+	initialLocalEntries := dc.HasLocalEntries()
 
 	br := bufio.NewReader(os.Stdin)
 	jd := json.NewDecoder(br)
@@ -104,26 +116,30 @@ func run() error {
 	}
 
 	if *preload || *commit != "" || *changesID != "" || *buildType != "" || *baseCommit != "" || *parentCommit != "" {
-		st := time.Now()
-		println("preloading cache up to", *preloadSize, "bytes per item from remote server ...")
-		if err := dc.Preload(cache.PreloadRequest{
-			MaxSize:      *preloadSize,
-			Commit:       *commit,
-			ChangesID:    *changesID,
-			BuildType:    *buildType,
-			BaseCommit:   *baseCommit,
-			ParentCommit: *parentCommit,
-		}); err != nil {
-			return fmt.Errorf("preload cache: %w", err)
-		}
-
-		if s, ok := upstream.(interface{ LastPreloadSources() string }); ok {
-			if sources := s.LastPreloadSources(); sources != "" {
-				println("preload sources:", sources)
+		if dc.HasLocalEntries() {
+			println("skipping preload because local cache dir is already populated")
+		} else {
+			st := time.Now()
+			println("preloading cache up to", *preloadSize, "bytes per item from remote server ...")
+			if err := dc.Preload(cache.PreloadRequest{
+				MaxSize:      *preloadSize,
+				Commit:       *commit,
+				ChangesID:    *changesID,
+				BuildType:    *buildType,
+				BaseCommit:   *baseCommit,
+				ParentCommit: *parentCommit,
+			}); err != nil {
+				return fmt.Errorf("preload cache: %w", err)
 			}
-		}
 
-		println("preload done in", time.Since(st).String())
+			if s, ok := upstream.(interface{ LastPreloadSources() string }); ok {
+				if sources := s.LastPreloadSources(); sources != "" {
+					println("preload sources:", sources)
+				}
+			}
+
+			println("preload done in", time.Since(st).String())
+		}
 	}
 
 	go func() {
@@ -198,7 +214,7 @@ func run() error {
 		return fmt.Errorf("close cache: %w", err)
 	}
 
-	if err := dc.PostCacheUsed(*commit, *changesID, *buildType); err != nil {
+	if err := dc.PostCacheUsed(*commit, *changesID, *buildType, !initialLocalEntries); err != nil {
 		return fmt.Errorf("post cache-used: %w", err)
 	}
 	close(resps)

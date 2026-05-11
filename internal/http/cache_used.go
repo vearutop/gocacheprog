@@ -13,6 +13,7 @@ func (h *Handler) CacheUsed(rw http.ResponseWriter, r *http.Request) {
 	commit := strings.TrimSpace(r.URL.Query().Get("commit"))
 	changesID := strings.TrimSpace(r.URL.Query().Get("changes-id"))
 	buildType := strings.TrimSpace(r.URL.Query().Get("build-type"))
+	replaceChanges := r.URL.Query().Get("replace-changes") == "1"
 	if commit == "" && changesID == "" {
 		http.Error(rw, "missing commit or changes-id", http.StatusBadRequest)
 		return
@@ -32,7 +33,7 @@ func (h *Handler) CacheUsed(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := recorder.PostCacheUsed(commit, changesID, buildType, actionIDs); err != nil {
+	if err := recorder.PostCacheUsed(commit, changesID, buildType, actionIDs, replaceChanges); err != nil {
 		if isManifestValidationError(err) {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return

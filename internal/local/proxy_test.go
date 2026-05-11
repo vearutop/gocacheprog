@@ -3,6 +3,7 @@ package local
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/vearutop/gocacheprogd/internal/cache"
@@ -22,11 +23,12 @@ func TestProxyPostCacheUsed_ReportsDedupedSortedActionIDs(t *testing.T) {
 	proxy.recordUsedActionID("actionId1")
 	proxy.recordUsedActionID("actionId2")
 
-	require.NoError(t, proxy.PostCacheUsed("commit123", "repo/pr-123", "unit"))
+	require.NoError(t, proxy.PostCacheUsed("commit123", "repo/pr-123", "unit", false))
 	require.True(t, upstream.called)
 	require.Equal(t, "commit123", upstream.commit)
 	require.Equal(t, "repo/pr-123", upstream.changesID)
 	require.Equal(t, "unit", upstream.buildType)
+	require.False(t, upstream.replaceChanges)
 	require.Equal(t, []string{"actionId1", "actionId2"}, upstream.actionIDs)
 }
 
@@ -39,9 +41,27 @@ func TestProxyPostCacheUsed_NoOpWithoutUsageRecorder(t *testing.T) {
 
 	proxy.recordUsedActionID("actionId1")
 
-	require.NoError(t, proxy.PostCacheUsed("commit123", "", ""))
-	require.NoError(t, proxy.PostCacheUsed("", "changes123", ""))
-	require.NoError(t, proxy.PostCacheUsed("", "", ""))
+	require.NoError(t, proxy.PostCacheUsed("commit123", "", "", false))
+	require.NoError(t, proxy.PostCacheUsed("", "changes123", "", false))
+	require.NoError(t, proxy.PostCacheUsed("", "", "", false))
+}
+
+func TestProxyHasLocalEntries(t *testing.T) {
+	proxy, err := NewProxy(t.TempDir(), noopStore{}, make(chan cacheprog.Response, 1))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	require.False(t, proxy.HasLocalEntries())
+
+	proxy.Put(cacheprog.Request{
+		ActionID: "actionId1",
+		OutputID: "outputId1",
+		BodySize: int64(len("body-1")),
+	}, []byte("body-1"))
+
+	require.Eventually(t, proxy.HasLocalEntries, time.Second, 10*time.Millisecond)
 }
 
 func TestProxyStats_HitBreakdown(t *testing.T) {
@@ -74,11 +94,12 @@ func TestProxyStats_HitBreakdown(t *testing.T) {
 }
 
 type usageRecorderStub struct {
-	called    bool
-	commit    string
-	changesID string
-	buildType string
-	actionIDs []string
+	called         bool
+	commit         string
+	changesID      string
+	buildType      string
+	replaceChanges bool
+	actionIDs      []string
 }
 
 func (u *usageRecorderStub) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
@@ -89,11 +110,12 @@ func (u *usageRecorderStub) Put(values cache.Response) error {
 	return nil
 }
 
-func (u *usageRecorderStub) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string) error {
+func (u *usageRecorderStub) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string, replaceChanges bool) error {
 	u.called = true
 	u.commit = commit
 	u.changesID = changesID
 	u.buildType = buildType
+	u.replaceChanges = replaceChanges
 	u.actionIDs = append([]string(nil), actionIDs...)
 
 	return nil

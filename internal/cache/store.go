@@ -27,7 +27,7 @@ type Preloader interface {
 }
 
 type UsageRecorder interface {
-	PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string) error
+	PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string, replaceChanges bool) error
 }
 
 type PreloadSourceProvider interface {

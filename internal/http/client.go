@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +19,20 @@ import (
 	"github.com/vearutop/dynhist-go"
 	"github.com/vearutop/gocacheprogd/internal/cache"
 )
+
+var gatewayRetryDelay = 5 * time.Second
+
+type SessionInfo struct {
+	SessionID  string
+	StartedAt  time.Time
+	PID        int
+	CacheDir   string
+	Commit     string
+	Parent     string
+	ChangesID  string
+	BuildType  string
+	BaseCommit string
+}
 
 type Client struct {
 	baseURL   string
@@ -40,6 +55,10 @@ type Client struct {
 }
 
 func NewClient(baseURL string, authToken string) (*Client, error) {
+	return NewClientWithSession(baseURL, authToken, nil)
+}
+
+func NewClientWithSession(baseURL string, authToken string, sessionInfo *SessionInfo) (*Client, error) {
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/version", nil)
@@ -47,6 +66,7 @@ func NewClient(baseURL string, authToken string) (*Client, error) {
 		return nil, err
 	}
 	setAuthHeader(req, authToken)
+	setSessionHeaders(req, sessionInfo)
 
 	client := &Client{baseURL: baseURL, authToken: authToken}
 	client.latencyGet = &dynhist.Collector{WeightFunc: dynhist.LatencyWidth, BucketsLimit: 50}
@@ -78,11 +98,18 @@ func NewClient(baseURL string, authToken string) (*Client, error) {
 		}, nil
 	}
 
-	resp, err := client.tr.RoundTrip(req)
+	resp, err := client.roundTrip(req, "version")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if err := checkStatus(resp, http.StatusOK, "version"); err != nil {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return nil, fmt.Errorf("authentication failed: -auth-token <value> is missing or incorrect")
+		}
+		return nil, err
+	}
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -94,6 +121,40 @@ func NewClient(baseURL string, authToken string) (*Client, error) {
 	}
 
 	return client, nil
+}
+
+func setSessionHeaders(req *http.Request, sessionInfo *SessionInfo) {
+	if sessionInfo == nil {
+		return
+	}
+
+	if sessionInfo.SessionID != "" {
+		req.Header.Set("X-GoCacheProg-Session-Id", sessionInfo.SessionID)
+	}
+	if !sessionInfo.StartedAt.IsZero() {
+		req.Header.Set("X-GoCacheProg-Started-At", sessionInfo.StartedAt.UTC().Format(time.RFC3339Nano))
+	}
+	if sessionInfo.PID != 0 {
+		req.Header.Set("X-GoCacheProg-Pid", strconv.Itoa(sessionInfo.PID))
+	}
+	if sessionInfo.CacheDir != "" {
+		req.Header.Set("X-GoCacheProg-Cache-Dir", sessionInfo.CacheDir)
+	}
+	if sessionInfo.Commit != "" {
+		req.Header.Set("X-GoCacheProg-Commit", sessionInfo.Commit)
+	}
+	if sessionInfo.Parent != "" {
+		req.Header.Set("X-GoCacheProg-Parent", sessionInfo.Parent)
+	}
+	if sessionInfo.ChangesID != "" {
+		req.Header.Set("X-GoCacheProg-Changes", sessionInfo.ChangesID)
+	}
+	if sessionInfo.BuildType != "" {
+		req.Header.Set("X-GoCacheProg-Build-Type", sessionInfo.BuildType)
+	}
+	if sessionInfo.BaseCommit != "" {
+		req.Header.Set("X-GoCacheProg-Base", sessionInfo.BaseCommit)
+	}
 }
 
 type countingConn struct {
@@ -134,7 +195,7 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	r.Header.Set("Content-Type", "application/json")
 	setAuthHeader(r, c.authToken)
 
-	res, err := c.tr.RoundTrip(r)
+	res, err := c.roundTrip(r, "preload")
 	if err != nil {
 		return err
 	}
@@ -177,7 +238,7 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	return err
 }
 
-func (c *Client) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string) error {
+func (c *Client) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string, replaceChanges bool) error {
 	if commit == "" && changesID == "" {
 		return nil
 	}
@@ -193,6 +254,9 @@ func (c *Client) PostCacheUsed(commit string, changesID string, buildType string
 	if buildType != "" {
 		v.Set("build-type", buildType)
 	}
+	if replaceChanges {
+		v.Set("replace-changes", "1")
+	}
 	endpoint := c.baseURL + "/cache-used?" + v.Encode()
 
 	r, err := http.NewRequest(http.MethodPost, endpoint, body)
@@ -202,7 +266,7 @@ func (c *Client) PostCacheUsed(commit string, changesID string, buildType string
 	r.Header.Set("Content-Type", "text/plain")
 	setAuthHeader(r, c.authToken)
 
-	res, err := c.tr.RoundTrip(r)
+	res, err := c.roundTrip(r, "cache-used")
 	if err != nil {
 		return err
 	}
@@ -233,7 +297,7 @@ func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error 
 
 	st := time.Now()
 
-	res, err := c.tr.RoundTrip(r)
+	res, err := c.roundTrip(r, "get")
 	if err != nil {
 		return err
 	}
@@ -282,7 +346,7 @@ func (c *Client) head(req cache.Request) (cache.Response, error) {
 	r.Header.Set("Content-Type", "application/json")
 	setAuthHeader(r, c.authToken)
 
-	res, err := c.tr.RoundTrip(r)
+	res, err := c.roundTrip(r, "head")
 	if err != nil {
 		return resp, err
 	}
@@ -371,7 +435,7 @@ func (c *Client) Put(values cache.Response) error {
 
 	st := time.Now()
 
-	res, err := c.tr.RoundTrip(req)
+	res, err := c.roundTrip(req, "put")
 	if err != nil {
 		return fmt.Errorf("sending request: %w", err)
 	}
@@ -431,6 +495,62 @@ func setAuthHeader(r *http.Request, authToken string) {
 	}
 
 	r.Header.Set("Authorization", "Bearer "+authToken)
+}
+
+func (c *Client) roundTrip(req *http.Request, op string) (*http.Response, error) {
+	res, err := c.tr.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.StatusCode != http.StatusBadGateway && res.StatusCode != http.StatusGatewayTimeout {
+		return res, nil
+	}
+
+	if req.GetBody == nil && req.Body != nil && req.Body != http.NoBody {
+		return res, nil
+	}
+
+	b, readErr := io.ReadAll(res.Body)
+	res.Body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+
+	log.Printf("%s got status %d, retrying once in %s", op, res.StatusCode, gatewayRetryDelay)
+	time.Sleep(gatewayRetryDelay)
+
+	var body io.ReadCloser
+	if req.GetBody != nil {
+		body, err = req.GetBody()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		body = http.NoBody
+	}
+
+	retryReq := req.Clone(req.Context())
+	retryReq.Body = body
+	retryReq.GetBody = req.GetBody
+	retryReq.ContentLength = req.ContentLength
+
+	retryRes, err := c.tr.RoundTrip(retryReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if retryRes.StatusCode == http.StatusBadGateway || retryRes.StatusCode == http.StatusGatewayTimeout {
+		retryRes.Body.Close()
+		return &http.Response{
+			StatusCode: res.StatusCode,
+			Status:     res.Status,
+			Header:     res.Header.Clone(),
+			Body:       io.NopCloser(bytes.NewReader(b)),
+		}, nil
+	}
+
+	return retryRes, nil
 }
 
 // Bytes.

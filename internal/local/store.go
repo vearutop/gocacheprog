@@ -59,6 +59,11 @@ type indexEntry struct {
 	WireSize        int64  `json:"w,omitempty"`
 }
 
+type actionIndexEntry struct {
+	actionID string
+	entry    indexEntry
+}
+
 type StoreOption func(*Store)
 
 func WithMaxDiskBytes(maxDiskBytes int64) StoreOption {
@@ -328,6 +333,7 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 
 	var (
 		res             []cache.ResponseItem
+		snapshot        []actionIndexEntry
 		filterActionIDs map[string]struct{}
 		err             error
 	)
@@ -340,7 +346,14 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	}
 
 	dc.mu.Lock()
+	snapshot = make([]actionIndexEntry, 0, len(dc.index))
 	for k, v := range dc.index {
+		snapshot = append(snapshot, actionIndexEntry{actionID: k, entry: v})
+	}
+	dc.mu.Unlock()
+
+	for _, item := range snapshot {
+		k, v := item.actionID, item.entry
 		if filterActionIDs != nil {
 			if _, ok := filterActionIDs[k]; !ok {
 				continue
@@ -358,7 +371,6 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 
 		res = append(res, dc.responseItem(k, v))
 	}
-	dc.mu.Unlock()
 
 	for _, item := range res {
 		cb(item)
@@ -372,14 +384,16 @@ func (dc *Store) PreloadSources(req cache.PreloadRequest) ([]string, error) {
 	return sources, err
 }
 
-func (dc *Store) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string) error {
+func (dc *Store) HasEntries() bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	return len(dc.index) > 0
+}
+
+func (dc *Store) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string, replaceChanges bool) error {
 	if commit == "" && changesID == "" {
 		return nil
-	}
-
-	body := strings.Join(actionIDs, "\n")
-	if body != "" {
-		body += "\n"
 	}
 
 	if commit != "" {
@@ -388,7 +402,7 @@ func (dc *Store) PostCacheUsed(commit string, changesID string, buildType string
 			return err
 		}
 
-		if err := dc.writeManifest(manifestPath, body); err != nil {
+		if err := dc.mergeManifest(manifestPath, actionIDs); err != nil {
 			return err
 		}
 	}
@@ -399,7 +413,15 @@ func (dc *Store) PostCacheUsed(commit string, changesID string, buildType string
 			return err
 		}
 
-		if err := dc.writeManifest(manifestPath, body); err != nil {
+		if replaceChanges {
+			body := strings.Join(actionIDs, "\n")
+			if body != "" {
+				body += "\n"
+			}
+			if err := dc.writeManifest(manifestPath, body); err != nil {
+				return err
+			}
+		} else if err := dc.mergeManifest(manifestPath, actionIDs); err != nil {
 			return err
 		}
 	}
@@ -726,6 +748,47 @@ func (dc *Store) writeManifest(manifestPath string, body string) error {
 	}
 
 	return nil
+}
+
+func (dc *Store) mergeManifest(manifestPath string, actionIDs []string) error {
+	existing, err := dc.loadManifest(manifestPath, manifestPath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	seen := make(map[string]struct{}, len(existing)+len(actionIDs))
+	merged := make([]string, 0, len(existing)+len(actionIDs))
+
+	for _, actionID := range existing {
+		actionID = strings.TrimSpace(actionID)
+		if actionID == "" {
+			continue
+		}
+		if _, ok := seen[actionID]; ok {
+			continue
+		}
+		seen[actionID] = struct{}{}
+		merged = append(merged, actionID)
+	}
+
+	for _, actionID := range actionIDs {
+		actionID = strings.TrimSpace(actionID)
+		if actionID == "" {
+			continue
+		}
+		if _, ok := seen[actionID]; ok {
+			continue
+		}
+		seen[actionID] = struct{}{}
+		merged = append(merged, actionID)
+	}
+
+	body := strings.Join(merged, "\n")
+	if body != "" {
+		body += "\n"
+	}
+
+	return dc.writeManifest(manifestPath, body)
 }
 
 func (dc *Store) Stats() map[string]string {
