@@ -3,6 +3,9 @@ package local
 import (
 	"bytes"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,6 +142,74 @@ func TestStorePreload_BuildTypeIsolated(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"actionId2"}, gotRace)
+}
+
+func TestStorePut_WritesEntriesUnderPrefixedDir(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, true)
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "output/one", "body-1", &now),
+	}}))
+
+	_, err = os.Stat(filepath.Join(dir, "entries", "ou", "output_one"))
+	require.NoError(t, err)
+}
+
+func TestStoreEvictsLeastRecentlyUsedWhenSizeLimitExceeded(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, true, WithMaxDiskBytes(10), WithEvictionDelay(10*time.Millisecond))
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "12345", &now),
+	}}))
+	time.Sleep(2 * time.Millisecond)
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId2", "outputId2", "67890", &now),
+	}}))
+
+	require.NoError(t, store.Get(cache.Request{ActionIDs: []string{"actionId1"}}, func(resp cache.ResponseItem) {}))
+	store.mu.Lock()
+	action1Access := store.index["actionId1"].AccessTimeMicro
+	action2Access := store.index["actionId2"].AccessTimeMicro
+	store.mu.Unlock()
+	require.Greater(t, action1Access, action2Access)
+	time.Sleep(2 * time.Millisecond)
+
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId3", "outputId3", "abcde", &now),
+	}}))
+
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.currentDiskBytes == int64(10) && len(store.index) == 2
+	}, time.Second, 10*time.Millisecond)
+
+	var got []string
+	require.NoError(t, store.Get(cache.Request{ActionIDs: []string{"actionId1", "actionId2", "actionId3"}}, func(resp cache.ResponseItem) {
+		if !resp.Miss {
+			got = append(got, resp.ActionID)
+		}
+	}))
+	require.ElementsMatch(t, []string{"actionId1", "actionId3"}, got)
+}
+
+func TestStoreManifestKeyLengthLimit(t *testing.T) {
+	store, err := NewStore(t.TempDir(), true)
+	require.NoError(t, err)
+
+	longKey := strings.Repeat("a", maxManifestKeyLen+1)
+
+	_, err = store.PreloadSources(cache.PreloadRequest{ChangesID: longKey})
+	require.EqualError(t, err, "changes-id too long: 101 > 100")
+
+	_, err = store.PreloadSources(cache.PreloadRequest{BuildType: longKey, Commit: "commit123"})
+	require.EqualError(t, err, "build-type too long: 101 > 100")
 }
 
 func testItem(actionID, outputID, body string, now *time.Time) cache.ResponseItem {

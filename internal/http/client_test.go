@@ -39,11 +39,11 @@ func TestNewClient(t *testing.T) {
 		items = append(items, item)
 	}
 
-	h := http.NewHandler(localStore)
+	h := http.NewHandler(localStore, "")
 
 	srv := httptest.NewServer(h)
 
-	client, err := http.NewClient(srv.URL)
+	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
 	require.NoError(t, client.Put(cache.Response{Items: items}))
@@ -71,11 +71,11 @@ func TestClient_PostCacheUsed(t *testing.T) {
 	localStore, err := local.NewStore(dir, true)
 	require.NoError(t, err)
 
-	h := http.NewHandler(localStore)
+	h := http.NewHandler(localStore, "")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	client, err := http.NewClient(srv.URL)
+	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
 	err = client.PostCacheUsed("abcdef1234", "repo/pr-123", "unit", []string{"actionId2", "actionId1", "actionId1"})
@@ -107,11 +107,11 @@ func TestPreload_UsesCommitManifestFilters(t *testing.T) {
 	require.NoError(t, localStore.PostCacheUsed("parent123", "", "", []string{"actionId1", "missingAction"}))
 	require.NoError(t, localStore.PostCacheUsed("base123", "", "", []string{"actionId3"}))
 
-	h := http.NewHandler(localStore)
+	h := http.NewHandler(localStore, "")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	client, err := http.NewClient(srv.URL)
+	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
 	var got []string
@@ -145,11 +145,11 @@ func TestPreload_UsesCurrentCommitManifestForRerun(t *testing.T) {
 	require.NoError(t, localStore.PostCacheUsed("parent123", "", "", []string{"actionId1"}))
 	require.NoError(t, localStore.PostCacheUsed("base123", "", "", []string{"actionId3"}))
 
-	h := http.NewHandler(localStore)
+	h := http.NewHandler(localStore, "")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	client, err := http.NewClient(srv.URL)
+	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
 	var got []string
@@ -184,11 +184,11 @@ func TestPreload_UsesChangesIDBetweenParentAndBase(t *testing.T) {
 	require.NoError(t, localStore.PostCacheUsed("", "repo/pr-123", "unit", []string{"actionId2"}))
 	require.NoError(t, localStore.PostCacheUsed("base123", "", "unit", []string{"actionId3"}))
 
-	h := http.NewHandler(localStore)
+	h := http.NewHandler(localStore, "")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	client, err := http.NewClient(srv.URL)
+	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
 	var got []string
@@ -212,17 +212,63 @@ func TestClient_Preload_HTTPError(t *testing.T) {
 	localStore, err := local.NewStore(dir, true)
 	require.NoError(t, err)
 
-	h := http.NewHandler(localStore)
+	h := http.NewHandler(localStore, "")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	client, err := http.NewClient(srv.URL)
+	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
 	err = client.Preload(cache.PreloadRequest{
 		BaseCommit: "'invalid'",
 	}, func(item cache.ResponseItem) {})
-	require.EqualError(t, err, `preload status 500: invalid commit: "'invalid'"`)
+	require.EqualError(t, err, `preload status 400: invalid commit: "'invalid'"`)
+}
+
+func TestClient_PostCacheUsed_HTTPError(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, true)
+	require.NoError(t, err)
+
+	h := http.NewHandler(localStore, "")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	err = client.PostCacheUsed("", strings.Repeat("a", 101), "", []string{"actionId1"})
+	require.EqualError(t, err, "cache-used status 400: changes-id too long: 101 > 100")
+}
+
+func TestClient_AuthToken(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, true)
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, localStore.Put(cache.Response{Items: []cache.ResponseItem{
+		makeItem("actionId1", "outputId1", "body-1", &now),
+	}}))
+
+	h := http.NewHandler(localStore, "secret-token")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	_, err = http.NewClient(srv.URL, "")
+	require.EqualError(t, err, "unexpected version: unauthorized\n")
+
+	client, err := http.NewClient(srv.URL, "secret-token")
+	require.NoError(t, err)
+
+	var got []string
+	err = client.Get(cache.Request{ActionIDs: []string{"actionId1"}}, func(item cache.ResponseItem) {
+		got = append(got, item.ActionID)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"actionId1"}, got)
 }
 
 func makeItem(actionID, outputID, body string, now *time.Time) cache.ResponseItem {
@@ -261,11 +307,11 @@ func TestNewClient_compressed(t *testing.T) {
 		items = append(items, item)
 	}
 
-	h := http.NewHandler(localStore)
+	h := http.NewHandler(localStore, "")
 
 	srv := httptest.NewServer(h)
 
-	client, err := http.NewClient(srv.URL)
+	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
 	require.NoError(t, client.Put(cache.Response{Items: items}))

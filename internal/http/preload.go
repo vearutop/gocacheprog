@@ -46,6 +46,10 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 	if s, ok := h.store.(cache.PreloadSourceProvider); ok {
 		sources, err := s.PreloadSources(req)
 		if err != nil {
+			if isManifestValidationError(err) {
+				http.Error(rw, err.Error(), http.StatusBadRequest)
+				return
+			}
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -76,6 +80,10 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 		resp.Items = append(resp.Items, item)
 	})
 	if err != nil {
+		if isManifestValidationError(err) {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}

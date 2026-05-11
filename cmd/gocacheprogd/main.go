@@ -23,8 +23,10 @@ func main() {
 
 func run() error {
 	var (
-		listen = flag.String("listen", ":8080", "Listen address")
-		dir    = flag.String("dir", "", "Cache store")
+		listen       = flag.String("listen", ":8080", "Listen address")
+		dir          = flag.String("dir", "", "Cache store")
+		maxDiskBytes = flag.Int64("max-disk-bytes", 0, "Optional total on-disk cache size limit in bytes; 0 disables eviction")
+		authToken    = flag.String("auth-token", "", "Optional bearer token required by clients")
 	)
 
 	flag.Parse()
@@ -43,13 +45,13 @@ func run() error {
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
 
-	store, err := local.NewStore(*dir, true)
+	store, err := local.NewStore(*dir, true, local.WithMaxDiskBytes(*maxDiskBytes))
 	if err != nil {
 		return fmt.Errorf("init local storage: %w", err)
 	}
 	defer store.Close()
 
-	h := http.NewHandler(store)
+	h := http.NewHandler(store, *authToken)
 
 	go func() {
 		for {

@@ -33,6 +33,10 @@ func (h *Handler) CacheUsed(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := recorder.PostCacheUsed(commit, changesID, buildType, actionIDs); err != nil {
+		if isManifestValidationError(err) {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}

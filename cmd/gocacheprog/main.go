@@ -28,6 +28,7 @@ func run() error {
 	dir := flag.String("cache-dir", "", "cache directory; empty means automatic")
 	dumpLogs := flag.String("dump-log", "", "dump req/resp logs to file")
 	remoteURL := flag.String("remote-url", "", "remote HTTP server cache source, e.g. https://example.com:8080")
+	authToken := flag.String("auth-token", "", "optional bearer token for the remote HTTP cache server")
 	preload := flag.Bool("preload", false, "preload cache from remote server")
 	preloadSize := flag.Int64("preload-size", 1000000, "preload cache from remote server fo items up to this size")
 	commit := flag.String("commit", "", "current commit SHA used to upload cache usage manifest")
@@ -80,7 +81,7 @@ func run() error {
 	resps := make(chan cacheprog.Response, 100)
 
 	if *remoteURL != "" {
-		upstream, err = http.NewClient(*remoteURL)
+		upstream, err = http.NewClient(*remoteURL, *authToken)
 		if err != nil {
 			return fmt.Errorf("remote client: %w", err)
 		}

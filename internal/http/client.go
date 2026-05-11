@@ -20,7 +20,8 @@ import (
 )
 
 type Client struct {
-	baseURL string
+	baseURL   string
+	authToken string
 
 	tr *http.Transport
 
@@ -38,15 +39,16 @@ type Client struct {
 	lastPreloadSources string
 }
 
-func NewClient(baseURL string) (*Client, error) {
+func NewClient(baseURL string, authToken string) (*Client, error) {
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/version", nil)
 	if err != nil {
 		return nil, err
 	}
+	setAuthHeader(req, authToken)
 
-	client := &Client{baseURL: baseURL}
+	client := &Client{baseURL: baseURL, authToken: authToken}
 	client.latencyGet = &dynhist.Collector{WeightFunc: dynhist.LatencyWidth, BucketsLimit: 50}
 	client.latencyPut = &dynhist.Collector{WeightFunc: dynhist.LatencyWidth, BucketsLimit: 50}
 
@@ -130,6 +132,7 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 		return err
 	}
 	r.Header.Set("Content-Type", "application/json")
+	setAuthHeader(r, c.authToken)
 
 	res, err := c.tr.RoundTrip(r)
 	if err != nil {
@@ -197,6 +200,7 @@ func (c *Client) PostCacheUsed(commit string, changesID string, buildType string
 		return err
 	}
 	r.Header.Set("Content-Type", "text/plain")
+	setAuthHeader(r, c.authToken)
 
 	res, err := c.tr.RoundTrip(r)
 	if err != nil {
@@ -225,6 +229,7 @@ func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error 
 		return err
 	}
 	r.Header.Set("Content-Type", "application/json")
+	setAuthHeader(r, c.authToken)
 
 	st := time.Now()
 
@@ -275,6 +280,7 @@ func (c *Client) head(req cache.Request) (cache.Response, error) {
 		return resp, err
 	}
 	r.Header.Set("Content-Type", "application/json")
+	setAuthHeader(r, c.authToken)
 
 	res, err := c.tr.RoundTrip(r)
 	if err != nil {
@@ -361,6 +367,7 @@ func (c *Client) Put(values cache.Response) error {
 		return fmt.Errorf("creating request: %w", err)
 	}
 	req.ContentLength = cl
+	setAuthHeader(req, c.authToken)
 
 	st := time.Now()
 
@@ -416,6 +423,14 @@ func (c *Client) LastPreloadSources() string {
 	defer c.mu.Unlock()
 
 	return c.lastPreloadSources
+}
+
+func setAuthHeader(r *http.Request, authToken string) {
+	if strings.TrimSpace(authToken) == "" {
+		return
+	}
+
+	r.Header.Set("Authorization", "Bearer "+authToken)
 }
 
 // Bytes.

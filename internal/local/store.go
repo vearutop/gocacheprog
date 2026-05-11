@@ -21,11 +21,17 @@ import (
 )
 
 type Store struct {
-	dir      string
-	compress bool
+	dir           string
+	compress      bool
+	maxDiskBytes  int64
+	evictionDelay time.Duration
 
-	mu    sync.Mutex
-	index map[string]indexEntry
+	mu                sync.Mutex
+	index             map[string]indexEntry
+	outputRefs        map[string]int
+	outputSizes       map[string]int64
+	currentDiskBytes  int64
+	evictionScheduled bool
 
 	prevStats     string
 	hits          int64
@@ -36,31 +42,55 @@ type Store struct {
 	errors        int64
 }
 
-var validCommitName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-var validBuildTypeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var (
+	validScopedKeyName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+)
+
+const maxManifestKeyLen = 100
 
 // indexEntry is the metadata that Store stores on disk for an ActionID.
 type indexEntry struct {
-	OutputID   string `json:"o"`
-	Size       int64  `json:"n"`
-	TimeMicro  int64  `json:"t,omitempty"`
-	Compressed int64  `json:"c,omitempty"`
-	WireSize   int64  `json:"w,omitempty"`
+	OutputID        string `json:"o"`
+	Size            int64  `json:"n"`
+	TimeMicro       int64  `json:"t,omitempty"`
+	AccessTimeMicro int64  `json:"a,omitempty"`
+	Compressed      int64  `json:"c,omitempty"`
+	WireSize        int64  `json:"w,omitempty"`
 }
 
-func NewStore(dir string, withCompression bool) (*Store, error) {
+type StoreOption func(*Store)
+
+func WithMaxDiskBytes(maxDiskBytes int64) StoreOption {
+	return func(s *Store) {
+		s.maxDiskBytes = maxDiskBytes
+	}
+}
+
+func WithEvictionDelay(evictionDelay time.Duration) StoreOption {
+	return func(s *Store) {
+		s.evictionDelay = evictionDelay
+	}
+}
+
+func NewStore(dir string, withCompression bool, opts ...StoreOption) (*Store, error) {
 	dir, err := toAbsPath(dir)
 	if err != nil {
 		return nil, err
 	}
 
 	dc := &Store{
-		dir:      dir,
-		compress: withCompression,
-		index:    make(map[string]indexEntry),
+		dir:           dir,
+		compress:      withCompression,
+		evictionDelay: 5 * time.Minute,
+		index:         make(map[string]indexEntry),
+		outputRefs:    make(map[string]int),
+		outputSizes:   make(map[string]int64),
+	}
+	for _, opt := range opts {
+		opt(dc)
 	}
 
-	indexPath := filepath.Join(dir, "index.json")
+	indexPath := dc.indexPath()
 	d, err := os.ReadFile(indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -72,6 +102,10 @@ func NewStore(dir string, withCompression bool) (*Store, error) {
 	err = json.Unmarshal(d, &dc.index)
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal %s: %w", indexPath, err)
+	}
+
+	if err := dc.rebuildStorageState(); err != nil {
+		return nil, err
 	}
 
 	return dc, nil
@@ -128,6 +162,8 @@ func (dc *Store) getOne(actionID string) cache.ResponseItem {
 	}
 
 	atomic.AddInt64(&dc.hits, 1)
+	ie.AccessTimeMicro = time.Now().UTC().UnixMicro()
+	dc.index[actionID] = ie
 
 	return dc.responseItem(actionID, ie)
 }
@@ -137,7 +173,7 @@ func (dc *Store) responseItem(actionID string, ie indexEntry) cache.ResponseItem
 
 	res.OutputID = ie.OutputID
 	res.Size = ie.Size
-	res.DiskPath = dc.OutputFilename(ie.OutputID)
+	res.DiskPath = dc.outputPathForRead(ie.OutputID)
 	res.IsCompressed = ie.Compressed == 1
 	res.WireSize = ie.WireSize
 
@@ -167,17 +203,21 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 		return fmt.Errorf("empty output id: %+v", item)
 	}
 
-	existing := dc.getOne(item.ActionID)
-	if existing.DiskPath != "" && !existing.Miss {
+	dc.mu.Lock()
+	existingEntry, hadExisting := dc.index[item.ActionID]
+	dc.mu.Unlock()
+
+	if hadExisting {
 		atomic.AddInt64(&dc.putsExist, 1)
 	}
 
 	atomic.AddInt64(&dc.puts, 1)
 
 	ie := indexEntry{
-		OutputID:  item.OutputID,
-		Size:      item.Size,
-		TimeMicro: now.UnixMicro(),
+		OutputID:        item.OutputID,
+		Size:            item.Size,
+		TimeMicro:       now.UnixMicro(),
+		AccessTimeMicro: now.UnixMicro(),
 	}
 
 	var (
@@ -222,7 +262,14 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
+	newStoredSize := dc.entryStoredSize(ie)
+	if hadExisting {
+		dc.replaceOutputRefLocked(existingEntry, ie, newStoredSize)
+	} else {
+		dc.addOutputRefLocked(ie.OutputID, newStoredSize)
+	}
 	dc.index[item.ActionID] = ie
+	dc.scheduleEvictionLocked()
 
 	atomic.AddInt64(&dc.putsCompleted, 1)
 
@@ -230,6 +277,10 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 }
 
 func writeAtomic(outputFile string, rd io.Reader) (err error) {
+	if err := os.MkdirAll(filepath.Dir(outputFile), 0o755); err != nil {
+		return fmt.Errorf("mkdir output dir: %w", err)
+	}
+
 	f, err := os.Create(outputFile + ".tmp")
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
@@ -256,11 +307,17 @@ func (dc *Store) Close() error {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(dc.dir, "index.json"), d, 0o600)
+	return os.WriteFile(dc.indexPath(), d, 0o600)
 }
 
 func (dc *Store) OutputFilename(outputID string) string {
-	return filepath.Join(dc.dir, strings.ReplaceAll(outputID, "/", "_"))
+	name := strings.ReplaceAll(outputID, "/", "_")
+	prefix := name
+	if len(prefix) > 2 {
+		prefix = prefix[:2]
+	}
+
+	return filepath.Join(dc.dir, "entries", prefix, name)
 }
 
 func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
@@ -415,7 +472,6 @@ func (dc *Store) loadChangesManifest(changesID string, buildType string) ([]stri
 }
 
 func (dc *Store) loadManifest(manifestPath string, name string) ([]string, error) {
-
 	f, err := os.Open(manifestPath)
 	if err != nil {
 		return nil, err
@@ -444,7 +500,10 @@ func (dc *Store) loadManifest(manifestPath string, name string) ([]string, error
 
 func (dc *Store) commitManifestPath(commit string, buildType string) (string, error) {
 	commit = strings.TrimSpace(commit)
-	if !validCommitName.MatchString(commit) {
+	if len(commit) > maxManifestKeyLen {
+		return "", fmt.Errorf("commit too long: %d > %d", len(commit), maxManifestKeyLen)
+	}
+	if !validScopedKeyName.MatchString(commit) {
 		return "", fmt.Errorf("invalid commit: %q", commit)
 	}
 
@@ -466,6 +525,9 @@ func (dc *Store) changesManifestPath(changesID string, buildType string) (string
 	if changesID == "" {
 		return "", fmt.Errorf("invalid changes-id: %q", changesID)
 	}
+	if len(changesID) > maxManifestKeyLen {
+		return "", fmt.Errorf("changes-id too long: %d > %d", len(changesID), maxManifestKeyLen)
+	}
 
 	escaped := url.QueryEscape(changesID)
 	prefix := escaped
@@ -486,11 +548,166 @@ func (dc *Store) manifestScopeDir(buildType string) (string, error) {
 	if buildType == "" {
 		return "default", nil
 	}
-	if !validBuildTypeName.MatchString(buildType) {
+	if len(buildType) > maxManifestKeyLen {
+		return "", fmt.Errorf("build-type too long: %d > %d", len(buildType), maxManifestKeyLen)
+	}
+	if !validScopedKeyName.MatchString(buildType) {
 		return "", fmt.Errorf("invalid build-type: %q", buildType)
 	}
 
 	return "buildtype-" + buildType, nil
+}
+
+func (dc *Store) indexPath() string {
+	return filepath.Join(dc.dir, "index.json")
+}
+
+func (dc *Store) legacyOutputFilename(outputID string) string {
+	return filepath.Join(dc.dir, strings.ReplaceAll(outputID, "/", "_"))
+}
+
+func (dc *Store) outputPathForRead(outputID string) string {
+	path := dc.OutputFilename(outputID)
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+
+	legacy := dc.legacyOutputFilename(outputID)
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+
+	return path
+}
+
+func (dc *Store) rebuildStorageState() error {
+	seen := map[string]struct{}{}
+	for _, ie := range dc.index {
+		dc.outputRefs[ie.OutputID]++
+		if _, ok := seen[ie.OutputID]; ok {
+			continue
+		}
+		seen[ie.OutputID] = struct{}{}
+
+		size, err := dc.outputFileSize(ie)
+		if err != nil {
+			return err
+		}
+		dc.outputSizes[ie.OutputID] = size
+		dc.currentDiskBytes += size
+	}
+
+	return nil
+}
+
+func (dc *Store) outputFileSize(ie indexEntry) (int64, error) {
+	path := dc.outputPathForRead(ie.OutputID)
+	fi, err := os.Stat(path)
+	if err == nil {
+		return fi.Size(), nil
+	}
+	if !os.IsNotExist(err) {
+		return 0, fmt.Errorf("stat output %s: %w", ie.OutputID, err)
+	}
+
+	return dc.entryStoredSize(ie), nil
+}
+
+func (dc *Store) entryStoredSize(ie indexEntry) int64 {
+	if ie.WireSize > 0 {
+		return ie.WireSize
+	}
+	return ie.Size
+}
+
+func (dc *Store) addOutputRefLocked(outputID string, size int64) {
+	if dc.outputRefs[outputID] == 0 {
+		dc.outputSizes[outputID] = size
+		dc.currentDiskBytes += size
+	}
+	dc.outputRefs[outputID]++
+}
+
+func (dc *Store) replaceOutputRefLocked(oldEntry indexEntry, newEntry indexEntry, newStoredSize int64) {
+	if oldEntry.OutputID == newEntry.OutputID {
+		oldSize := dc.outputSizes[oldEntry.OutputID]
+		dc.outputSizes[oldEntry.OutputID] = newStoredSize
+		dc.currentDiskBytes += newStoredSize - oldSize
+		return
+	}
+
+	dc.releaseOutputRefLocked(oldEntry.OutputID)
+	dc.addOutputRefLocked(newEntry.OutputID, newStoredSize)
+}
+
+func (dc *Store) releaseOutputRefLocked(outputID string) {
+	refCount := dc.outputRefs[outputID]
+	if refCount <= 1 {
+		delete(dc.outputRefs, outputID)
+		dc.currentDiskBytes -= dc.outputSizes[outputID]
+		delete(dc.outputSizes, outputID)
+
+		path := dc.outputPathForRead(outputID)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("remove output %s: %v", outputID, err)
+		}
+		return
+	}
+
+	dc.outputRefs[outputID] = refCount - 1
+}
+
+func (dc *Store) scheduleEvictionLocked() {
+	if dc.maxDiskBytes <= 0 || dc.currentDiskBytes <= dc.maxDiskBytes || dc.evictionScheduled {
+		return
+	}
+
+	dc.evictionScheduled = true
+	delay := dc.evictionDelay
+	go func() {
+		time.Sleep(delay)
+
+		dc.mu.Lock()
+		defer dc.mu.Unlock()
+		dc.evictionScheduled = false
+		dc.evictIfNeededLocked()
+	}()
+}
+
+func (dc *Store) evictIfNeededLocked() {
+	if dc.maxDiskBytes <= 0 {
+		return
+	}
+
+	for dc.currentDiskBytes > dc.maxDiskBytes && len(dc.index) > 0 {
+		var (
+			evictActionID string
+			evictEntry    indexEntry
+			found         bool
+		)
+
+		for actionID, ie := range dc.index {
+			if !found || lruTimeMicro(ie) < lruTimeMicro(evictEntry) {
+				evictActionID = actionID
+				evictEntry = ie
+				found = true
+			}
+		}
+		if !found {
+			return
+		}
+
+		delete(dc.index, evictActionID)
+		dc.releaseOutputRefLocked(evictEntry.OutputID)
+		log.Printf("evicted cache entry action_id=%s output_id=%s current_disk_bytes=%d max_disk_bytes=%d", evictActionID, evictEntry.OutputID, dc.currentDiskBytes, dc.maxDiskBytes)
+	}
+}
+
+func lruTimeMicro(ie indexEntry) int64 {
+	if ie.AccessTimeMicro != 0 {
+		return ie.AccessTimeMicro
+	}
+	return ie.TimeMicro
 }
 
 func (dc *Store) writeManifest(manifestPath string, body string) error {
@@ -514,13 +731,16 @@ func (dc *Store) Stats() map[string]string {
 	defer dc.mu.Unlock()
 
 	return map[string]string{
-		"hits":          fmt.Sprintf("%d", dc.hits),
-		"misses":        fmt.Sprintf("%d", dc.misses),
-		"puts":          fmt.Sprintf("%d", dc.puts),
-		"putsExist":     fmt.Sprintf("%d", dc.putsExist),
-		"putsCompleted": fmt.Sprintf("%d", dc.putsCompleted),
-		"index":         fmt.Sprintf("%d", len(dc.index)),
-		"errors":        fmt.Sprintf("%d", dc.errors),
+		"hits":              fmt.Sprintf("%d", dc.hits),
+		"misses":            fmt.Sprintf("%d", dc.misses),
+		"puts":              fmt.Sprintf("%d", dc.puts),
+		"putsExist":         fmt.Sprintf("%d", dc.putsExist),
+		"putsCompleted":     fmt.Sprintf("%d", dc.putsCompleted),
+		"index":             fmt.Sprintf("%d", len(dc.index)),
+		"diskBytes":         fmt.Sprintf("%d", dc.currentDiskBytes),
+		"maxDiskBytes":      fmt.Sprintf("%d", dc.maxDiskBytes),
+		"uniqueOutputFiles": fmt.Sprintf("%d", len(dc.outputRefs)),
+		"errors":            fmt.Sprintf("%d", dc.errors),
 	}
 }
 
