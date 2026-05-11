@@ -26,12 +26,13 @@ type Store struct {
 	maxDiskBytes  int64
 	evictionDelay time.Duration
 
-	mu                sync.Mutex
-	index             map[string]indexEntry
-	outputRefs        map[string]int
-	outputSizes       map[string]int64
-	currentDiskBytes  int64
-	evictionScheduled bool
+	mu                    sync.Mutex
+	index                 map[string]indexEntry
+	outputRefs            map[string]int
+	outputSizes           map[string]int64
+	currentDiskBytes      int64
+	evictionScheduled     bool
+	lastEvictionUnixMicro int64
 
 	prevStats     string
 	hits          int64
@@ -699,6 +700,7 @@ func (dc *Store) evictIfNeededLocked() {
 
 		delete(dc.index, evictActionID)
 		dc.releaseOutputRefLocked(evictEntry.OutputID)
+		dc.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
 		log.Printf("evicted cache entry action_id=%s output_id=%s current_disk_bytes=%d max_disk_bytes=%d", evictActionID, evictEntry.OutputID, dc.currentDiskBytes, dc.maxDiskBytes)
 	}
 }
@@ -731,16 +733,18 @@ func (dc *Store) Stats() map[string]string {
 	defer dc.mu.Unlock()
 
 	return map[string]string{
-		"hits":              fmt.Sprintf("%d", dc.hits),
-		"misses":            fmt.Sprintf("%d", dc.misses),
-		"puts":              fmt.Sprintf("%d", dc.puts),
-		"putsExist":         fmt.Sprintf("%d", dc.putsExist),
-		"putsCompleted":     fmt.Sprintf("%d", dc.putsCompleted),
-		"index":             fmt.Sprintf("%d", len(dc.index)),
-		"diskBytes":         fmt.Sprintf("%d", dc.currentDiskBytes),
-		"maxDiskBytes":      fmt.Sprintf("%d", dc.maxDiskBytes),
-		"uniqueOutputFiles": fmt.Sprintf("%d", len(dc.outputRefs)),
-		"errors":            fmt.Sprintf("%d", dc.errors),
+		"hits":                  fmt.Sprintf("%d", dc.hits),
+		"misses":                fmt.Sprintf("%d", dc.misses),
+		"puts":                  fmt.Sprintf("%d", dc.puts),
+		"putsExist":             fmt.Sprintf("%d", dc.putsExist),
+		"putsCompleted":         fmt.Sprintf("%d", dc.putsCompleted),
+		"index":                 fmt.Sprintf("%d", len(dc.index)),
+		"diskBytes":             fmt.Sprintf("%d", dc.currentDiskBytes),
+		"maxDiskBytes":          fmt.Sprintf("%d", dc.maxDiskBytes),
+		"uniqueOutputFiles":     fmt.Sprintf("%d", len(dc.outputRefs)),
+		"evictionScheduled":     fmt.Sprintf("%t", dc.evictionScheduled),
+		"lastEvictionUnixMicro": fmt.Sprintf("%d", dc.lastEvictionUnixMicro),
+		"errors":                fmt.Sprintf("%d", dc.errors),
 	}
 }
 

@@ -2,7 +2,9 @@ package http_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
+	nethttp "net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -269,6 +271,36 @@ func TestClient_AuthToken(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"actionId1"}, got)
+}
+
+func TestStatus(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, true, local.WithMaxDiskBytes(123456))
+	require.NoError(t, err)
+
+	h := http.NewHandler(localStore, "")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	res, err := nethttp.Get(srv.URL + "/status")
+	require.NoError(t, err)
+	defer res.Body.Close()
+	require.Equal(t, nethttp.StatusOK, res.StatusCode)
+
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(res.Body).Decode(&body))
+
+	storeStats, ok := body["store"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "123456", storeStats["maxDiskBytes"])
+	require.Equal(t, "120.6KB", storeStats["maxDiskBytesHuman"])
+	require.Contains(t, storeStats, "lastEviction")
+
+	runtimeStats, ok := body["runtime"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, runtimeStats, "heapInuseBytes")
+	require.Contains(t, runtimeStats, "heapInuse")
 }
 
 func makeItem(actionID, outputID, body string, now *time.Time) cache.ResponseItem {
