@@ -5,8 +5,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	nethttp "net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/vearutop/gocacheprogd/internal/cache"
@@ -23,9 +28,12 @@ func main() {
 
 func run() error {
 	dir := flag.String("cache-dir", "", "cache directory; empty means automatic")
+	listen := flag.String("listen", "", "listen address or unix socket path; when set, run as server instead of cache helper")
 	dumpLogs := flag.String("dump-log", "", "dump req/resp logs to file")
 	remoteURL := flag.String("remote-url", "", "remote HTTP server cache source, e.g. https://example.com:8080")
 	authToken := flag.String("auth-token", "", "optional bearer token for the remote HTTP cache server")
+	maxDiskBytes := flag.Int64("max-disk-bytes", 0, "optional total on-disk cache size limit in bytes; 0 disables eviction")
+	preloadLimit := flag.Int("preload-limit", 2, "maximum number of concurrent preload preparations in server mode")
 	preload := flag.Bool("preload", false, "preload cache from remote server")
 	preloadSize := flag.Int64("preload-size", 1000000, "preload cache from remote server fo items up to this size")
 	commit := flag.String("commit", "", "current commit SHA used to upload cache usage manifest")
@@ -53,6 +61,10 @@ func run() error {
 
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		return fmt.Errorf("ensure cache dir: %w", err)
+	}
+
+	if *listen != "" {
+		return runServer(*listen, *dir, *authToken, *maxDiskBytes, *preloadLimit)
 	}
 
 	println("starting at dir", *dir)
@@ -156,4 +168,75 @@ func run() error {
 	dc.PrintStats()
 
 	return nil
+}
+
+func runServer(listen string, dir string, authToken string, maxDiskBytes int64, preloadLimit int) error {
+	store, err := local.NewStore(dir, true, local.WithMaxDiskBytes(maxDiskBytes))
+	if err != nil {
+		return fmt.Errorf("init local storage: %w", err)
+	}
+	defer store.Close()
+
+	h := http.NewHandlerWithPreloadLimit(store, authToken, preloadLimit)
+
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			store.PrintStats()
+		}
+	}()
+
+	network, addr := listenNetworkAndAddr(listen)
+	if network == "unix" {
+		if err := os.RemoveAll(addr); err != nil {
+			return fmt.Errorf("remove old unix socket %s: %w", addr, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(addr), 0o755); err != nil {
+			return fmt.Errorf("create unix socket dir: %w", err)
+		}
+	}
+
+	ln, err := net.Listen(network, addr)
+	if err != nil {
+		return fmt.Errorf("listen %s %s: %w", network, addr, err)
+	}
+	if network == "unix" {
+		defer os.Remove(addr)
+	}
+	defer ln.Close()
+
+	server := &nethttp.Server{Handler: h}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(stop)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Serve(ln)
+	}()
+
+	log.Printf("Listening on %s://%s ...", network, addr)
+
+	select {
+	case sig := <-stop:
+		log.Printf("Shutting down on %s ...", sig)
+		if err := server.Close(); err != nil {
+			log.Printf("server close: %s", err.Error())
+		}
+	case err := <-errCh:
+		if err != nil && err != nethttp.ErrServerClosed {
+			return fmt.Errorf("serve %s %s: %w", network, addr, err)
+		}
+	}
+
+	return nil
+}
+
+func listenNetworkAndAddr(listen string) (network string, addr string) {
+	if strings.HasPrefix(listen, "unix://") {
+		return "unix", strings.TrimPrefix(listen, "unix://")
+	}
+
+	return "tcp", listen
 }
