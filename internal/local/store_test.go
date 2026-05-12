@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cache"
 )
 
 func TestStorePreload_NoCommitFiltersFallsBackToAllItems(t *testing.T) {

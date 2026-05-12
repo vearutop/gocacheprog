@@ -1,15 +1,17 @@
 # gocacheprogd
 
-[![Build Status](https://github.com/vearutop/gocacheprogd/workflows/test-unit/badge.svg)](https://github.com/vearutop/gocacheprogd/actions?query=branch%3Amaster+workflow%3Atest-unit)
+[![Build Status](https://github.com/vearutop/gocacheprog/workflows/test-unit/badge.svg)](https://github.com/vearutop/gocacheprog/actions?query=branch%3Amaster+workflow%3Atest-unit)
 [![Coverage Status](https://codecov.io/gh/vearutop/gocacheprogd/branch/master/graph/badge.svg)](https://codecov.io/gh/vearutop/gocacheprogd)
-[![GoDevDoc](https://img.shields.io/badge/dev-doc-00ADD8?logo=go)](https://pkg.go.dev/github.com/vearutop/gocacheprogd)
+[![GoDevDoc](https://img.shields.io/badge/dev-doc-00ADD8?logo=go)](https://pkg.go.dev/github.com/vearutop/gocacheprog)
 [![Time Tracker](https://wakatime.com/badge/github/vearutop/gocacheprogd.svg)](https://wakatime.com/badge/github/vearutop/gocacheprogd)
 ![Code lines](https://sloc.xyz/github/vearutop/gocacheprogd/?category=code)
 ![Comments](https://sloc.xyz/github/vearutop/gocacheprogd/?category=comments)
 
-`gocacheprogd` is a remote HTTP cache server for Go's `GOCACHEPROG` protocol.
+`gocacheprog` can act as:
 
-`gocacheprog` is the companion client/helper that the Go tool runs as `GOCACHEPROG`.
+- a direct `GOCACHEPROG` helper
+- a local daemon + shim pair for CI
+- a remote HTTP cache server when started with `-listen`
 
 The project is aimed at large CI workloads where:
 
@@ -21,7 +23,7 @@ The project is aimed at large CI workloads where:
 
 At a high level:
 
-- `gocacheprogd` stores cached Go action results and serves them over HTTP
+- `gocacheprog -listen ...` stores cached Go action results and serves them over HTTP
 - `gocacheprog` keeps a local on-disk cache and proxies misses to the remote server
 - preload can pull a relevant working set into the local cache before the build starts
 - cache usage manifests store the list of cached entries actually used by a build, so later runs can preload only likely-needed entries
@@ -36,37 +38,23 @@ The design supports:
 ## Install
 
 ```bash
-go install github.com/vearutop/gocacheprogd@latest
+go install github.com/vearutop/gocacheprog@latest
 ```
 
-Or download binaries from [releases](https://github.com/vearutop/gocacheprogd/releases).
+Or download binaries from [releases](https://github.com/vearutop/gocacheprog/releases).
 
 Example on Linux AMD64:
 
 ```bash
-wget https://github.com/vearutop/gocacheprogd/releases/latest/download/linux_amd64.tar.gz
+wget https://github.com/vearutop/gocacheprog/releases/latest/download/linux_amd64.tar.gz
 tar xf linux_amd64.tar.gz
 rm linux_amd64.tar.gz
-./gocacheprogd -help
+./gocacheprog -help
 ```
 
-## Binaries
+## Modes
 
-### `gocacheprogd`
-
-Remote HTTP cache server.
-
-Important flags:
-
-- `-listen`
-- `-dir`
-- `-auth-token`
-- `-max-disk-bytes`
-- `-preload-limit`
-
-### `gocacheprog`
-
-Go cache helper. It has three practical modes:
+`gocacheprog` has three practical modes selected by `-listen` and `-remote-url`:
 
 1. Direct mode
 2. Daemon mode
@@ -85,10 +73,6 @@ Important flags:
 - `-base-commit`
 - `-parent-commit`
 - `-canonicalize-timestamps`
-- `-daemon`
-- `-daemon-socket`
-
-## Modes
 
 ### Direct Mode
 
@@ -117,8 +101,7 @@ Start a local daemon once:
 
 ```bash
 /path/to/gocacheprog \
-  -daemon \
-  -daemon-socket /tmp/gocacheprog.sock \
+  -listen unix:///tmp/gocacheprog.sock \
   -cache-dir ./build-cache \
   -remote-url https://cache.example.com \
   -preload \
@@ -133,7 +116,7 @@ Start a local daemon once:
 Then point `GOCACHEPROG` at the shim:
 
 ```bash
-export GOCACHEPROG="/path/to/gocacheprog -daemon-socket /tmp/gocacheprog.sock"
+export GOCACHEPROG="/path/to/gocacheprog -remote-url unix:///tmp/gocacheprog.sock"
 go test ./...
 ```
 
@@ -291,10 +274,10 @@ This avoids mixing actual cached blobs with sidecar metadata.
 
 ## Eviction
 
-`gocacheprogd` supports a total on-disk cache size limit:
+Server mode supports a total on-disk cache size limit:
 
 ```bash
-gocacheprogd -max-disk-bytes 5000000000
+gocacheprog -listen :8080 -max-disk-bytes 5000000000
 ```
 
 Eviction policy:
@@ -312,7 +295,7 @@ Optional bearer token auth is supported on both client and server.
 Server:
 
 ```bash
-gocacheprogd -auth-token secret-token
+gocacheprog -listen :8080 -auth-token secret-token
 ```
 
 Client:
@@ -331,7 +314,7 @@ authentication failed: -auth-token <value> is missing or incorrect
 
 ### `/status`
 
-`gocacheprogd` exposes:
+Server mode exposes:
 
 ```text
 /status
@@ -393,7 +376,7 @@ This protects the server from thrashing, but under heavy multi-session startup i
 If needed, raise it moderately, for example:
 
 ```bash
-gocacheprogd -preload-limit 4
+gocacheprog -listen :8080 -preload-limit 4
 ```
 
 Do not jump straight to very high values without observing:

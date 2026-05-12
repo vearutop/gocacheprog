@@ -5,7 +5,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cache"
 )
 
 func (h *Handler) Put(rw http.ResponseWriter, r *http.Request) {

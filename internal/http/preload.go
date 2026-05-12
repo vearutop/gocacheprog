@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cache"
 )
 
 func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {

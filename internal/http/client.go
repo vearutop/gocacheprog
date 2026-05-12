@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/vearutop/dynhist-go"
-	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cache"
 )
 
 var gatewayRetryDelay = 5 * time.Second

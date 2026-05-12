@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vearutop/gocacheprogd/internal/cacheprog"
+	"github.com/vearutop/gocacheprog/internal/cacheprog"
 )
 
 type shimHello struct {

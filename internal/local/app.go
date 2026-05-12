@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vearutop/gocacheprogd/internal/cacheprog"
+	"github.com/vearutop/gocacheprog/internal/cacheprog"
 )
 
 type App struct {

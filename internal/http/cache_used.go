@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cache"
 )
 
 func (h *Handler) CacheUsed(rw http.ResponseWriter, r *http.Request) {

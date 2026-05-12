@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/vearutop/gocacheprogd/internal/cache"
-	"github.com/vearutop/gocacheprogd/internal/cacheprog"
+	"github.com/vearutop/gocacheprog/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cacheprog"
 )
 
 func TestProxyClose_PostsCacheUsed_ReportsDedupedSortedActionIDs(t *testing.T) {

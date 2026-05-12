@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	cachehttp "github.com/vearutop/gocacheprogd/internal/http"
+	cachehttp "github.com/vearutop/gocacheprog/internal/http"
 )
 
 func RunServer(listen string, store *Store, authToken string, preloadLimit int) error {

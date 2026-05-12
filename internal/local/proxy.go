@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vearutop/gocacheprogd/internal/cache"
-	"github.com/vearutop/gocacheprogd/internal/cacheprog"
+	"github.com/vearutop/gocacheprog/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cacheprog"
 )
 
 type Proxy struct {

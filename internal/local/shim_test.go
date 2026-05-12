@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/vearutop/gocacheprogd/internal/cache"
-	"github.com/vearutop/gocacheprogd/internal/cacheprog"
-	cachehttp "github.com/vearutop/gocacheprogd/internal/http"
+	"github.com/vearutop/gocacheprog/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cacheprog"
+	cachehttp "github.com/vearutop/gocacheprog/internal/http"
 )
 
 func TestProcessShimSession_SharedProxyRemoteCompression(t *testing.T) {

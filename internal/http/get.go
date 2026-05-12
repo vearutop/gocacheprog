@@ -8,7 +8,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cache"
 )
 
 func (h *Handler) Get(rw http.ResponseWriter, r *http.Request) {

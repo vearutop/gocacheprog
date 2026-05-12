@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bool64/dev/version"
-	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cache"
 )
 
 type Handler struct {
@@ -45,7 +45,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Path == "/version" {
 		logVersionProbe(r)
-		_, _ = rw.Write([]byte("gocacheprogd " + version.Module("github.com/vearutop/gocacheprogd").Version))
+		_, _ = rw.Write([]byte("gocacheprogd " + version.Module("github.com/vearutop/gocacheprog").Version))
 		return
 	}
 

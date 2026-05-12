@@ -19,7 +19,7 @@ jobs:
 
       - name: Download gocacheprog
         run: |
-          wget -q -O /tmp/gocacheprog https://github.com/vearutop/gocacheprogd/releases/download/dev/gocacheprog
+          wget -q -O /tmp/gocacheprog https://github.com/vearutop/gocacheprog/releases/download/dev/gocacheprog
           chmod +x /tmp/gocacheprog
 
       # Go test cache includes file mtimes for some repo-local inputs.

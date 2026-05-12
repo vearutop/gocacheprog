@@ -16,10 +16,10 @@ func TestParseEntry(t *testing.T) {
 }
 
 func TestParseTestCacheEntry(t *testing.T) {
-	e, ok := parseEntry(`testcache: github.com/vearutop/gocacheprogd/internal/http: input list not found: cache entry not found`)
+	e, ok := parseEntry(`testcache: github.com/vearutop/gocacheprog/internal/http: input list not found: cache entry not found`)
 	require.True(t, ok)
 	require.Equal(t, "testcache", e.Kind)
-	require.Equal(t, "github.com/vearutop/gocacheprogd/internal/http", e.Package)
+	require.Equal(t, "github.com/vearutop/gocacheprog/internal/http", e.Package)
 	require.Equal(t, "input list not found: cache entry not found", e.Payload)
 }
 
@@ -37,7 +37,7 @@ func TestParseEntriesFocusInputs(t *testing.T) {
 		`HASH[moduleIndex]: "file foo.go 2026-05-11 12:00:00 +0000 UTC 123\n"` + "\n" +
 		`HASH[build fmt]: "compile"` + "\n" +
 		`HASH[testInputs]: "env TMPDIR /var/folders/vm/x/T/\n"` + "\n" +
-		`testcache: github.com/vearutop/gocacheprogd/internal/http: input list not found: cache entry not found` + "\n"
+		`testcache: github.com/vearutop/gocacheprog/internal/http: input list not found: cache entry not found` + "\n"
 	require.NoError(t, os.WriteFile(logPath, []byte(logData), 0o600))
 
 	entries, err := parseEntries(logPath, "all", "inputs")

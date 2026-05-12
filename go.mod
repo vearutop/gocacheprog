@@ -1,4 +1,4 @@
-module github.com/vearutop/gocacheprogd
+module github.com/vearutop/gocacheprog
 
 go 1.24
 

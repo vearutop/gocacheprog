@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vearutop/gocacheprogd/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cache"
 )
 
 type Store struct {
@@ -827,7 +827,7 @@ func (dc *Store) PrintStats() {
 	}
 
 	if stats != dc.prevStats {
-		log.Printf(stats)
+		log.Print(stats)
 		dc.prevStats = stats
 	}
 }

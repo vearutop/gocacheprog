@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vearutop/gocacheprogd/internal/cache"
-	"github.com/vearutop/gocacheprogd/internal/cacheprog"
-	"github.com/vearutop/gocacheprogd/internal/http"
-	"github.com/vearutop/gocacheprogd/internal/local"
+	"github.com/vearutop/gocacheprog/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/cacheprog"
+	"github.com/vearutop/gocacheprog/internal/http"
+	"github.com/vearutop/gocacheprog/internal/local"
 )
 
 func main() {
