@@ -45,7 +45,7 @@ type Proxy struct {
 	usedPreloadedIDs   map[string]struct{}
 }
 
-func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response) (*Proxy, error) {
+func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response, opts ...StoreOption) (*Proxy, error) {
 	c := &Proxy{
 		resps:              resps,
 		lookup:             make(chan cacheprog.Request, 1000),
@@ -56,7 +56,7 @@ func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response) (
 		usedPreloadedIDs:   map[string]struct{}{},
 	}
 
-	disk, err := NewStore(dir)
+	disk, err := NewStore(dir, opts...)
 	if err != nil {
 		return nil, err
 	}
