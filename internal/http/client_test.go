@@ -21,7 +21,7 @@ import (
 )
 
 func TestNewClient(t *testing.T) {
-	localStore, err := local.NewStore("./testdata", false)
+	localStore, err := local.NewStore("./testdata")
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -115,7 +115,7 @@ func TestNewClientWithSession_SendsVersionSessionHeaders(t *testing.T) {
 func TestClient_PostCacheUsed(t *testing.T) {
 	dir := t.TempDir()
 
-	localStore, err := local.NewStore(dir, true)
+	localStore, err := local.NewStore(dir, local.WithCompression())
 	require.NoError(t, err)
 
 	h := http.NewHandler(localStore, "")
@@ -142,7 +142,7 @@ func TestClient_PostCacheUsed(t *testing.T) {
 func TestPreload_UsesCommitManifestFilters(t *testing.T) {
 	dir := t.TempDir()
 
-	localStore, err := local.NewStore(dir, true)
+	localStore, err := local.NewStore(dir, local.WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -179,7 +179,7 @@ func TestPreload_UsesCommitManifestFilters(t *testing.T) {
 func TestPreload_UsesCurrentCommitManifestForRerun(t *testing.T) {
 	dir := t.TempDir()
 
-	localStore, err := local.NewStore(dir, true)
+	localStore, err := local.NewStore(dir, local.WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -218,7 +218,7 @@ func TestPreload_UsesCurrentCommitManifestForRerun(t *testing.T) {
 func TestPreload_UsesChangesIDBetweenParentAndBase(t *testing.T) {
 	dir := t.TempDir()
 
-	localStore, err := local.NewStore(dir, true)
+	localStore, err := local.NewStore(dir, local.WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -258,7 +258,7 @@ func TestPreload_UsesChangesIDBetweenParentAndBase(t *testing.T) {
 func TestClient_Preload_HTTPError(t *testing.T) {
 	dir := t.TempDir()
 
-	localStore, err := local.NewStore(dir, true)
+	localStore, err := local.NewStore(dir, local.WithCompression())
 	require.NoError(t, err)
 
 	h := http.NewHandler(localStore, "")
@@ -277,7 +277,7 @@ func TestClient_Preload_HTTPError(t *testing.T) {
 func TestClient_PostCacheUsed_HTTPError(t *testing.T) {
 	dir := t.TempDir()
 
-	localStore, err := local.NewStore(dir, true)
+	localStore, err := local.NewStore(dir, local.WithCompression())
 	require.NoError(t, err)
 
 	h := http.NewHandler(localStore, "")
@@ -294,7 +294,7 @@ func TestClient_PostCacheUsed_HTTPError(t *testing.T) {
 func TestClient_AuthToken(t *testing.T) {
 	dir := t.TempDir()
 
-	localStore, err := local.NewStore(dir, true)
+	localStore, err := local.NewStore(dir, local.WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -323,7 +323,7 @@ func TestClient_AuthToken(t *testing.T) {
 func TestStatus(t *testing.T) {
 	dir := t.TempDir()
 
-	localStore, err := local.NewStore(dir, true, local.WithMaxDiskBytes(123456))
+	localStore, err := local.NewStore(dir, local.WithCompression(), local.WithMaxDiskBytes(123456))
 	require.NoError(t, err)
 
 	h := http.NewHandler(localStore, "")
@@ -373,7 +373,7 @@ func makeItem(actionID, outputID, body string, now *time.Time) cache.ResponseIte
 }
 
 func TestNewClient_compressed(t *testing.T) {
-	localStore, err := local.NewStore("./testdata", true)
+	localStore, err := local.NewStore("./testdata", local.WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()

@@ -46,7 +46,7 @@ func run() error {
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
 
-	store, err := local.NewStore(*dir, true, local.WithMaxDiskBytes(*maxDiskBytes))
+	store, err := local.NewStore(*dir, local.WithCompression(), local.WithMaxDiskBytes(*maxDiskBytes))
 	if err != nil {
 		return fmt.Errorf("init local storage: %w", err)
 	}

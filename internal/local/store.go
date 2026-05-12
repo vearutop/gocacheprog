@@ -66,6 +66,12 @@ type actionIndexEntry struct {
 
 type StoreOption func(*Store)
 
+func WithCompression() StoreOption {
+	return func(s *Store) {
+		s.compress = true
+	}
+}
+
 func WithMaxDiskBytes(maxDiskBytes int64) StoreOption {
 	return func(s *Store) {
 		s.maxDiskBytes = maxDiskBytes
@@ -78,7 +84,7 @@ func WithEvictionDelay(evictionDelay time.Duration) StoreOption {
 	}
 }
 
-func NewStore(dir string, withCompression bool, opts ...StoreOption) (*Store, error) {
+func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	dir, err := toAbsPath(dir)
 	if err != nil {
 		return nil, err
@@ -86,7 +92,6 @@ func NewStore(dir string, withCompression bool, opts ...StoreOption) (*Store, er
 
 	dc := &Store{
 		dir:           dir,
-		compress:      withCompression,
 		evictionDelay: 5 * time.Minute,
 		index:         make(map[string]indexEntry),
 		outputRefs:    make(map[string]int),

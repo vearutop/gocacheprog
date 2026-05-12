@@ -14,7 +14,7 @@ import (
 )
 
 func TestStorePreload_NoCommitFiltersFallsBackToAllItems(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -32,7 +32,7 @@ func TestStorePreload_NoCommitFiltersFallsBackToAllItems(t *testing.T) {
 }
 
 func TestStorePreload_MissingManifestIsIgnored(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -53,7 +53,7 @@ func TestStorePreload_MissingManifestIsIgnored(t *testing.T) {
 }
 
 func TestStorePreload_CurrentCommitManifestUsedForSameCommitRestart(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -75,7 +75,7 @@ func TestStorePreload_CurrentCommitManifestUsedForSameCommitRestart(t *testing.T
 }
 
 func TestStorePreload_ChangesIDManifestUsedAfterParent(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -110,7 +110,7 @@ func TestStorePreload_ChangesIDManifestUsedAfterParent(t *testing.T) {
 }
 
 func TestStorePreload_BuildTypeIsolated(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -145,7 +145,7 @@ func TestStorePreload_BuildTypeIsolated(t *testing.T) {
 }
 
 func TestStorePostCacheUsed_MergesWithExistingManifest(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	require.NoError(t, store.PostCacheUsed("current123", "", "", []string{"actionId1", "actionId2"}, false))
@@ -157,7 +157,7 @@ func TestStorePostCacheUsed_MergesWithExistingManifest(t *testing.T) {
 }
 
 func TestStorePostCacheUsed_ReplaceChangesManifestOnColdStart(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	require.NoError(t, store.PostCacheUsed("", "repo/pr-123", "", []string{"oldAction", "sharedAction"}, false))
@@ -169,7 +169,7 @@ func TestStorePostCacheUsed_ReplaceChangesManifestOnColdStart(t *testing.T) {
 }
 
 func TestStoreHasEntries(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 	require.False(t, store.HasEntries())
 
@@ -183,7 +183,7 @@ func TestStoreHasEntries(t *testing.T) {
 
 func TestStorePut_WritesEntriesUnderPrefixedDir(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, true)
+	store, err := NewStore(dir, WithCompression())
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -197,7 +197,7 @@ func TestStorePut_WritesEntriesUnderPrefixedDir(t *testing.T) {
 
 func TestStoreEvictsLeastRecentlyUsedWhenSizeLimitExceeded(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, true, WithMaxDiskBytes(10), WithEvictionDelay(10*time.Millisecond))
+	store, err := NewStore(dir, WithCompression(), WithMaxDiskBytes(10), WithEvictionDelay(10*time.Millisecond))
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -237,7 +237,7 @@ func TestStoreEvictsLeastRecentlyUsedWhenSizeLimitExceeded(t *testing.T) {
 }
 
 func TestStoreManifestKeyLengthLimit(t *testing.T) {
-	store, err := NewStore(t.TempDir(), true)
+	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	longKey := strings.Repeat("a", maxManifestKeyLen+1)

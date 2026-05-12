@@ -56,7 +56,7 @@ func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response) (
 		usedPreloadedIDs:   map[string]struct{}{},
 	}
 
-	disk, err := NewStore(dir, false)
+	disk, err := NewStore(dir)
 	if err != nil {
 		return nil, err
 	}

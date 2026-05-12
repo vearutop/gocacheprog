@@ -171,7 +171,7 @@ func run() error {
 }
 
 func runServer(listen string, dir string, authToken string, maxDiskBytes int64, preloadLimit int) error {
-	store, err := local.NewStore(dir, true, local.WithMaxDiskBytes(maxDiskBytes))
+	store, err := local.NewStore(dir, local.WithCompression(), local.WithMaxDiskBytes(maxDiskBytes))
 	if err != nil {
 		return fmt.Errorf("init local storage: %w", err)
 	}

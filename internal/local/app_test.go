@@ -122,7 +122,7 @@ func TestApp_IterateInput_RejectsDeclaredBodySizeMismatch(t *testing.T) {
 
 func TestApp_E2E_DirectWithRemoteCompression(t *testing.T) {
 	// Seed a real remote store that keeps cache entries compressed.
-	remoteStore, err := NewStore(t.TempDir(), true)
+	remoteStore, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
 
 	remoteBody := strings.Repeat("remote-body-", 32)
