@@ -1,10 +1,10 @@
 module github.com/vearutop/gocacheprogd
 
-go 1.23.0
+go 1.24
 
 require (
-	github.com/bool64/dev v0.2.43
-	github.com/klauspost/compress v1.18.2
+	github.com/bool64/dev v0.2.45
+	github.com/klauspost/compress v1.18.6
 	github.com/stretchr/testify v1.11.1
 	github.com/vearutop/dynhist-go v1.2.4
 )

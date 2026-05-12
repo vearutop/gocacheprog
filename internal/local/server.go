@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	nethttp "net/http"
 	"os"
 	"os/signal"
@@ -17,13 +18,22 @@ import (
 
 func RunServer(listen string, store *Store, authToken string, preloadLimit int) error {
 	h := cachehttp.NewHandlerWithPreloadLimit(store, authToken, preloadLimit)
+	return serveHTTP(listen, h, store.PrintStats)
+}
 
-	go func() {
-		for {
-			time.Sleep(5 * time.Second)
-			store.PrintStats()
-		}
-	}()
+func RunProxyServer(listen string, h http.Handler, printStats func()) error {
+	return serveHTTP(listen, h, printStats)
+}
+
+func serveHTTP(listen string, h http.Handler, printStats func()) error {
+	if printStats != nil {
+		go func() {
+			for {
+				time.Sleep(5 * time.Second)
+				printStats()
+			}
+		}()
+	}
 
 	network, addr := listenNetworkAndAddr(listen)
 	if network == "unix" {

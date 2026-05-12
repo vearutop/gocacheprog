@@ -215,7 +215,6 @@ func (ri *ResponseItem) WriteTo(w io.Writer) (int64, error) {
 			sys = fi.Sys().(*syscall.Stat_t)
 			log.Printf("after sleep inode: %d, nlink: %d\n", sys.Ino, sys.Nlink)
 			log.Printf("after sleep file size: %d, current offset: %d\n", fi.Size(), offset)
-
 		}
 
 		return int64(n), fmt.Errorf("read item %T (read %d bytes) %+v: %w", bodyReader, n, ri, err)

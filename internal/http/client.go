@@ -52,6 +52,7 @@ type Client struct {
 	preloadBytes int64
 	preloadItems int64
 	getCnt       int64
+	getReqCnt    int64
 	putCnt       int64
 
 	mu                 sync.Mutex
@@ -286,6 +287,7 @@ func (c *Client) PostCacheUsed(commit string, changesID string, buildType string
 
 func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
 	atomic.AddInt64(&c.getCnt, 1)
+	atomic.AddInt64(&c.getReqCnt, 1)
 
 	j, err := json.Marshal(req)
 	if err != nil {
@@ -481,6 +483,7 @@ func (c *Client) Stats() map[string]string {
 		"preloaded":       fmt.Sprintf("%d", atomic.LoadInt64(&c.preloadItems)),
 		"get_95%":         fmt.Sprintf("%.2fms", c.latencyGet.Percentile(95)),
 		"get_cnt":         fmt.Sprintf("%d", atomic.LoadInt64(&c.getCnt)),
+		"get_req_cnt":     fmt.Sprintf("%d", atomic.LoadInt64(&c.getReqCnt)),
 		"put_95%":         fmt.Sprintf("%.2fms", c.latencyPut.Percentile(95)),
 		"put_cnt":         fmt.Sprintf("%d", atomic.LoadInt64(&c.putCnt)),
 	}

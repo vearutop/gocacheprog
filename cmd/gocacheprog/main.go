@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/vearutop/gocacheprogd/internal/cache"
@@ -61,6 +63,52 @@ func run() error {
 	}
 
 	if *listen != "" {
+		if *remoteURL != "" {
+			sessionStartedAt := time.Now().UTC()
+			upstream, err := http.NewClientWithSession(*remoteURL, *authToken, &http.SessionInfo{
+				SessionID: fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano()),
+				StartedAt: sessionStartedAt,
+				PID:       os.Getpid(),
+				CacheDir:  *dir,
+				Params:    params,
+			})
+			if err != nil {
+				return fmt.Errorf("remote client: %w", err)
+			}
+
+			store, err := local.NewStore(*dir, local.WithMaxDiskBytes(*maxDiskBytes))
+			if err != nil {
+				return fmt.Errorf("new cache store: %w", err)
+			}
+
+			resps := make(chan cacheprog.Response, 100)
+			proxy, err := local.NewProxy(store, upstream, resps, params)
+			if err != nil {
+				return fmt.Errorf("new daemon proxy: %w", err)
+			}
+
+			proxy.Verbose = true
+			ready := make(chan struct{})
+			preloadErrCh := make(chan error, 1)
+			go func() {
+				preloadErrCh <- proxy.MaybePreload()
+				close(ready)
+			}()
+
+			server := local.NewShimServer(proxy, resps, *authToken, ready)
+			err = server.Serve(*listen, preloadErrCh)
+			closeErr := proxy.Close()
+			close(resps)
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close daemon proxy: %w", closeErr)
+			}
+
+			return nil
+		}
+
 		store, err := local.NewStore(*dir, local.WithCompression(), local.WithMaxDiskBytes(*maxDiskBytes))
 		if err != nil {
 			return fmt.Errorf("init local storage: %w", err)
@@ -68,6 +116,10 @@ func run() error {
 		defer store.Close()
 
 		return runServer(*listen, store, *authToken, *preloadLimit)
+	}
+
+	if isLocalRemoteURL(*remoteURL) {
+		return runShim(*remoteURL, *authToken, *dumpLogs)
 	}
 
 	println("starting at dir", *dir)
@@ -115,7 +167,7 @@ func run() error {
 		return fmt.Errorf("new cache: %w", err)
 	}
 
-	dc.Verbose = true
+	//dc.Verbose = true
 	app := local.NewApp(os.Stdin, os.Stdout, dc, resps, logDump)
 	if err := dc.MaybePreload(); err != nil {
 		return err
@@ -147,4 +199,39 @@ func run() error {
 
 func runServer(listen string, store *local.Store, authToken string, preloadLimit int) error {
 	return local.RunServer(listen, store, authToken, preloadLimit)
+}
+
+func runShim(remoteURL string, authToken string, dumpLogs string) error {
+	println("starting shim via", remoteURL)
+
+	var logDump io.Writer
+	if dumpLogs != "" {
+		f, err := os.Create(dumpLogs)
+		if err != nil {
+			return fmt.Errorf("create dump logs file: %w", err)
+		}
+		logDump = f
+		defer f.Close()
+	}
+
+	client, err := local.NewShimClient(remoteURL, authToken, fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UTC().UnixNano()))
+	if err != nil {
+		return fmt.Errorf("daemon client: %w", err)
+	}
+
+	return local.ProcessShimSession(os.Stdin, os.Stdout, logDump, client)
+}
+
+func isLocalRemoteURL(remoteURL string) bool {
+	if strings.HasPrefix(remoteURL, "unix://") {
+		return true
+	}
+
+	u, err := url.Parse(remoteURL)
+	if err != nil {
+		return false
+	}
+
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1"
 }

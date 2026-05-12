@@ -322,6 +322,39 @@ func TestClient_AuthToken(t *testing.T) {
 	require.Equal(t, []string{"actionId1"}, got)
 }
 
+func TestClient_StatsTracksRemoteGetRequestsSeparatelyFromHead(t *testing.T) {
+	dir := t.TempDir()
+
+	localStore, err := local.NewStore(dir, local.WithCompression())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, localStore.Put(cache.Response{Items: []cache.ResponseItem{
+		makeItem("actionId1", "outputId1", "body-1", &now),
+		makeItem("actionId2", "outputId2", "body-2", &now),
+	}}))
+
+	h := http.NewHandler(localStore, "")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	err = client.Get(cache.Request{ActionIDs: []string{"actionId1"}}, func(item cache.ResponseItem) {})
+	require.NoError(t, err)
+
+	err = client.Put(cache.Response{Items: []cache.ResponseItem{
+		makeItem("actionId3", "outputId3", "body-3", &now),
+	}})
+	require.NoError(t, err)
+
+	stats := client.Stats()
+	require.Equal(t, "2", stats["get_cnt"])
+	require.Equal(t, "1", stats["get_req_cnt"])
+	require.Equal(t, "1", stats["put_cnt"])
+}
+
 func TestStatus(t *testing.T) {
 	dir := t.TempDir()
 
