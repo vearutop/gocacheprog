@@ -36,6 +36,7 @@ This document describes the intended replacement architecture.
    - same `cache-used` manifests
 5. Keep local responses low-latency.
 6. Keep local daemon cache files uncompressed so returned `DiskPath` is directly usable by the Go tool.
+7. Make the daemon a multiplexor over one shared `Proxy`, not a second cache implementation.
 
 ## Non-goals
 
@@ -52,6 +53,14 @@ cmd/go
   -> local daemon (HTTP over Unix socket)
   -> remote gocacheprogd (HTTP over TCP/HTTPS)
 ```
+
+The important architectural rule is:
+
+- the daemon owns one shared `local.Proxy`
+- all shim sessions feed requests into that one proxy instance
+- the daemon must not introduce an alternate remote-fetch path that bypasses proxy batching/barriers
+
+In other words, shim mode is not a different cache algorithm. It is a transport topology change that gives many `cmd/go` processes one shared proxy.
 
 ### Roles
 
@@ -82,10 +91,11 @@ The daemon is the single owner of the local cache dir for one job/workspace.
 Responsibilities:
 
 - own local uncompressed cache storage
+- multiplex many shim sessions onto one shared `Proxy`
 - serve local hits and local `DiskPath`s
 - run preload at most once per daemon lifetime / cache scope
 - aggregate `used ActionID`s across all shim sessions
-- preserve current remote-facing batching behavior
+- preserve current remote-facing batching behavior by reusing proxy batching, not by re-implementing remote fetches
 - upload `cache-used` manifests at shutdown
 
 Non-responsibilities:
@@ -116,6 +126,9 @@ Reasons:
 
 The shim should use a dedicated Unix-socket HTTP client.
 
+This transport is only for session multiplexing and request routing.
+It must not change how remote misses are resolved once inside the daemon.
+
 ## Request flow
 
 ### Put
@@ -141,19 +154,29 @@ Invariant:
 ```text
 cmd/go -> shim -> daemon
   local hit => immediate local DiskPath
-  local miss => daemon resolves via remote, stores locally uncompressed, returns local DiskPath
+  local miss => daemon waits for shared proxy resolution, stores locally uncompressed, returns local DiskPath
 ```
 
 Rules:
 
 1. Shim must not implement its own local cache.
 2. Daemon is the only local cache owner.
-3. If the remote object is compressed, the daemon decompresses it before writing local disk.
-4. Shim returns the daemon-local `DiskPath` unchanged.
+3. A local miss must go through the daemon's shared `Proxy` batching/barrier machinery.
+4. The daemon must not call upstream directly in a special shim-only miss path.
+5. If the remote object is compressed, the daemon decompresses it before writing local disk.
+6. Shim returns the daemon-local `DiskPath` unchanged.
 
 Invariant:
 
 - any `DiskPath` returned to `cmd/go` points to uncompressed daemon-local storage
+
+This is the most important behavioral constraint of the redesign:
+
+- shim requests may block waiting for the daemon's normal proxy batch to resolve
+- that is expected and correct
+- the daemon should answer only after the action is either materialized locally or known to be a miss
+
+The daemon therefore behaves like a multiplexed session router over one proxy, not like a metadata service.
 
 ## Compression model
 
@@ -210,6 +233,12 @@ Reason:
 Reason:
 
 - this is where roundtrip reduction still matters
+
+Important clarification:
+
+- "preserve current remote batching" means reuse the same proxy batching implementation as direct mode
+- it does not mean "add a second daemon-specific batching layer beside proxy"
+- it also does not mean "perform eager direct upstream fetches for shim requests"
 
 ## Manifest model
 
@@ -286,6 +315,17 @@ Required pattern:
 - extract runtime construction under `internal/...`
 - tests call those constructors/facades directly
 
+Code placement rule:
+
+- `cmd/gocacheprog/main.go` should stay relatively minimal and mostly perform flag parsing plus wiring
+- runtime/session/server/shim/proxy-facing code should live under `internal/local`
+- tests should primarily target those `internal/local` facades instead of rebuilding behavior through `main.go`
+
+Required topology rule:
+
+- tests must validate the daemon as a shared-proxy multiplexor
+- tests must not accidentally validate a shim-only bypass path that production code should not have
+
 ### Test layers
 
 1. Unit tests
@@ -309,15 +349,19 @@ Required pattern:
 3. Keep daemon-local storage policy explicit and testable.
 4. Keep shim intentionally dumb.
 5. Avoid incremental layering of daemon logic on top of direct-mode ad hoc code without first extracting shared runtime pieces.
+6. Do not add shim-only remote lookup paths that bypass `local.Proxy`.
+7. Do not introduce pseudo-`HEAD` or metadata-only APIs as a substitute for true shared proxy resolution.
+8. Prefer placing new runtime logic under `internal/local` rather than growing `cmd/gocacheprog/main.go`.
 
 ## Rollout plan
 
 1. Keep current direct-only implementation stable.
-2. Extract shared runtime/setup code first, while still direct-only.
-3. Add daemon runtime using those extracted pieces.
-4. Add shim runtime using those extracted pieces.
-5. Add end-to-end runtime tests against extracted facades.
-6. Only then wire daemon/shim flags back into the CLI and sample workflow.
+2. Extract server/runtime helpers first, while still direct-only.
+3. Extract a shared cacheprog session runner abstraction so direct and shim do not fork the JSON loop logic ad hoc.
+4. Add daemon runtime as "one shared proxy behind many sessions".
+5. Add shim runtime as a thin transport adapter to that daemon.
+6. Add end-to-end runtime tests against extracted facades.
+7. Only then wire daemon/shim flags back into the CLI and sample workflow.
 
 ## Acceptance criteria
 
