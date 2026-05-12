@@ -7,9 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
-	"syscall"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -189,34 +187,13 @@ func (ri *ResponseItem) WriteTo(w io.Writer) (int64, error) {
 
 	defer func() {
 		if err := bodyReader.Close(); err != nil {
-			log.Println("close item writer:", err.Error())
+			_ = err
 		}
 	}()
 
 	buf := make([]byte, ri.WireSize)
 	n, err := io.ReadFull(bodyReader, buf)
 	if err != nil {
-		if f, ok := bodyReader.(*os.File); ok {
-			fi, err := f.Stat()
-			if err != nil {
-				log.Println("stat file:", err.Error())
-			}
-			offset, _ := f.Seek(0, io.SeekCurrent)
-			sys := fi.Sys().(*syscall.Stat_t)
-			log.Printf("file: %s\n", f.Name())
-			log.Printf("inode: %d, nlink: %d\n", sys.Ino, sys.Nlink)
-			log.Printf("file size: %d, current offset: %d\n", fi.Size(), offset)
-			time.Sleep(1 * time.Second)
-
-			fi, err = os.Stat(f.Name()) // <-- note: os.Stat, not f.Stat()
-			if err != nil {
-				log.Println("stat 2 file:", err.Error())
-			}
-			sys = fi.Sys().(*syscall.Stat_t)
-			log.Printf("after sleep inode: %d, nlink: %d\n", sys.Ino, sys.Nlink)
-			log.Printf("after sleep file size: %d, current offset: %d\n", fi.Size(), offset)
-		}
-
 		return int64(n), fmt.Errorf("read item %T (read %d bytes) %+v: %w", bodyReader, n, ri, err)
 	}
 
