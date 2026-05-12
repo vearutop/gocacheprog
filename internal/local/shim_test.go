@@ -1,6 +1,7 @@
 package local
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -61,7 +62,7 @@ func TestProcessShimSession_SharedProxyRemoteCompression(t *testing.T) {
 		close(resps)
 	})
 
-	shimAddr := startTestShimServer(t, NewShimServer(proxy, resps, "", nil))
+	shimAddr := startTestShimServer(t, NewShimServer(proxy, resps, "", nil, nil))
 	shimClient, err := NewShimClient(shimAddr, "", "shim-a")
 	require.NoError(t, err)
 
@@ -188,7 +189,7 @@ func TestShimServer_RewritesCollidingRequestIDsAcrossSessions(t *testing.T) {
 		close(resps)
 	})
 
-	shimAddr := startTestShimServer(t, NewShimServer(proxy, resps, "", nil))
+	shimAddr := startTestShimServer(t, NewShimServer(proxy, resps, "", nil, nil))
 	clientA, err := NewShimClient(shimAddr, "", "shim-a")
 	require.NoError(t, err)
 	clientB, err := NewShimClient(shimAddr, "", "shim-b")
@@ -241,7 +242,7 @@ func TestNewShimClient_UnixSocket(t *testing.T) {
 		close(resps)
 	})
 
-	client, err := NewShimClient(startTestShimServer(t, NewShimServer(proxy, resps, "", nil)), "", "shim-a")
+	client, err := NewShimClient(startTestShimServer(t, NewShimServer(proxy, resps, "", nil, nil)), "", "shim-a")
 	require.NoError(t, err)
 
 	resp, err := client.Do(cacheprog.Request{
@@ -255,6 +256,193 @@ func TestNewShimClient_UnixSocket(t *testing.T) {
 	require.False(t, resp.Miss)
 	require.Equal(t, "outputIdPut", resp.OutputID)
 	require.NotEmpty(t, resp.DiskPath)
+}
+
+func TestProcessShimSession_HangsOnCloseAfterDisconnectWithPendingRequest(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		closePipeConn(t, serverConn)
+		closePipeConn(t, clientConn)
+	})
+
+	go func() {
+		dec := json.NewDecoder(bufio.NewReader(serverConn))
+
+		var hello shimHello
+		require.NoError(t, dec.Decode(&hello))
+
+		var env shimEnvelope
+		//nolint:musttag // shimEnvelope is the streaming shim protocol payload.
+		require.NoError(t, dec.Decode(&env))
+		require.Equal(t, cacheprog.CmdGet, env.Request.Command)
+
+		closePipeConn(t, serverConn)
+	}()
+
+	client := newTestShimClient(clientConn)
+	require.NoError(t, client.enc.Encode(shimHello{SessionID: "shim-a"}))
+
+	var input bytes.Buffer
+	writeJSONLine(t, &input, cacheprog.Request{ID: 1, Command: cacheprog.CmdGet, ActionID: "actionId1"})
+	writeJSONLine(t, &input, cacheprog.Request{ID: 2, Command: cacheprog.CmdClose})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ProcessShimSession(&input, &bytes.Buffer{}, nil, client)
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "expected shim session to surface disconnect during close")
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("ProcessShimSession remained blocked on close after daemon disconnect")
+	}
+}
+
+func TestShimServer_ClosedReadyProcessesRequestsEvenWhenPreloadFailed(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	resps := make(chan cacheprog.Response, 10)
+	proxy := NewProxy(store, nil, resps, ProxyParams{})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+		close(resps)
+	})
+
+	ready := make(chan struct{})
+	server := NewShimServer(proxy, resps, "", ready, func() error { return errors.New("preload failed") })
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		closePipeConn(t, serverConn)
+		closePipeConn(t, clientConn)
+	})
+
+	go server.serveConn(serverConn)
+
+	enc := json.NewEncoder(clientConn)
+	dec := json.NewDecoder(bufio.NewReader(clientConn))
+
+	require.NoError(t, enc.Encode(shimHello{SessionID: "shim-a"}))
+
+	writeDone := make(chan error, 1)
+	go func() {
+		//nolint:musttag // shimEnvelope is the streaming shim protocol payload.
+		err := enc.Encode(shimEnvelope{
+			Request: cacheprog.Request{
+				ID:       1,
+				Command:  cacheprog.CmdPut,
+				ActionID: "actionId1",
+				OutputID: "outputId1",
+				BodySize: int64(len("body-1")),
+			},
+			Body: []byte("body-1"),
+		})
+		writeDone <- err
+	}()
+
+	close(ready) // This mirrors the current main.go behavior even when preload failed.
+
+	if err := <-writeDone; err != nil {
+		return
+	}
+
+	require.NoError(t, clientConn.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
+
+	var resp cacheprog.Response
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
+	err = dec.Decode(&resp)
+	require.Error(t, err, "request unexpectedly succeeded after a failed preload signal")
+}
+
+func TestShimClient_DoCanStealResponsesFromOtherConsumers(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		closePipeConn(t, serverConn)
+		closePipeConn(t, clientConn)
+	})
+
+	go func() {
+		dec := json.NewDecoder(bufio.NewReader(serverConn))
+		enc := json.NewEncoder(serverConn)
+
+		var hello shimHello
+		require.NoError(t, dec.Decode(&hello))
+
+		var req1 shimEnvelope
+		//nolint:musttag // shimEnvelope is the streaming shim protocol payload.
+		require.NoError(t, dec.Decode(&req1))
+		require.Equal(t, int64(1), req1.Request.ID)
+
+		var req2 shimEnvelope
+		//nolint:musttag // shimEnvelope is the streaming shim protocol payload.
+		require.NoError(t, dec.Decode(&req2))
+		require.Equal(t, int64(2), req2.Request.ID)
+
+		//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
+		require.NoError(t, enc.Encode(cacheprog.Response{ID: 2, OutputID: "outputId2"}))
+		time.Sleep(20 * time.Millisecond)
+		//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
+		require.NoError(t, enc.Encode(cacheprog.Response{ID: 1, OutputID: "outputId1"}))
+		closePipeConn(t, serverConn)
+	}()
+
+	client := newTestShimClient(clientConn)
+	require.NoError(t, client.enc.Encode(shimHello{SessionID: "shim-a"}))
+
+	done1 := make(chan cacheprog.Response, 1)
+	err1 := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(cacheprog.Request{ID: 1, Command: cacheprog.CmdGet, ActionID: "actionId1"}, nil)
+		if err != nil {
+			err1 <- err
+			return
+		}
+		done1 <- resp
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, client.Send(cacheprog.Request{ID: 2, Command: cacheprog.CmdGet, ActionID: "actionId2"}, nil))
+
+	resp1 := <-done1
+	require.Equal(t, int64(1), resp1.ID)
+
+	select {
+	case resp, ok := <-client.Responses():
+		if ok {
+			require.Equal(t, int64(2), resp.ID, "expected response for request 2 to remain available")
+		} else {
+			t.Fatal("response for request 2 was lost when Do consumed the shared response channel")
+		}
+	case err := <-err1:
+		require.NoError(t, err)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for request 2 response")
+	}
+}
+
+func newTestShimClient(conn net.Conn) *ShimClient {
+	client := &ShimClient{
+		conn:    conn,
+		enc:     json.NewEncoder(conn),
+		jd:      json.NewDecoder(bufio.NewReader(conn)),
+		resps:   make(chan cacheprog.Response, 100),
+		waiters: make(map[int64]chan cacheprog.Response),
+	}
+
+	go client.readResponses()
+
+	return client
+}
+
+func closePipeConn(t *testing.T, conn net.Conn) {
+	t.Helper()
+
+	err := conn.Close()
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		require.NoError(t, err)
+	}
 }
 
 func startTestShimServer(t *testing.T, server *ShimServer) string {

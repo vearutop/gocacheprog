@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vearutop/gocacheprog/internal/cache"
@@ -187,13 +188,23 @@ func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, par
 	proxy.Verbose = true
 
 	ready := make(chan struct{})
+	var preloadMu sync.Mutex
+	var preloadErr error
 	preloadErrCh := make(chan error, 1)
 	go func() {
-		preloadErrCh <- proxy.MaybePreload()
+		err := proxy.MaybePreload()
+		preloadMu.Lock()
+		preloadErr = err
+		preloadMu.Unlock()
+		preloadErrCh <- err
 		close(ready)
 	}()
 
-	server := local.NewShimServer(proxy, resps, authToken, ready)
+	server := local.NewShimServer(proxy, resps, authToken, ready, func() error {
+		preloadMu.Lock()
+		defer preloadMu.Unlock()
+		return preloadErr
+	})
 	err = server.Serve(listen, preloadErrCh)
 	closeErr := proxy.Close()
 	close(resps)

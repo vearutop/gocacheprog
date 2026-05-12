@@ -55,18 +55,20 @@ type ShimServer struct {
 	proxy     *Proxy
 	resps     <-chan cacheprog.Response
 	ready     <-chan struct{}
+	readyErr  func() error
 
 	nextID  int64
 	waiters map[int64]shimPending
 	mu      sync.Mutex
 }
 
-func NewShimServer(proxy *Proxy, resps <-chan cacheprog.Response, authToken string, ready <-chan struct{}) *ShimServer {
+func NewShimServer(proxy *Proxy, resps <-chan cacheprog.Response, authToken string, ready <-chan struct{}, readyErr func() error) *ShimServer {
 	s := &ShimServer{
 		authToken: authToken,
 		proxy:     proxy,
 		resps:     resps,
 		ready:     ready,
+		readyErr:  readyErr,
 		waiters:   map[int64]shimPending{},
 	}
 
@@ -75,6 +77,7 @@ func NewShimServer(proxy *Proxy, resps <-chan cacheprog.Response, authToken stri
 	return s
 }
 
+//nolint:gocyclo // shim server startup/shutdown coordination is intentionally centralized here.
 func (s *ShimServer) Serve(listen string, preloadErrCh <-chan error) error {
 	if s.proxy != nil {
 		go func() {
@@ -122,11 +125,19 @@ func (s *ShimServer) Serve(listen string, preloadErrCh <-chan error) error {
 
 	s.proxy.logf("Listening on %s://%s ...", network, addr)
 
+	ready := s.ready
 	for {
 		select {
 		case sig := <-stop:
 			s.proxy.logf("Shutting down on %s ...", sig)
 			return nil
+		case <-ready:
+			if s.readyErr != nil {
+				if err := s.readyErr(); err != nil {
+					return fmt.Errorf("daemon preload: %w", err)
+				}
+			}
+			ready = nil
 		case err := <-preloadErrCh:
 			if err != nil {
 				return fmt.Errorf("daemon preload: %w", err)
@@ -189,6 +200,13 @@ func (s *ShimServer) serveConn(conn net.Conn) {
 	if s.ready != nil {
 		select {
 		case <-s.ready:
+			if s.readyErr != nil {
+				if err := s.readyErr(); err != nil {
+					s.proxy.logf("shim session %q blocked by daemon preload failure: %s", hello.SessionID, err.Error())
+					s.dropSessionWaiters(session)
+					return
+				}
+			}
 		case <-time.After(30 * time.Second):
 			s.proxy.logf("shim session %q timed out waiting for daemon readiness", hello.SessionID)
 			s.dropSessionWaiters(session)
@@ -285,6 +303,8 @@ type ShimClient struct {
 	jd        *json.Decoder
 	resps     chan cacheprog.Response
 	writeMu   sync.Mutex
+	waitersMu sync.Mutex
+	waiters   map[int64]chan cacheprog.Response
 }
 
 func NewShimClient(remoteURL string, authToken string, sessionID string) (*ShimClient, error) {
@@ -315,6 +335,7 @@ func NewShimClient(remoteURL string, authToken string, sessionID string) (*ShimC
 		enc:       json.NewEncoder(conn),
 		jd:        json.NewDecoder(bufio.NewReader(conn)),
 		resps:     make(chan cacheprog.Response, 100),
+		waiters:   make(map[int64]chan cacheprog.Response),
 	}
 
 	//nolint:gosec // local shim auth token is an expected protocol field.
@@ -331,13 +352,33 @@ func NewShimClient(remoteURL string, authToken string, sessionID string) (*ShimC
 }
 
 func (c *ShimClient) readResponses() {
-	defer close(c.resps)
+	defer func() {
+		c.waitersMu.Lock()
+		for id, ch := range c.waiters {
+			close(ch)
+			delete(c.waiters, id)
+		}
+		c.waitersMu.Unlock()
+		close(c.resps)
+	}()
 
 	for {
 		var resp cacheprog.Response
 		//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 		if err := c.jd.Decode(&resp); err != nil {
 			return
+		}
+
+		c.waitersMu.Lock()
+		waiter, ok := c.waiters[resp.ID]
+		if ok {
+			delete(c.waiters, resp.ID)
+		}
+		c.waitersMu.Unlock()
+		if ok {
+			waiter <- resp
+			close(waiter)
+			continue
 		}
 
 		c.resps <- resp
@@ -349,17 +390,24 @@ func (c *ShimClient) Responses() <-chan cacheprog.Response {
 }
 
 func (c *ShimClient) Do(req cacheprog.Request, body []byte) (cacheprog.Response, error) {
+	respCh := make(chan cacheprog.Response, 1)
+	c.waitersMu.Lock()
+	c.waiters[req.ID] = respCh
+	c.waitersMu.Unlock()
+
 	if err := c.Send(req, body); err != nil {
+		c.waitersMu.Lock()
+		delete(c.waiters, req.ID)
+		c.waitersMu.Unlock()
 		return cacheprog.Response{}, err
 	}
 
-	for resp := range c.resps {
-		if resp.ID == req.ID {
-			return resp, nil
-		}
+	resp, ok := <-respCh
+	if !ok {
+		return cacheprog.Response{}, io.EOF
 	}
 
-	return cacheprog.Response{}, io.EOF
+	return resp, nil
 }
 
 func (c *ShimClient) Send(req cacheprog.Request, body []byte) error {
@@ -394,6 +442,7 @@ func shimNetworkAndAddr(remoteURL string) (string, string, error) {
 	return "tcp", remoteURL, nil
 }
 
+//nolint:gocyclo // the stdio session loop is inherently stateful and clearer inline.
 func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *ShimClient) error {
 	br := bufio.NewReader(in)
 	jd := json.NewDecoder(br)
@@ -407,6 +456,7 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 	var mu sync.Mutex
 	errCh := make(chan error, 1)
 	var pending sync.WaitGroup
+	var inFlight atomic.Int64
 
 	go func() {
 		for resp := range client.Responses() {
@@ -416,7 +466,13 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 				return
 			}
 			dumpShimResponse(logDump, &mu, resp)
+			inFlight.Add(-1)
 			pending.Done()
+		}
+
+		if inFlight.Load() > 0 {
+			errCh <- io.ErrUnexpectedEOF
+			return
 		}
 
 		errCh <- nil
@@ -442,7 +498,22 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 		}
 
 		if req.Command == cacheprog.CmdClose {
-			pending.Wait()
+			waitDone := make(chan struct{})
+			go func() {
+				pending.Wait()
+				close(waitDone)
+			}()
+			select {
+			case <-waitDone:
+			case err := <-errCh:
+				if err == nil {
+					break
+				}
+				if closeErr := client.Close(); closeErr != nil {
+					return errors.Join(fmt.Errorf("wait for pending shim responses: %w", err), fmt.Errorf("close shim client: %w", closeErr))
+				}
+				return fmt.Errorf("wait for pending shim responses: %w", err)
+			}
 			if err := client.Close(); err != nil {
 				return fmt.Errorf("close shim client: %w", err)
 			}
@@ -450,11 +521,13 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 		}
 
 		if req.Command != cacheprog.CmdClose {
+			inFlight.Add(1)
 			pending.Add(1)
 		}
 
 		if err := client.Send(req, body); err != nil {
 			if req.Command != cacheprog.CmdClose {
+				inFlight.Add(-1)
 				pending.Done()
 			}
 			if closeErr := client.Close(); closeErr != nil {
