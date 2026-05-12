@@ -34,15 +34,14 @@ jobs:
           COMMIT="${{ github.event.pull_request.head.sha }}"
           CHANGES_ID="${{ github.repository }}#${{ github.event.pull_request.number }}"
           BUILD_TYPE="unit"
-          DAEMON_SOCKET="/tmp/gocacheprog.sock"
+          DAEMON_SOCKET="unix:///tmp/gocacheprog.sock"
           DAEMON_PID_FILE="/tmp/gocacheprog.pid"
           DAEMON_LOG="/tmp/gocacheprog-daemon.log"
 
           EXTRA_FLAGS="-commit ${COMMIT} -changes-id ${CHANGES_ID} -build-type ${BUILD_TYPE} -base-commit ${BASE_COMMIT}"
 
           /tmp/gocacheprog \
-            -daemon \
-            -daemon-socket "${DAEMON_SOCKET}" \
+            -listen "${DAEMON_SOCKET}" \
             -cache-dir ./build-cache \
             ${EXTRA_FLAGS} \
             -remote-url https://eq.p1cs.art \
@@ -52,7 +51,7 @@ jobs:
           echo $! > "${DAEMON_PID_FILE}"
 
           {
-            echo "GOCACHEPROG=/tmp/gocacheprog -daemon-socket ${DAEMON_SOCKET}"
+            echo "GOCACHEPROG=/tmp/gocacheprog -remote-url ${DAEMON_SOCKET}"
             echo "LOG_DISCARD=1"
             echo "GOMAXPROCS=100"
             echo "GOCACHEPROG_DAEMON_PID_FILE=${DAEMON_PID_FILE}"
