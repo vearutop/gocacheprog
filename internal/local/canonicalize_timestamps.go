@@ -1,4 +1,4 @@
-package main
+package local
 
 import (
 	"crypto/sha1"
@@ -19,7 +19,7 @@ type dirEntryPath struct {
 	relPath  string
 }
 
-func canonicalizeTimestamps(repoRoot string) error {
+func CanonicalizeTimestamps(repoRoot string) error {
 	repoRoot, err := filepath.Abs(repoRoot)
 	if err != nil {
 		return fmt.Errorf("abs repo root: %w", err)

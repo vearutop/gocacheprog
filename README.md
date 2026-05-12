@@ -1,11 +1,11 @@
-# gocacheprogd
+# gocacheprog
 
 [![Build Status](https://github.com/vearutop/gocacheprog/workflows/test-unit/badge.svg)](https://github.com/vearutop/gocacheprog/actions?query=branch%3Amaster+workflow%3Atest-unit)
-[![Coverage Status](https://codecov.io/gh/vearutop/gocacheprogd/branch/master/graph/badge.svg)](https://codecov.io/gh/vearutop/gocacheprogd)
+[![Coverage Status](https://codecov.io/gh/vearutop/gocacheprog/branch/master/graph/badge.svg)](https://codecov.io/gh/vearutop/gocacheprog)
 [![GoDevDoc](https://img.shields.io/badge/dev-doc-00ADD8?logo=go)](https://pkg.go.dev/github.com/vearutop/gocacheprog)
-[![Time Tracker](https://wakatime.com/badge/github/vearutop/gocacheprogd.svg)](https://wakatime.com/badge/github/vearutop/gocacheprogd)
-![Code lines](https://sloc.xyz/github/vearutop/gocacheprogd/?category=code)
-![Comments](https://sloc.xyz/github/vearutop/gocacheprogd/?category=comments)
+[![Time Tracker](https://wakatime.com/badge/github/vearutop/gocacheprog.svg)](https://wakatime.com/badge/github/vearutop/gocacheprog)
+![Code lines](https://sloc.xyz/github/vearutop/gocacheprog/?category=code)
+![Comments](https://sloc.xyz/github/vearutop/gocacheprog/?category=comments)
 
 `gocacheprog` can act as:
 

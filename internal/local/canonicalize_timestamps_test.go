@@ -1,4 +1,4 @@
-package main
+package local
 
 import (
 	"os"
@@ -22,7 +22,7 @@ func TestCanonicalizeTimestamps(t *testing.T) {
 	hiddenFile := filepath.Join(hiddenDir, "secret.txt")
 	require.NoError(t, os.WriteFile(hiddenFile, []byte("secret"), 0o600))
 
-	require.NoError(t, canonicalizeTimestamps(root))
+	require.NoError(t, CanonicalizeTimestamps(root))
 
 	visibleInfo, err := os.Stat(visibleFile)
 	require.NoError(t, err)
