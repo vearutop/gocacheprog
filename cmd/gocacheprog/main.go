@@ -106,7 +106,7 @@ func run() error {
 		}
 	}
 
-	dc, err := local.NewProxy(*dir, upstream, resps)
+	dc, err := local.NewProxy(*dir, upstream, resps, local.WithMaxDiskBytes(*maxDiskBytes))
 	if err != nil {
 		return fmt.Errorf("new cache: %w", err)
 	}
