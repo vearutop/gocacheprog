@@ -101,15 +101,15 @@ func logVersionProbe(r *http.Request) {
 	log.Printf(
 		"version; remote=%s; session_id=%q; started_at=%q; pid=%q; cache_dir=%q; commit=%q; parent=%q; changes=%q; build_type=%q; base=%q",
 		r.RemoteAddr,
-		r.Header.Get("X-GoCacheProg-Session-Id"),
-		r.Header.Get("X-GoCacheProg-Started-At"),
-		r.Header.Get("X-GoCacheProg-Pid"),
-		r.Header.Get("X-GoCacheProg-Cache-Dir"),
-		r.Header.Get("X-GoCacheProg-Commit"),
-		r.Header.Get("X-GoCacheProg-Parent"),
-		r.Header.Get("X-GoCacheProg-Changes"),
-		r.Header.Get("X-GoCacheProg-Build-Type"),
-		r.Header.Get("X-GoCacheProg-Base"),
+		r.Header.Get(headerSessionID),
+		r.Header.Get(headerStartedAt),
+		r.Header.Get(headerPID),
+		r.Header.Get(headerCacheDir),
+		r.Header.Get(headerCommit),
+		r.Header.Get(headerParent),
+		r.Header.Get(headerChanges),
+		r.Header.Get(headerBuildType),
+		r.Header.Get(headerBase),
 	)
 }
 

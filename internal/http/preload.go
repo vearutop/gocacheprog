@@ -32,7 +32,6 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	r.Body.Close()
 
 	if err := r.Body.Close(); err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -67,7 +66,7 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 
 		if len(sources) > 0 {
 			preloadSources = strings.Join(sources, ",")
-			rw.Header().Set("X-GoCacheProgD-Preload-Sources", preloadSources)
+			rw.Header().Set(headerPreloadSources, preloadSources)
 		}
 	}
 

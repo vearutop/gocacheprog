@@ -22,6 +22,19 @@ import (
 
 var gatewayRetryDelay = 5 * time.Second
 
+const (
+	headerSessionID      = "X-Gocacheprog-Session-Id"
+	headerStartedAt      = "X-Gocacheprog-Started-At"
+	headerPID            = "X-Gocacheprog-Pid"
+	headerCacheDir       = "X-Gocacheprog-Cache-Dir"
+	headerCommit         = "X-Gocacheprog-Commit"
+	headerParent         = "X-Gocacheprog-Parent"
+	headerChanges        = "X-Gocacheprog-Changes"
+	headerBuildType      = "X-Gocacheprog-Build-Type"
+	headerBase           = "X-Gocacheprog-Base"
+	headerPreloadSources = "X-Gocacheprog-Preload-Sources"
+)
+
 type SessionInfo struct {
 	SessionID string
 	StartedAt time.Time
@@ -134,31 +147,31 @@ func setSessionHeaders(req *http.Request, sessionInfo *SessionInfo) {
 	}
 
 	if sessionInfo.SessionID != "" {
-		req.Header.Set("X-GoCacheProg-Session-Id", sessionInfo.SessionID)
+		req.Header.Set(headerSessionID, sessionInfo.SessionID)
 	}
 	if !sessionInfo.StartedAt.IsZero() {
-		req.Header.Set("X-GoCacheProg-Started-At", sessionInfo.StartedAt.UTC().Format(time.RFC3339Nano))
+		req.Header.Set(headerStartedAt, sessionInfo.StartedAt.UTC().Format(time.RFC3339Nano))
 	}
 	if sessionInfo.PID != 0 {
-		req.Header.Set("X-GoCacheProg-Pid", strconv.Itoa(sessionInfo.PID))
+		req.Header.Set(headerPID, strconv.Itoa(sessionInfo.PID))
 	}
 	if sessionInfo.CacheDir != "" {
-		req.Header.Set("X-GoCacheProg-Cache-Dir", sessionInfo.CacheDir)
+		req.Header.Set(headerCacheDir, sessionInfo.CacheDir)
 	}
 	if sessionInfo.Params != nil && sessionInfo.Params.SessionCommit() != "" {
-		req.Header.Set("X-GoCacheProg-Commit", sessionInfo.Params.SessionCommit())
+		req.Header.Set(headerCommit, sessionInfo.Params.SessionCommit())
 	}
 	if sessionInfo.Params != nil && sessionInfo.Params.SessionParentCommit() != "" {
-		req.Header.Set("X-GoCacheProg-Parent", sessionInfo.Params.SessionParentCommit())
+		req.Header.Set(headerParent, sessionInfo.Params.SessionParentCommit())
 	}
 	if sessionInfo.Params != nil && sessionInfo.Params.SessionChangesID() != "" {
-		req.Header.Set("X-GoCacheProg-Changes", sessionInfo.Params.SessionChangesID())
+		req.Header.Set(headerChanges, sessionInfo.Params.SessionChangesID())
 	}
 	if sessionInfo.Params != nil && sessionInfo.Params.SessionBuildType() != "" {
-		req.Header.Set("X-GoCacheProg-Build-Type", sessionInfo.Params.SessionBuildType())
+		req.Header.Set(headerBuildType, sessionInfo.Params.SessionBuildType())
 	}
 	if sessionInfo.Params != nil && sessionInfo.Params.SessionBaseCommit() != "" {
-		req.Header.Set("X-GoCacheProg-Base", sessionInfo.Params.SessionBaseCommit())
+		req.Header.Set(headerBase, sessionInfo.Params.SessionBaseCommit())
 	}
 }
 
@@ -211,7 +224,7 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	}
 
 	c.mu.Lock()
-	c.lastPreloadSources = strings.TrimSpace(res.Header.Get("X-GoCacheProgD-Preload-Sources"))
+	c.lastPreloadSources = strings.TrimSpace(res.Header.Get(headerPreloadSources))
 	c.mu.Unlock()
 
 	var resp cache.Response

@@ -1,10 +1,10 @@
 package local
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	nethttp "net/http"
 	"os"
 	"os/signal"
@@ -21,11 +21,11 @@ func RunServer(listen string, store *Store, authToken string, preloadLimit int) 
 	return serveHTTP(listen, h, store.PrintStats)
 }
 
-func RunProxyServer(listen string, h http.Handler, printStats func()) error {
+func RunProxyServer(listen string, h nethttp.Handler, printStats func()) error {
 	return serveHTTP(listen, h, printStats)
 }
 
-func serveHTTP(listen string, h http.Handler, printStats func()) error {
+func serveHTTP(listen string, h nethttp.Handler, printStats func()) error {
 	if printStats != nil {
 		go func() {
 			for {
@@ -74,7 +74,7 @@ func serveHTTP(listen string, h http.Handler, printStats func()) error {
 			log.Printf("server close: %s", err.Error())
 		}
 	case err := <-errCh:
-		if err != nil && err != nethttp.ErrServerClosed {
+		if err != nil && !errors.Is(err, nethttp.ErrServerClosed) {
 			return fmt.Errorf("serve %s %s: %w", network, addr, err)
 		}
 	}

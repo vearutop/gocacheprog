@@ -72,15 +72,15 @@ func TestNewClientWithSession_SendsVersionSessionHeaders(t *testing.T) {
 
 	srv := httptest.NewServer(nethttp.HandlerFunc(func(rw nethttp.ResponseWriter, r *nethttp.Request) {
 		gotHeaders = map[string]string{
-			"session":    r.Header.Get("X-GoCacheProg-Session-Id"),
-			"started_at": r.Header.Get("X-GoCacheProg-Started-At"),
-			"pid":        r.Header.Get("X-GoCacheProg-Pid"),
-			"cache_dir":  r.Header.Get("X-GoCacheProg-Cache-Dir"),
-			"commit":     r.Header.Get("X-GoCacheProg-Commit"),
-			"parent":     r.Header.Get("X-GoCacheProg-Parent"),
-			"changes":    r.Header.Get("X-GoCacheProg-Changes"),
-			"build_type": r.Header.Get("X-GoCacheProg-Build-Type"),
-			"base":       r.Header.Get("X-GoCacheProg-Base"),
+			"session":    r.Header.Get("X-Gocacheprog-Session-Id"),
+			"started_at": r.Header.Get("X-Gocacheprog-Started-At"),
+			"pid":        r.Header.Get("X-Gocacheprog-Pid"),
+			"cache_dir":  r.Header.Get("X-Gocacheprog-Cache-Dir"),
+			"commit":     r.Header.Get("X-Gocacheprog-Commit"),
+			"parent":     r.Header.Get("X-Gocacheprog-Parent"),
+			"changes":    r.Header.Get("X-Gocacheprog-Changes"),
+			"build_type": r.Header.Get("X-Gocacheprog-Build-Type"),
+			"base":       r.Header.Get("X-Gocacheprog-Base"),
 		}
 
 		_, _ = rw.Write([]byte("gocacheprogd test"))

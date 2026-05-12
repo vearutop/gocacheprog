@@ -43,9 +43,7 @@ type Store struct {
 	errors        int64
 }
 
-var (
-	validScopedKeyName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-)
+var validScopedKeyName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 const maxManifestKeyLen = 100
 
