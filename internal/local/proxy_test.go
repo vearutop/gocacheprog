@@ -10,44 +10,50 @@ import (
 	"github.com/vearutop/gocacheprogd/internal/cacheprog"
 )
 
-func TestProxyPostCacheUsed_ReportsDedupedSortedActionIDs(t *testing.T) {
+func TestProxyClose_PostsCacheUsed_ReportsDedupedSortedActionIDs(t *testing.T) {
 	upstream := &usageRecorderStub{}
 
-	proxy, err := NewProxy(t.TempDir(), upstream, make(chan cacheprog.Response, 1))
+	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, proxy.Close())
+	proxy, err := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
+		Commit:    "commit123",
+		ChangesID: "repo/pr-123",
+		BuildType: "unit",
 	})
+	require.NoError(t, err)
 
 	proxy.recordUsedActionID("actionId2")
 	proxy.recordUsedActionID("actionId1")
 	proxy.recordUsedActionID("actionId2")
 
-	require.NoError(t, proxy.PostCacheUsed("commit123", "repo/pr-123", "unit", false))
+	require.NoError(t, proxy.Close())
 	require.True(t, upstream.called)
 	require.Equal(t, "commit123", upstream.commit)
 	require.Equal(t, "repo/pr-123", upstream.changesID)
 	require.Equal(t, "unit", upstream.buildType)
-	require.False(t, upstream.replaceChanges)
+	require.True(t, upstream.replaceChanges)
 	require.Equal(t, []string{"actionId1", "actionId2"}, upstream.actionIDs)
 }
 
-func TestProxyPostCacheUsed_NoOpWithoutUsageRecorder(t *testing.T) {
-	proxy, err := NewProxy(t.TempDir(), noopStore{}, make(chan cacheprog.Response, 1))
+func TestProxyClose_CacheUsedNoOpWithoutUsageRecorder(t *testing.T) {
+	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, proxy.Close())
+	proxy, err := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{
+		Commit:    "commit123",
+		ChangesID: "changes123",
+		BuildType: "unit",
 	})
+	require.NoError(t, err)
 
 	proxy.recordUsedActionID("actionId1")
 
-	require.NoError(t, proxy.PostCacheUsed("commit123", "", "", false))
-	require.NoError(t, proxy.PostCacheUsed("", "changes123", "", false))
-	require.NoError(t, proxy.PostCacheUsed("", "", "", false))
+	require.NoError(t, proxy.Close())
 }
 
 func TestProxyHasLocalEntries(t *testing.T) {
-	proxy, err := NewProxy(t.TempDir(), noopStore{}, make(chan cacheprog.Response, 1))
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy, err := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())
@@ -65,7 +71,9 @@ func TestProxyHasLocalEntries(t *testing.T) {
 }
 
 func TestProxyStats_HitBreakdown(t *testing.T) {
-	proxy, err := NewProxy(t.TempDir(), noopStore{}, make(chan cacheprog.Response, 1))
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy, err := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())

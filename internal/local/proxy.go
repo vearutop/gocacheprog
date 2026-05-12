@@ -43,9 +43,42 @@ type Proxy struct {
 	preloadedMu        sync.Mutex
 	preloadedActionIDs map[string]struct{}
 	usedPreloadedIDs   map[string]struct{}
+
+	initialLocalEntries bool
+	params              ProxyParams
 }
 
-func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response, opts ...StoreOption) (*Proxy, error) {
+type ProxyParams struct {
+	Commit       string
+	ChangesID    string
+	BuildType    string
+	BaseCommit   string
+	ParentCommit string
+	Preload      bool
+	PreloadSize  int64
+}
+
+func (p ProxyParams) SessionCommit() string {
+	return p.Commit
+}
+
+func (p ProxyParams) SessionParentCommit() string {
+	return p.ParentCommit
+}
+
+func (p ProxyParams) SessionChangesID() string {
+	return p.ChangesID
+}
+
+func (p ProxyParams) SessionBuildType() string {
+	return p.BuildType
+}
+
+func (p ProxyParams) SessionBaseCommit() string {
+	return p.BaseCommit
+}
+
+func NewProxy(disk *Store, upstream cache.Store, resps chan cacheprog.Response, params ProxyParams) (*Proxy, error) {
 	c := &Proxy{
 		resps:              resps,
 		lookup:             make(chan cacheprog.Request, 1000),
@@ -54,14 +87,11 @@ func NewProxy(dir string, upstream cache.Store, resps chan cacheprog.Response, o
 		usedActionIDs:      map[string]struct{}{},
 		preloadedActionIDs: map[string]struct{}{},
 		usedPreloadedIDs:   map[string]struct{}{},
-	}
-
-	disk, err := NewStore(dir, opts...)
-	if err != nil {
-		return nil, err
+		params:             params,
 	}
 
 	c.disk = disk
+	c.initialLocalEntries = disk.HasEntries()
 
 	c.wg.Add(2)
 
@@ -75,6 +105,10 @@ func (dc *Proxy) Close() error {
 	close(dc.lookup)
 	close(dc.put)
 	dc.wg.Wait()
+
+	if err := dc.postCacheUsedOnClose(); err != nil {
+		return err
+	}
 
 	return dc.disk.Close()
 }
@@ -123,7 +157,7 @@ func (dc *Proxy) UsedActionIDs() []string {
 	return res
 }
 
-func (dc *Proxy) PostCacheUsed(commit string, changesID string, buildType string, replaceChanges bool) error {
+func (dc *Proxy) postCacheUsed(commit string, changesID string, buildType string, replaceChanges bool) error {
 	if commit == "" && changesID == "" {
 		return nil
 	}
@@ -134,6 +168,54 @@ func (dc *Proxy) PostCacheUsed(commit string, changesID string, buildType string
 	}
 
 	return recorder.PostCacheUsed(commit, changesID, buildType, dc.UsedActionIDs(), replaceChanges)
+}
+
+func (dc *Proxy) postCacheUsedOnClose() error {
+	return dc.postCacheUsed(
+		dc.params.Commit,
+		dc.params.ChangesID,
+		dc.params.BuildType,
+		!dc.initialLocalEntries,
+	)
+}
+
+func (dc *Proxy) MaybePreload() error {
+	if !dc.params.Preload &&
+		dc.params.Commit == "" &&
+		dc.params.ChangesID == "" &&
+		dc.params.BuildType == "" &&
+		dc.params.BaseCommit == "" &&
+		dc.params.ParentCommit == "" {
+		return nil
+	}
+
+	if dc.HasLocalEntries() {
+		println("skipping preload because local cache dir is already populated")
+		return nil
+	}
+
+	st := time.Now()
+	println("preloading cache up to", dc.params.PreloadSize, "bytes per item from remote server ...")
+	if err := dc.Preload(cache.PreloadRequest{
+		MaxSize:      dc.params.PreloadSize,
+		Commit:       dc.params.Commit,
+		ChangesID:    dc.params.ChangesID,
+		BuildType:    dc.params.BuildType,
+		BaseCommit:   dc.params.BaseCommit,
+		ParentCommit: dc.params.ParentCommit,
+	}); err != nil {
+		return fmt.Errorf("preload cache: %w", err)
+	}
+
+	if s, ok := dc.upstream.(interface{ LastPreloadSources() string }); ok {
+		if sources := s.LastPreloadSources(); sources != "" {
+			println("preload sources:", sources)
+		}
+	}
+
+	println("preload done in", time.Since(st).String())
+
+	return nil
 }
 
 func (dc *Proxy) HasLocalEntries() bool {

@@ -89,15 +89,17 @@ func TestNewClientWithSession_SendsVersionSessionHeaders(t *testing.T) {
 
 	startedAt := time.Date(2026, time.May, 12, 0, 20, 0, 123, time.UTC)
 	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{
-		SessionID:  "session-123",
-		StartedAt:  startedAt,
-		PID:        42,
-		CacheDir:   "/tmp/build-cache",
-		Commit:     "commit123",
-		Parent:     "parent123",
-		ChangesID:  "repo/pr-123",
-		BuildType:  "unit",
-		BaseCommit: "base123",
+		SessionID: "session-123",
+		StartedAt: startedAt,
+		PID:       42,
+		CacheDir:  "/tmp/build-cache",
+		Params: local.ProxyParams{
+			Commit:       "commit123",
+			ParentCommit: "parent123",
+			ChangesID:    "repo/pr-123",
+			BuildType:    "unit",
+			BaseCommit:   "base123",
+		},
 	})
 	require.NoError(t, err)
 	require.NotNil(t, client)
@@ -408,7 +410,9 @@ func TestNewClient_compressed(t *testing.T) {
 	}
 
 	resps := make(chan cacheprog.Response, 10)
-	pr, err := local.NewProxy("testdata/proxy", client, resps)
+	store, err := local.NewStore("testdata/proxy")
+	require.NoError(t, err)
+	pr, err := local.NewProxy(store, client, resps, local.ProxyParams{})
 	require.NoError(t, err)
 
 	err = pr.Preload(cache.PreloadRequest{

@@ -29,14 +29,16 @@ func run() error {
 	authToken := flag.String("auth-token", "", "optional bearer token for the remote HTTP cache server")
 	maxDiskBytes := flag.Int64("max-disk-bytes", 0, "optional total on-disk cache size limit in bytes; 0 disables eviction")
 	preloadLimit := flag.Int("preload-limit", 2, "maximum number of concurrent preload preparations in server mode")
-	preload := flag.Bool("preload", false, "preload cache from remote server")
-	preloadSize := flag.Int64("preload-size", 1000000, "preload cache from remote server fo items up to this size")
-	commit := flag.String("commit", "", "current commit SHA used to upload cache usage manifest")
-	changesID := flag.String("changes-id", "", "stable change stream label used to upload and preload latest cache usage manifest")
-	buildType := flag.String("build-type", "", "optional build type label to isolate cache manifests, e.g. unit or race")
-	baseCommit := flag.String("base-commit", "", "base commit SHA used to scope preload")
-	parentCommit := flag.String("parent-commit", "", "parent commit SHA used to scope preload")
 	canonicalize := flag.String("canonicalize-timestamps", "", "canonicalize file and directory timestamps under this repo root and exit")
+	params := local.ProxyParams{}
+
+	flag.BoolVar(&params.Preload, "preload", false, "preload cache from remote server")
+	flag.Int64Var(&params.PreloadSize, "preload-size", 1000000, "preload cache from remote server fo items up to this size")
+	flag.StringVar(&params.Commit, "commit", "", "current commit SHA used to upload cache usage manifest")
+	flag.StringVar(&params.ChangesID, "changes-id", "", "stable change stream label used to upload and preload latest cache usage manifest")
+	flag.StringVar(&params.BuildType, "build-type", "", "optional build type label to isolate cache manifests, e.g. unit or race")
+	flag.StringVar(&params.BaseCommit, "base-commit", "", "base commit SHA used to scope preload")
+	flag.StringVar(&params.ParentCommit, "parent-commit", "", "parent commit SHA used to scope preload")
 
 	flag.Parse()
 
@@ -59,7 +61,13 @@ func run() error {
 	}
 
 	if *listen != "" {
-		return runServer(*listen, *dir, *authToken, *maxDiskBytes, *preloadLimit)
+		store, err := local.NewStore(*dir, local.WithCompression(), local.WithMaxDiskBytes(*maxDiskBytes))
+		if err != nil {
+			return fmt.Errorf("init local storage: %w", err)
+		}
+		defer store.Close()
+
+		return runServer(*listen, store, *authToken, *preloadLimit)
 	}
 
 	println("starting at dir", *dir)
@@ -86,55 +94,31 @@ func run() error {
 	if *remoteURL != "" {
 		sessionStartedAt := time.Now().UTC()
 		upstream, err = http.NewClientWithSession(*remoteURL, *authToken, &http.SessionInfo{
-			SessionID:  fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano()),
-			StartedAt:  sessionStartedAt,
-			PID:        os.Getpid(),
-			CacheDir:   *dir,
-			Commit:     *commit,
-			Parent:     *parentCommit,
-			ChangesID:  *changesID,
-			BuildType:  *buildType,
-			BaseCommit: *baseCommit,
+			SessionID: fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano()),
+			StartedAt: sessionStartedAt,
+			PID:       os.Getpid(),
+			CacheDir:  *dir,
+			Params:    params,
 		})
 		if err != nil {
 			return fmt.Errorf("remote client: %w", err)
 		}
 	}
 
-	dc, err := local.NewProxy(*dir, upstream, resps, local.WithMaxDiskBytes(*maxDiskBytes))
+	store, err := local.NewStore(*dir, local.WithMaxDiskBytes(*maxDiskBytes))
+	if err != nil {
+		return fmt.Errorf("new cache store: %w", err)
+	}
+
+	dc, err := local.NewProxy(store, upstream, resps, params)
 	if err != nil {
 		return fmt.Errorf("new cache: %w", err)
 	}
 
 	dc.Verbose = true
-	initialLocalEntries := dc.HasLocalEntries()
 	app := local.NewApp(os.Stdin, os.Stdout, dc, resps, logDump)
-
-	if *preload || *commit != "" || *changesID != "" || *buildType != "" || *baseCommit != "" || *parentCommit != "" {
-		if dc.HasLocalEntries() {
-			println("skipping preload because local cache dir is already populated")
-		} else {
-			st := time.Now()
-			println("preloading cache up to", *preloadSize, "bytes per item from remote server ...")
-			if err := dc.Preload(cache.PreloadRequest{
-				MaxSize:      *preloadSize,
-				Commit:       *commit,
-				ChangesID:    *changesID,
-				BuildType:    *buildType,
-				BaseCommit:   *baseCommit,
-				ParentCommit: *parentCommit,
-			}); err != nil {
-				return fmt.Errorf("preload cache: %w", err)
-			}
-
-			if s, ok := upstream.(interface{ LastPreloadSources() string }); ok {
-				if sources := s.LastPreloadSources(); sources != "" {
-					println("preload sources:", sources)
-				}
-			}
-
-			println("preload done in", time.Since(st).String())
-		}
+	if err := dc.MaybePreload(); err != nil {
+		return err
 	}
 
 	go func() {
@@ -154,10 +138,6 @@ func run() error {
 	if err := dc.Close(); err != nil {
 		return fmt.Errorf("close cache: %w", err)
 	}
-
-	if err := dc.PostCacheUsed(*commit, *changesID, *buildType, !initialLocalEntries); err != nil {
-		return fmt.Errorf("post cache-used: %w", err)
-	}
 	close(resps)
 
 	dc.PrintStats()
@@ -165,12 +145,6 @@ func run() error {
 	return nil
 }
 
-func runServer(listen string, dir string, authToken string, maxDiskBytes int64, preloadLimit int) error {
-	store, err := local.NewStore(dir, local.WithCompression(), local.WithMaxDiskBytes(maxDiskBytes))
-	if err != nil {
-		return fmt.Errorf("init local storage: %w", err)
-	}
-	defer store.Close()
-
+func runServer(listen string, store *local.Store, authToken string, preloadLimit int) error {
 	return local.RunServer(listen, store, authToken, preloadLimit)
 }

@@ -18,7 +18,9 @@ import (
 
 func TestApp_IterateInputAndResponses(t *testing.T) {
 	resps := make(chan cacheprog.Response, 10)
-	proxy, err := NewProxy(t.TempDir(), nil, resps)
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy, err := NewProxy(store, nil, resps, ProxyParams{})
 	require.NoError(t, err)
 
 	body := []byte("body-1")
@@ -97,7 +99,9 @@ func TestApp_IterateInputAndResponses(t *testing.T) {
 
 func TestApp_IterateInput_RejectsDeclaredBodySizeMismatch(t *testing.T) {
 	resps := make(chan cacheprog.Response, 1)
-	proxy, err := NewProxy(t.TempDir(), nil, resps)
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy, err := NewProxy(store, nil, resps, ProxyParams{})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())
@@ -154,7 +158,9 @@ func TestApp_E2E_DirectWithRemoteCompression(t *testing.T) {
 	require.NoError(t, err)
 
 	resps := make(chan cacheprog.Response, 10)
-	proxy, err := NewProxy(t.TempDir(), upstream, resps)
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy, err := NewProxy(store, upstream, resps, ProxyParams{})
 	require.NoError(t, err)
 
 	// Preload the existing remote entry so the app-level "get" stays on the

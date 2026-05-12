@@ -23,15 +23,19 @@ import (
 var gatewayRetryDelay = 5 * time.Second
 
 type SessionInfo struct {
-	SessionID  string
-	StartedAt  time.Time
-	PID        int
-	CacheDir   string
-	Commit     string
-	Parent     string
-	ChangesID  string
-	BuildType  string
-	BaseCommit string
+	SessionID string
+	StartedAt time.Time
+	PID       int
+	CacheDir  string
+	Params    SessionParams
+}
+
+type SessionParams interface {
+	SessionCommit() string
+	SessionParentCommit() string
+	SessionChangesID() string
+	SessionBuildType() string
+	SessionBaseCommit() string
 }
 
 type Client struct {
@@ -140,20 +144,20 @@ func setSessionHeaders(req *http.Request, sessionInfo *SessionInfo) {
 	if sessionInfo.CacheDir != "" {
 		req.Header.Set("X-GoCacheProg-Cache-Dir", sessionInfo.CacheDir)
 	}
-	if sessionInfo.Commit != "" {
-		req.Header.Set("X-GoCacheProg-Commit", sessionInfo.Commit)
+	if sessionInfo.Params != nil && sessionInfo.Params.SessionCommit() != "" {
+		req.Header.Set("X-GoCacheProg-Commit", sessionInfo.Params.SessionCommit())
 	}
-	if sessionInfo.Parent != "" {
-		req.Header.Set("X-GoCacheProg-Parent", sessionInfo.Parent)
+	if sessionInfo.Params != nil && sessionInfo.Params.SessionParentCommit() != "" {
+		req.Header.Set("X-GoCacheProg-Parent", sessionInfo.Params.SessionParentCommit())
 	}
-	if sessionInfo.ChangesID != "" {
-		req.Header.Set("X-GoCacheProg-Changes", sessionInfo.ChangesID)
+	if sessionInfo.Params != nil && sessionInfo.Params.SessionChangesID() != "" {
+		req.Header.Set("X-GoCacheProg-Changes", sessionInfo.Params.SessionChangesID())
 	}
-	if sessionInfo.BuildType != "" {
-		req.Header.Set("X-GoCacheProg-Build-Type", sessionInfo.BuildType)
+	if sessionInfo.Params != nil && sessionInfo.Params.SessionBuildType() != "" {
+		req.Header.Set("X-GoCacheProg-Build-Type", sessionInfo.Params.SessionBuildType())
 	}
-	if sessionInfo.BaseCommit != "" {
-		req.Header.Set("X-GoCacheProg-Base", sessionInfo.BaseCommit)
+	if sessionInfo.Params != nil && sessionInfo.Params.SessionBaseCommit() != "" {
+		req.Header.Set("X-GoCacheProg-Base", sessionInfo.Params.SessionBaseCommit())
 	}
 }
 
