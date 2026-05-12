@@ -59,7 +59,9 @@ func TestNewClient(t *testing.T) {
 		rd, err := item.UncompressedBodyReader()
 		require.NoError(t, err)
 
-		defer rd.Close()
+		defer func() {
+			require.NoError(t, rd.Close())
+		}()
 
 		b, err := io.ReadAll(rd)
 		require.NoError(t, err)
@@ -83,7 +85,8 @@ func TestNewClientWithSession_SendsVersionSessionHeaders(t *testing.T) {
 			"base":       r.Header.Get("X-Gocacheprog-Base"),
 		}
 
-		_, _ = rw.Write([]byte("gocacheprogd test"))
+		_, err := rw.Write([]byte("gocacheprog test"))
+		require.NoError(t, err)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -367,7 +370,9 @@ func TestStatus(t *testing.T) {
 
 	res, err := nethttp.Get(srv.URL + "/status")
 	require.NoError(t, err)
-	defer res.Body.Close()
+	defer func() {
+		require.NoError(t, res.Body.Close())
+	}()
 	require.Equal(t, nethttp.StatusOK, res.StatusCode)
 
 	var body map[string]any
@@ -445,8 +450,7 @@ func TestNewClient_compressed(t *testing.T) {
 	resps := make(chan cacheprog.Response, 10)
 	store, err := local.NewStore("testdata/proxy")
 	require.NoError(t, err)
-	pr, err := local.NewProxy(store, client, resps, local.ProxyParams{})
-	require.NoError(t, err)
+	pr := local.NewProxy(store, client, resps, local.ProxyParams{})
 
 	err = pr.Preload(cache.PreloadRequest{
 		MaxSize: 100000,
@@ -469,7 +473,9 @@ func TestNewClient_compressed(t *testing.T) {
 		rd, err := item.UncompressedBodyReader()
 		require.NoError(t, err)
 
-		defer rd.Close()
+		defer func() {
+			require.NoError(t, rd.Close())
+		}()
 
 		b, err := io.ReadAll(rd)
 		require.NoError(t, err)

@@ -77,7 +77,7 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 		if item.DiskPath != "" {
 			diskPath := item.DiskPath
 			item.SetBodyReader(func() (io.ReadCloser, error) {
-				f, err := os.Open(diskPath)
+				f, err := os.Open(diskPath) //nolint:gosec // diskPath comes from the local cache index.
 				if err != nil {
 					return nil, err
 				}
@@ -107,6 +107,7 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 	prepareTime := time.Since(prepareStartedAt)
 	totalTime := queueWait + prepareTime
 
+	//nolint:gosec // preload request metadata is intentionally logged for diagnostics.
 	log.Printf(
 		"preload queue_wait=%s prepare_time=%s total_time=%s; remote=%s; commit=%q; parent=%q; changes=%q; build_type=%q; sources=%s; items=%d; content_length=%d",
 		queueWait,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -116,15 +117,19 @@ func NewClientWithSession(baseURL string, authToken string, sessionInfo *Session
 		}, nil
 	}
 
-	resp, err := client.roundTrip(req, "version")
+	resp, err := client.roundTrip(req)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("close version body: %s", err.Error())
+		}
+	}()
 
 	if err := checkStatus(resp, http.StatusOK, "version"); err != nil {
 		if resp.StatusCode == http.StatusUnauthorized {
-			return nil, fmt.Errorf("authentication failed: -auth-token <value> is missing or incorrect")
+			return nil, errors.New("authentication failed: -auth-token <value> is missing or incorrect")
 		}
 		return nil, err
 	}
@@ -134,7 +139,7 @@ func NewClientWithSession(baseURL string, authToken string, sessionInfo *Session
 		return nil, err
 	}
 
-	if !strings.HasPrefix(string(b), "gocacheprogd ") {
+	if !strings.HasPrefix(string(b), "gocacheprog ") {
 		return nil, fmt.Errorf("unexpected version: %s", string(b))
 	}
 
@@ -213,11 +218,15 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	r.Header.Set("Content-Type", "application/json")
 	setAuthHeader(r, c.authToken)
 
-	res, err := c.roundTrip(r, "preload")
+	res, err := c.roundTrip(r)
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close preload body: %s", err.Error())
+		}
+	}()
 
 	if err := checkStatus(res, http.StatusOK, "preload"); err != nil {
 		return err
@@ -277,21 +286,28 @@ func (c *Client) PostCacheUsed(commit string, changesID string, buildType string
 	}
 	endpoint := c.baseURL + "/cache-used?" + v.Encode()
 
-	r, err := http.NewRequest(http.MethodPost, endpoint, body)
+	r, err := http.NewRequest(http.MethodPost, endpoint, body) //nolint:gosec // endpoint is an explicit user-configured remote cache URL.
 	if err != nil {
 		return err
 	}
 	r.Header.Set("Content-Type", "text/plain")
 	setAuthHeader(r, c.authToken)
 
-	res, err := c.roundTrip(r, "cache-used")
+	res, err := c.roundTrip(r)
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Print("close cache-used body")
+		}
+	}()
 
 	if res.StatusCode != http.StatusNoContent {
-		b, _ := io.ReadAll(res.Body)
+		b, readErr := io.ReadAll(res.Body)
+		if readErr != nil {
+			return fmt.Errorf("cache-used status %d and response read failed: %w", res.StatusCode, readErr)
+		}
 		return fmt.Errorf("cache-used status %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
 	}
 
@@ -316,11 +332,15 @@ func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error 
 
 	st := time.Now()
 
-	res, err := c.roundTrip(r, "get")
+	res, err := c.roundTrip(r)
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close get body: %s", err.Error())
+		}
+	}()
 
 	if err := checkStatus(res, http.StatusOK, "get"); err != nil {
 		return err
@@ -365,11 +385,15 @@ func (c *Client) head(req cache.Request) (cache.Response, error) {
 	r.Header.Set("Content-Type", "application/json")
 	setAuthHeader(r, c.authToken)
 
-	res, err := c.roundTrip(r, "head")
+	res, err := c.roundTrip(r)
 	if err != nil {
 		return resp, err
 	}
-	defer res.Body.Close()
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close head body: %s", err.Error())
+		}
+	}()
 
 	if err := checkStatus(res, http.StatusOK, "head"); err != nil {
 		return resp, err
@@ -454,11 +478,15 @@ func (c *Client) Put(values cache.Response) error {
 
 	st := time.Now()
 
-	res, err := c.roundTrip(req, "put")
+	res, err := c.roundTrip(req)
 	if err != nil {
 		return fmt.Errorf("sending request: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close put body: %s", err.Error())
+		}
+	}()
 
 	c.latencyPut.Add(1000 * time.Since(st).Seconds())
 
@@ -474,7 +502,10 @@ func checkStatus(res *http.Response, expected int, op string) error {
 		return nil
 	}
 
-	b, _ := io.ReadAll(res.Body)
+	b, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		return fmt.Errorf("%s status %d: response read failed: %w", op, res.StatusCode, readErr)
+	}
 	msg := strings.TrimSpace(string(b))
 	if msg == "" {
 		msg = http.StatusText(res.StatusCode)
@@ -493,12 +524,12 @@ func (c *Client) Stats() map[string]string {
 		"bytes_written":   byteSize(atomic.LoadInt64(&c.bytesWritten)),
 		"preload_bytes":   byteSize(atomic.LoadInt64(&c.preloadBytes)),
 		"preload_sources": lastPreloadSources,
-		"preloaded":       fmt.Sprintf("%d", atomic.LoadInt64(&c.preloadItems)),
+		"preloaded":       strconv.FormatInt(atomic.LoadInt64(&c.preloadItems), 10),
 		"get_95%":         fmt.Sprintf("%.2fms", c.latencyGet.Percentile(95)),
-		"get_cnt":         fmt.Sprintf("%d", atomic.LoadInt64(&c.getCnt)),
-		"get_req_cnt":     fmt.Sprintf("%d", atomic.LoadInt64(&c.getReqCnt)),
+		"get_cnt":         strconv.FormatInt(atomic.LoadInt64(&c.getCnt), 10),
+		"get_req_cnt":     strconv.FormatInt(atomic.LoadInt64(&c.getReqCnt), 10),
 		"put_95%":         fmt.Sprintf("%.2fms", c.latencyPut.Percentile(95)),
-		"put_cnt":         fmt.Sprintf("%d", atomic.LoadInt64(&c.putCnt)),
+		"put_cnt":         strconv.FormatInt(atomic.LoadInt64(&c.putCnt), 10),
 	}
 }
 
@@ -517,7 +548,7 @@ func setAuthHeader(r *http.Request, authToken string) {
 	r.Header.Set("Authorization", "Bearer "+authToken)
 }
 
-func (c *Client) roundTrip(req *http.Request, op string) (*http.Response, error) {
+func (c *Client) roundTrip(req *http.Request) (*http.Response, error) {
 	res, err := c.tr.RoundTrip(req)
 	if err != nil {
 		return nil, err
@@ -532,12 +563,14 @@ func (c *Client) roundTrip(req *http.Request, op string) (*http.Response, error)
 	}
 
 	b, readErr := io.ReadAll(res.Body)
-	res.Body.Close()
+	if err := res.Body.Close(); err != nil {
+		log.Print("close gateway retry body")
+	}
 	if readErr != nil {
 		return nil, readErr
 	}
 
-	log.Printf("%s got status %d, retrying once in %s", op, res.StatusCode, gatewayRetryDelay)
+	log.Printf("gateway timeout, retrying once in %s", gatewayRetryDelay)
 	time.Sleep(gatewayRetryDelay)
 
 	var body io.ReadCloser
@@ -561,7 +594,9 @@ func (c *Client) roundTrip(req *http.Request, op string) (*http.Response, error)
 	}
 
 	if retryRes.StatusCode == http.StatusBadGateway || retryRes.StatusCode == http.StatusGatewayTimeout {
-		retryRes.Body.Close()
+		if err := retryRes.Body.Close(); err != nil {
+			log.Print("close retry response body")
+		}
 		return &http.Response{
 			StatusCode: res.StatusCode,
 			Status:     res.Status,

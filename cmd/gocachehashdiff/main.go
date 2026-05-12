@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -36,7 +37,7 @@ func run() error {
 
 	args := flag.Args()
 	if len(args) < 1 || len(args) > 2 {
-		return fmt.Errorf("usage: gocachehashdiff [flags] <log-a> [log-b]")
+		return errors.New("usage: gocachehashdiff [flags] <log-a> [log-b]")
 	}
 
 	moduleRoot := *moduleRootFlag
@@ -71,11 +72,15 @@ func run() error {
 }
 
 func parseEntries(path, wantKind, focus string) ([]entry, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // this CLI intentionally reads the user-specified log path.
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "close %s: %s\n", path, closeErr.Error())
+		}
+	}()
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 128*1024), 16*1024*1024)
@@ -238,7 +243,7 @@ func printSummary(path, moduleRoot, kind, focus string, entries []entry, verbose
 	}
 
 	fmt.Println("\nSample:")
-	for _, e := range entries[:min(20, len(entries))] {
+	for _, e := range entries[:minInt(20, len(entries))] {
 		fmt.Printf("[%s] %s\n", e.Kind, e.Payload)
 	}
 }
@@ -264,7 +269,7 @@ func printSingleLogModuleIndexFiles(moduleRoot string, entries []entry) {
 		return
 	}
 	fmt.Printf("- `moduleIndex`: %d repo-local file inputs\n", len(files))
-	for _, p := range files[:min(10, len(files))] {
+	for _, p := range files[:minInt(10, len(files))] {
 		fmt.Printf("  - %s\n", p)
 	}
 }
@@ -290,7 +295,7 @@ func printSingleLogTestInputStats(moduleRoot string, entries []entry) {
 		return
 	}
 	fmt.Printf("- `testInputs`: %d repo-local stat inputs\n", len(paths))
-	for _, p := range paths[:min(10, len(paths))] {
+	for _, p := range paths[:minInt(10, len(paths))] {
 		fmt.Printf("  - %s\n", p)
 	}
 }
@@ -322,10 +327,10 @@ func printSingleLogTestCache(moduleRoot string, entries []entry) {
 
 	pkgs := sortedTestCachePackages(byPkg)
 	fmt.Printf("- `testcache`: %d package(s) with actionable miss reasons\n", len(pkgs))
-	for _, pkg := range pkgs[:min(5, len(pkgs))] {
+	for _, pkg := range pkgs[:minInt(5, len(pkgs))] {
 		fmt.Printf("  - %s\n", pkg)
 		reasons := sortedReasonKeys(byPkg[pkg])
-		for _, reason := range reasons[:min(3, len(reasons))] {
+		for _, reason := range reasons[:minInt(3, len(reasons))] {
 			fmt.Printf("    * %s\n", reason)
 		}
 	}
@@ -404,13 +409,13 @@ func printDiff(aName, bName, kind, focus, moduleRoot string, a, b []entry, limit
 func printActionableSummary(moduleRoot string, a, b []entry) {
 	fmt.Println("\nActionable summary:")
 
-	printModuleIndexFiles(moduleRoot, a, b)
+	printModuleIndexFiles(a, b)
 	printTestInputStatChanges(a, b)
 	printTestCacheChanges(moduleRoot, a, b)
 	printEnvChanges(a, b)
 }
 
-func printModuleIndexFiles(moduleRoot string, a, b []entry) {
+func printModuleIndexFiles(a, b []entry) {
 	am := map[string]int{}
 	bm := map[string]int{}
 
@@ -450,7 +455,7 @@ func printModuleIndexFiles(moduleRoot string, a, b []entry) {
 	}
 
 	fmt.Printf("- `moduleIndex`: %d file-list changes\n", len(changed))
-	for _, p := range changed[:min(10, len(changed))] {
+	for _, p := range changed[:minInt(10, len(changed))] {
 		fmt.Printf("  - %s\n", p)
 	}
 }
@@ -504,7 +509,7 @@ func printTestInputStatChanges(a, b []entry) {
 	}
 
 	fmt.Printf("- `testInputs`: %d file stat input changes\n", len(changed))
-	for _, p := range changed[:min(10, len(changed))] {
+	for _, p := range changed[:minInt(10, len(changed))] {
 		fmt.Printf("  - %s\n", p)
 	}
 }
@@ -520,14 +525,14 @@ func printTestCacheChanges(moduleRoot string, a, b []entry) {
 	}
 
 	fmt.Printf("- `testcache`: %d package reason changes\n", len(changed))
-	for _, pkg := range changed[:min(5, len(changed))] {
+	for _, pkg := range changed[:minInt(5, len(changed))] {
 		fmt.Printf("  - %s\n", pkg)
 
 		added, removed := diffReasonSets(am[pkg], bm[pkg])
-		for _, reason := range added[:min(2, len(added))] {
+		for _, reason := range added[:minInt(2, len(added))] {
 			fmt.Printf("    + %s\n", reason)
 		}
-		for _, reason := range removed[:min(2, len(removed))] {
+		for _, reason := range removed[:minInt(2, len(removed))] {
 			fmt.Printf("    - %s\n", reason)
 		}
 	}
@@ -749,7 +754,7 @@ func sortedCountMap(m map[string]int) []countRow {
 	return rows
 }
 
-func min(a, b int) int {
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}

@@ -3,6 +3,7 @@ package http
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/vearutop/gocacheprog/internal/cache"
@@ -14,7 +15,6 @@ func (h *Handler) Head(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	r.Body.Close()
 
 	if err := r.Body.Close(); err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -53,5 +53,7 @@ func (h *Handler) Head(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(http.StatusOK)
 
-	_, _ = rw.Write(j)
+	if _, err := rw.Write(j); err != nil {
+		log.Printf("write head response: %s", err.Error())
+	}
 }

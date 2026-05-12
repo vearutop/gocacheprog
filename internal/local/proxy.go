@@ -2,12 +2,14 @@ package local
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,7 +80,7 @@ func (p ProxyParams) SessionBaseCommit() string {
 	return p.BaseCommit
 }
 
-func NewProxy(disk *Store, upstream cache.Store, resps chan cacheprog.Response, params ProxyParams) (*Proxy, error) {
+func NewProxy(disk *Store, upstream cache.Store, resps chan cacheprog.Response, params ProxyParams) *Proxy {
 	c := &Proxy{
 		resps:              resps,
 		lookup:             make(chan cacheprog.Request, 1000),
@@ -98,7 +100,7 @@ func NewProxy(disk *Store, upstream cache.Store, resps chan cacheprog.Response, 
 	go c.resolve()
 	go c.consumePut()
 
-	return c, nil
+	return c
 }
 
 func (dc *Proxy) Close() error {
@@ -316,12 +318,12 @@ func (dc *Proxy) consumePut() {
 
 func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 	if dc.upstream == nil {
-		return fmt.Errorf("upstream is not set")
+		return errors.New("upstream is not set")
 	}
 
 	p, ok := dc.upstream.(cache.Preloader)
 	if !ok {
-		return fmt.Errorf("upstream is not preloader")
+		return errors.New("upstream is not preloader")
 	}
 
 	items := 0
@@ -337,7 +339,11 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 
 		var b []byte
 		if br != nil {
-			defer br.Close()
+			defer func() {
+				if err := br.Close(); err != nil {
+					dc.logf("close preload body reader: %s", err.Error())
+				}
+			}()
 
 			b, err = io.ReadAll(br)
 			if err != nil {
@@ -358,6 +364,7 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 	return err
 }
 
+//nolint:nestif // batching remote lookups is inherently branchy and clearer inline.
 func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 	atomic.AddInt64(&dc.batches, 1)
 
@@ -393,7 +400,11 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 
 			var b []byte
 			if br != nil {
-				defer br.Close()
+				defer func() {
+					if err := br.Close(); err != nil {
+						dc.logf("close upstream body reader: %s", err.Error())
+					}
+				}()
 
 				b, err = io.ReadAll(br)
 				if err != nil {
@@ -451,15 +462,15 @@ func (dc *Proxy) Get(req cacheprog.Request) cacheprog.Response {
 func (dc *Proxy) PrintStats() {
 	st := dc.Stats()
 
-	var res string
+	var sb strings.Builder
 	for _, k := range slices.Sorted(maps.Keys(st)) {
 		v := st[k]
-		res += fmt.Sprintf(" %s: %s", k, v)
+		fmt.Fprintf(&sb, " %s: %s", k, v)
 	}
 
 	if dc.upstream != nil {
 		if s, ok := dc.upstream.(interface{ Stats() map[string]string }); ok {
-			res += "\nupstream:"
+			sb.WriteString("\nupstream:")
 
 			st := s.Stats()
 			for _, k := range slices.Sorted(maps.Keys(st)) {
@@ -467,18 +478,18 @@ func (dc *Proxy) PrintStats() {
 					continue
 				}
 
-				res += fmt.Sprintf(" %s: %s", k, st[k])
+				fmt.Fprintf(&sb, " %s: %s", k, st[k])
 			}
 		}
 	}
 
-	res += "\ndisk:"
+	sb.WriteString("\ndisk:")
 	st = dc.disk.Stats()
 	for _, k := range slices.Sorted(maps.Keys(st)) {
-		res += fmt.Sprintf(" %s: %s", k, st[k])
+		fmt.Fprintf(&sb, " %s: %s", k, st[k])
 	}
 
-	log.Println(res)
+	log.Println(sb.String())
 }
 
 func (dc *Proxy) putRespItem(item cache.ResponseItem, body []byte) error {
@@ -544,8 +555,8 @@ func (dc *Proxy) Stats() map[string]string {
 	preloadUnused := preloadedItems - preloadUsed
 
 	stats := map[string]string{
-		//"batchGets": strconv.FormatInt(atomic.LoadInt64(&dc.batches), 10),
-		//"batchPuts": strconv.FormatInt(atomic.LoadInt64(&dc.batchPuts), 10),
+		// "batchGets": strconv.FormatInt(atomic.LoadInt64(&dc.batches), 10),
+		// "batchPuts": strconv.FormatInt(atomic.LoadInt64(&dc.batchPuts), 10),
 		"lookups":             strconv.FormatInt(lookups, 10),
 		"hits":                strconv.FormatInt(hits, 10),
 		"hit_rate":            percent(hits, lookups),

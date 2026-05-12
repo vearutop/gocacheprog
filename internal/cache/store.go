@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"os"
 	"time"
 
@@ -76,7 +78,7 @@ func (ri *ResponseItem) PrepareBodyReader() {
 
 		ri.bodyReader = func() (io.ReadCloser, error) {
 			if ri.WireSize < 1e6 {
-				data, err := os.ReadFile(diskPath)
+				data, err := os.ReadFile(diskPath) //nolint:gosec // diskPath comes from the local cache index.
 				if err != nil {
 					return nil, err
 				}
@@ -84,7 +86,7 @@ func (ri *ResponseItem) PrepareBodyReader() {
 				return io.NopCloser(bytes.NewReader(data)), nil
 			}
 
-			f, err := os.Open(diskPath)
+			f, err := os.Open(diskPath) //nolint:gosec // diskPath comes from the local cache index.
 			if err != nil {
 				return nil, err
 			}
@@ -110,7 +112,11 @@ func (ri *ResponseItem) UncompressedBodyReader() (io.ReadCloser, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer rd.Close()
+		defer func() {
+			if closeErr := rd.Close(); closeErr != nil {
+				log.Printf("close compressed body reader: %s", closeErr.Error())
+			}
+		}()
 
 		zrd, err := zstd.NewReader(rd)
 		if err != nil {
@@ -143,9 +149,16 @@ func (ri *ResponseItem) CompressedBodyReader() (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rd.Close()
+	defer func() {
+		if closeErr := rd.Close(); closeErr != nil {
+			log.Printf("close body reader before compression: %s", closeErr.Error())
+		}
+	}()
 
-	data, err := io.ReadAll(rd)
+	data, readErr := io.ReadAll(rd)
+	if readErr != nil {
+		return nil, readErr
+	}
 
 	buf := make([]byte, 0, len(data)/2)
 	buf = zstd.EncodeTo(buf, data)
@@ -186,8 +199,8 @@ func (ri *ResponseItem) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	defer func() {
-		if err := bodyReader.Close(); err != nil {
-			_ = err
+		if closeErr := bodyReader.Close(); closeErr != nil {
+			log.Printf("close write body reader: %s", closeErr.Error())
 		}
 	}()
 
@@ -288,7 +301,10 @@ func (r *Response) Reader() (io.Reader, error) {
 	buf := bytes.NewBuffer(nil)
 
 	// Write the length of the JSON data as a 4-byte integer in binary format
-	jsonLength := int32(len(jsonData))
+	jsonLength, err := checkedJSONLength(jsonData)
+	if err != nil {
+		return nil, err
+	}
 	err = binary.Write(buf, binary.BigEndian, jsonLength)
 	if err != nil {
 		return nil, fmt.Errorf("write head: %w", err)
@@ -333,7 +349,10 @@ func (r *Response) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	// Write the length of the JSON data as a 4-byte integer in binary format
-	jsonLength := int32(len(jsonData))
+	jsonLength, err := checkedJSONLength(jsonData)
+	if err != nil {
+		return totalBytesWritten, err
+	}
 	err = binary.Write(w, binary.BigEndian, jsonLength)
 	if err != nil {
 		return totalBytesWritten, fmt.Errorf("write head: %w", err)
@@ -357,6 +376,14 @@ func (r *Response) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	return totalBytesWritten, nil
+}
+
+func checkedJSONLength(jsonData []byte) (int32, error) {
+	if len(jsonData) > math.MaxInt32 {
+		return 0, fmt.Errorf("response header too large: %d bytes", len(jsonData))
+	}
+
+	return int32(len(jsonData)), nil //nolint:gosec // range is checked above.
 }
 
 func (r *Response) ReaderFrom(rd io.Reader, read func(item ResponseItem, body io.Reader) error) (int64, error) {

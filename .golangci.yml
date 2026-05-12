@@ -5,6 +5,18 @@ run:
 linters:
   default: all
   disable:
+    - revive
+    - err113
+    - exhaustive
+    - funlen
+    - cyclop
+    - gocognit
+    - goconst
+    - modernize
+    - nlreturn
+    - noctx
+    - prealloc
+    - testpackage
     - wsl
     - embeddedstructfieldcheck
     - nilnil

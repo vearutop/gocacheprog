@@ -40,7 +40,7 @@ func serveHTTP(listen string, h nethttp.Handler, printStats func()) error {
 		if err := os.RemoveAll(addr); err != nil {
 			return fmt.Errorf("remove old unix socket %s: %w", addr, err)
 		}
-		if err := os.MkdirAll(filepath.Dir(addr), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(addr), 0o750); err != nil {
 			return fmt.Errorf("create unix socket dir: %w", err)
 		}
 	}
@@ -50,11 +50,22 @@ func serveHTTP(listen string, h nethttp.Handler, printStats func()) error {
 		return fmt.Errorf("listen %s %s: %w", network, addr, err)
 	}
 	if network == "unix" {
-		defer os.Remove(addr)
+		defer func() {
+			if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
+				log.Printf("remove unix socket %s: %s", addr, err.Error())
+			}
+		}()
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("close listener: %s", err.Error())
+		}
+	}()
 
-	server := &nethttp.Server{Handler: h}
+	server := &nethttp.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)

@@ -45,7 +45,9 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Path == "/version" {
 		logVersionProbe(r)
-		_, _ = rw.Write([]byte("gocacheprogd " + version.Module("github.com/vearutop/gocacheprog").Version))
+		if _, err := rw.Write([]byte("gocacheprog " + version.Module("github.com/vearutop/gocacheprog").Version)); err != nil {
+			log.Printf("write version response: %s", err.Error())
+		}
 		return
 	}
 
@@ -98,6 +100,7 @@ func (h *Handler) authorized(r *http.Request) bool {
 }
 
 func logVersionProbe(r *http.Request) {
+	//nolint:gosec // request metadata is intentionally logged for debugging shim/daemon session fan-out.
 	log.Printf(
 		"version; remote=%s; session_id=%q; started_at=%q; pid=%q; cache_dir=%q; commit=%q; parent=%q; changes=%q; build_type=%q; base=%q",
 		r.RemoteAddr,

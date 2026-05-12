@@ -15,12 +15,11 @@ func TestProxyClose_PostsCacheUsed_ReportsDedupedSortedActionIDs(t *testing.T) {
 
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	proxy, err := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
+	proxy := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
 		Commit:    "commit123",
 		ChangesID: "repo/pr-123",
 		BuildType: "unit",
 	})
-	require.NoError(t, err)
 
 	proxy.recordUsedActionID("actionId2")
 	proxy.recordUsedActionID("actionId1")
@@ -38,12 +37,11 @@ func TestProxyClose_PostsCacheUsed_ReportsDedupedSortedActionIDs(t *testing.T) {
 func TestProxyClose_CacheUsedNoOpWithoutUsageRecorder(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	proxy, err := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{
+	proxy := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{
 		Commit:    "commit123",
 		ChangesID: "changes123",
 		BuildType: "unit",
 	})
-	require.NoError(t, err)
 
 	proxy.recordUsedActionID("actionId1")
 
@@ -53,8 +51,7 @@ func TestProxyClose_CacheUsedNoOpWithoutUsageRecorder(t *testing.T) {
 func TestProxyHasLocalEntries(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	proxy, err := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{})
-	require.NoError(t, err)
+	proxy := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{})
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())
 	})
@@ -73,8 +70,7 @@ func TestProxyHasLocalEntries(t *testing.T) {
 func TestProxyStats_HitBreakdown(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	proxy, err := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{})
-	require.NoError(t, err)
+	proxy := NewProxy(store, noopStore{}, make(chan cacheprog.Response, 1), ProxyParams{})
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())
 	})

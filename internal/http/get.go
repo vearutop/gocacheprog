@@ -17,7 +17,6 @@ func (h *Handler) Get(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	r.Body.Close()
 
 	if err := r.Body.Close(); err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -39,7 +38,7 @@ func (h *Handler) Get(rw http.ResponseWriter, r *http.Request) {
 		if item.DiskPath != "" {
 			diskPath := item.DiskPath
 			item.SetBodyReader(func() (io.ReadCloser, error) {
-				f, err := os.Open(diskPath)
+				f, err := os.Open(diskPath) //nolint:gosec // diskPath comes from the local cache index.
 				if err != nil {
 					return nil, err
 				}

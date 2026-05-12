@@ -46,6 +46,7 @@ func (s *shimSession) writeResponse(resp cacheprog.Response) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 	return s.enc.Encode(resp)
 }
 
@@ -85,23 +86,22 @@ func (s *ShimServer) Serve(listen string, preloadErrCh <-chan error) error {
 	}
 
 	network, addr := listenNetworkAndAddr(listen)
-	if network == "unix" {
-		if err := os.RemoveAll(addr); err != nil {
-			return fmt.Errorf("remove old unix socket %s: %w", addr, err)
-		}
-		if err := os.MkdirAll(filepath.Dir(addr), 0o755); err != nil {
-			return fmt.Errorf("create unix socket dir: %w", err)
-		}
-	}
-
-	ln, err := net.Listen(network, addr)
+	ln, err := prepareShimListener(network, addr)
 	if err != nil {
-		return fmt.Errorf("listen %s %s: %w", network, addr, err)
+		return err
 	}
 	if network == "unix" {
-		defer os.Remove(addr)
+		defer func() {
+			if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
+				s.proxy.logf("remove unix socket %s: %s", addr, err.Error())
+			}
+		}()
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.proxy.logf("close shim listener: %s", err.Error())
+		}
+	}()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
@@ -141,8 +141,30 @@ func (s *ShimServer) Serve(listen string, preloadErrCh <-chan error) error {
 	}
 }
 
+func prepareShimListener(network string, addr string) (net.Listener, error) {
+	if network == "unix" {
+		if err := os.RemoveAll(addr); err != nil {
+			return nil, fmt.Errorf("remove old unix socket %s: %w", addr, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(addr), 0o750); err != nil {
+			return nil, fmt.Errorf("create unix socket dir: %w", err)
+		}
+	}
+
+	ln, err := net.Listen(network, addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen %s %s: %w", network, addr, err)
+	}
+
+	return ln, nil
+}
+
 func (s *ShimServer) serveConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			s.proxy.logf("close shim conn: %s", err.Error())
+		}
+	}()
 
 	jd := json.NewDecoder(bufio.NewReader(conn))
 	je := json.NewEncoder(conn)
@@ -176,6 +198,7 @@ func (s *ShimServer) serveConn(conn net.Conn) {
 
 	for {
 		var env shimEnvelope
+		//nolint:musttag // shimEnvelope is the streaming shim protocol payload.
 		if err := jd.Decode(&env); err != nil {
 			if err != io.EOF {
 				s.proxy.logf("decode shim request: %s", err.Error())
@@ -294,8 +317,11 @@ func NewShimClient(remoteURL string, authToken string, sessionID string) (*ShimC
 		resps:     make(chan cacheprog.Response, 100),
 	}
 
+	//nolint:gosec // local shim auth token is an expected protocol field.
 	if err := c.enc.Encode(shimHello{SessionID: sessionID, AuthToken: authToken}); err != nil {
-		conn.Close()
+		if closeErr := conn.Close(); closeErr != nil {
+			return nil, fmt.Errorf("close shim conn after hello failure: %w", closeErr)
+		}
 		return nil, err
 	}
 
@@ -309,6 +335,7 @@ func (c *ShimClient) readResponses() {
 
 	for {
 		var resp cacheprog.Response
+		//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 		if err := c.jd.Decode(&resp); err != nil {
 			return
 		}
@@ -339,6 +366,7 @@ func (c *ShimClient) Send(req cacheprog.Request, body []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
+	//nolint:musttag // shimEnvelope is the streaming shim protocol payload.
 	return c.enc.Encode(shimEnvelope{
 		Request: req,
 		Body:    body,
@@ -371,6 +399,7 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 	jd := json.NewDecoder(br)
 	je := json.NewEncoder(out)
 
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 	if err := je.Encode(&cacheprog.Response{KnownCommands: []cacheprog.Cmd{cacheprog.CmdPut, cacheprog.CmdGet, cacheprog.CmdClose}}); err != nil {
 		return fmt.Errorf("encode known commands: %w", err)
 	}
@@ -381,6 +410,7 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 
 	go func() {
 		for resp := range client.Responses() {
+			//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 			if err := je.Encode(resp); err != nil {
 				errCh <- fmt.Errorf("encode response: %w", err)
 				return
@@ -393,29 +423,29 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 	}()
 
 	for {
-		var req cacheprog.Request
-		if err := jd.Decode(&req); err != nil {
-			_ = client.Close()
+		req, err := decodeShimRequest(jd)
+		if err != nil {
+			if closeErr := client.Close(); closeErr != nil {
+				return errors.Join(fmt.Errorf("decode request: %w", err), fmt.Errorf("close client: %w", closeErr))
+			}
 			return fmt.Errorf("decode request: %w", err)
 		}
 
 		dumpShimRequest(logDump, &mu, req)
 
-		var body []byte
-		if req.Command == cacheprog.CmdPut && req.BodySize > 0 {
-			if err := jd.Decode(&body); err != nil {
-				_ = client.Close()
-				return fmt.Errorf("decode base64 cache body: %w", err)
+		body, err := decodeShimBody(jd, req)
+		if err != nil {
+			if closeErr := client.Close(); closeErr != nil {
+				return errors.Join(err, fmt.Errorf("close client: %w", closeErr))
 			}
-			if int64(len(body)) != req.BodySize {
-				_ = client.Close()
-				return fmt.Errorf("only got %d bytes of declared %d", len(body), req.BodySize)
-			}
+			return err
 		}
 
 		if req.Command == cacheprog.CmdClose {
 			pending.Wait()
-			_ = client.Close()
+			if err := client.Close(); err != nil {
+				return fmt.Errorf("close shim client: %w", err)
+			}
 			return nil
 		}
 
@@ -427,7 +457,9 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 			if req.Command != cacheprog.CmdClose {
 				pending.Done()
 			}
-			_ = client.Close()
+			if closeErr := client.Close(); closeErr != nil {
+				return errors.Join(err, fmt.Errorf("close client: %w", closeErr))
+			}
 			return err
 		}
 
@@ -442,15 +474,48 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 	}
 }
 
+func decodeShimRequest(jd *json.Decoder) (cacheprog.Request, error) {
+	var req cacheprog.Request
+	//nolint:musttag // cacheprog.Request is defined by the Go cache protocol.
+	if err := jd.Decode(&req); err != nil {
+		return cacheprog.Request{}, err
+	}
+
+	return req, nil
+}
+
+func decodeShimBody(jd *json.Decoder, req cacheprog.Request) ([]byte, error) {
+	if req.Command != cacheprog.CmdPut || req.BodySize <= 0 {
+		return nil, nil
+	}
+
+	var body []byte
+	if err := jd.Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode base64 cache body: %w", err)
+	}
+	if int64(len(body)) != req.BodySize {
+		return nil, fmt.Errorf("only got %d bytes of declared %d", len(body), req.BodySize)
+	}
+
+	return body, nil
+}
+
 func dumpShimRequest(logDump io.Writer, mu *sync.Mutex, req cacheprog.Request) {
 	if logDump == nil {
 		return
 	}
 
 	req.TS = time.Now().UTC().Unix()
-	j, _ := json.Marshal(req)
+	//nolint:musttag // cacheprog.Request is defined by the Go cache protocol.
+	j, err := json.Marshal(req)
+	if err != nil {
+		return
+	}
 	mu.Lock()
-	_, _ = logDump.Write(append(j, '\n'))
+	if _, err := logDump.Write(append(j, '\n')); err != nil {
+		mu.Unlock()
+		return
+	}
 	mu.Unlock()
 }
 
@@ -460,8 +525,15 @@ func dumpShimResponse(logDump io.Writer, mu *sync.Mutex, resp cacheprog.Response
 	}
 
 	resp.TS = time.Now().UTC().Unix()
-	j, _ := json.Marshal(resp)
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
+	j, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
 	mu.Lock()
-	_, _ = logDump.Write(append(j, '\n'))
+	if _, err := logDump.Write(append(j, '\n')); err != nil {
+		mu.Unlock()
+		return
+	}
 	mu.Unlock()
 }

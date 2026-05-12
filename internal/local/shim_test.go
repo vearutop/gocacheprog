@@ -3,6 +3,7 @@ package local
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -55,8 +56,7 @@ func TestProcessShimSession_SharedProxyRemoteCompression(t *testing.T) {
 	require.NoError(t, err)
 
 	resps := make(chan cacheprog.Response, 100)
-	proxy, err := NewProxy(store, upstream, resps, ProxyParams{})
-	require.NoError(t, err)
+	proxy := NewProxy(store, upstream, resps, ProxyParams{})
 	t.Cleanup(func() {
 		close(resps)
 	})
@@ -82,12 +82,14 @@ func TestProcessShimSession_SharedProxyRemoteCompression(t *testing.T) {
 	dec := json.NewDecoder(bytes.NewReader(output.Bytes()))
 
 	var handshake cacheprog.Response
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 	require.NoError(t, dec.Decode(&handshake))
 	require.Equal(t, []cacheprog.Cmd{cacheprog.CmdPut, cacheprog.CmdGet, cacheprog.CmdClose}, handshake.KnownCommands)
 
 	var responses []cacheprog.Response
 	for i := 0; i < 3; i++ {
 		var resp cacheprog.Response
+		//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 		require.NoError(t, dec.Decode(&resp))
 		responses = append(responses, resp)
 	}
@@ -135,14 +137,18 @@ func TestProcessShimSession_SharedProxyRemoteCompression(t *testing.T) {
 
 	compressedReader, err := remotePut.CompressedBodyReader()
 	require.NoError(t, err)
-	defer compressedReader.Close()
+	defer func() {
+		require.NoError(t, compressedReader.Close())
+	}()
 	compressedBody, err := io.ReadAll(compressedReader)
 	require.NoError(t, err)
 	require.Len(t, compressedBody, 32)
 
 	uncompressedReader, err := remotePut.UncompressedBodyReader()
 	require.NoError(t, err)
-	defer uncompressedReader.Close()
+	defer func() {
+		require.NoError(t, uncompressedReader.Close())
+	}()
 	uncompressedBody, err := io.ReadAll(uncompressedReader)
 	require.NoError(t, err)
 	require.Len(t, uncompressedBody, len(putBody))
@@ -176,8 +182,7 @@ func TestShimServer_RewritesCollidingRequestIDsAcrossSessions(t *testing.T) {
 	}
 
 	resps := make(chan cacheprog.Response, 100)
-	proxy, err := NewProxy(store, nil, resps, ProxyParams{})
-	require.NoError(t, err)
+	proxy := NewProxy(store, nil, resps, ProxyParams{})
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())
 		close(resps)
@@ -230,8 +235,7 @@ func TestNewShimClient_UnixSocket(t *testing.T) {
 	require.NoError(t, err)
 
 	resps := make(chan cacheprog.Response, 100)
-	proxy, err := NewProxy(store, nil, resps, ProxyParams{})
-	require.NoError(t, err)
+	proxy := NewProxy(store, nil, resps, ProxyParams{})
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())
 		close(resps)
@@ -272,8 +276,14 @@ func startTestShimServer(t *testing.T, server *ShimServer) string {
 	}()
 
 	t.Cleanup(func() {
-		_ = ln.Close()
-		_ = os.Remove(socketPath)
+		err := ln.Close()
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			require.NoError(t, err)
+		}
+		err = os.Remove(socketPath)
+		if err != nil && !os.IsNotExist(err) {
+			require.NoError(t, err)
+		}
 	})
 
 	return "unix://" + socketPath

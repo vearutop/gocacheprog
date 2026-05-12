@@ -23,7 +23,8 @@ func TestNewClient_RetriesGatewayTimeout(t *testing.T) {
 			nethttp.Error(rw, "upstream timeout", nethttp.StatusGatewayTimeout)
 			return
 		}
-		_, _ = rw.Write([]byte("gocacheprogd test"))
+		_, err := rw.Write([]byte("gocacheprog test"))
+		require.NoError(t, err)
 	}))
 	t.Cleanup(srv.Close)
 

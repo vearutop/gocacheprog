@@ -20,8 +20,7 @@ func TestApp_IterateInputAndResponses(t *testing.T) {
 	resps := make(chan cacheprog.Response, 10)
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	proxy, err := NewProxy(store, nil, resps, ProxyParams{})
-	require.NoError(t, err)
+	proxy := NewProxy(store, nil, resps, ProxyParams{})
 
 	body := []byte("body-1")
 
@@ -63,10 +62,12 @@ func TestApp_IterateInputAndResponses(t *testing.T) {
 	dec := json.NewDecoder(bytes.NewReader(output.Bytes()))
 
 	var handshake cacheprog.Response
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 	require.NoError(t, dec.Decode(&handshake))
 	require.Equal(t, []cacheprog.Cmd{cacheprog.CmdPut, cacheprog.CmdGet, cacheprog.CmdClose}, handshake.KnownCommands)
 
 	var putResp cacheprog.Response
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 	require.NoError(t, dec.Decode(&putResp))
 	require.Equal(t, int64(1), putResp.ID)
 	require.False(t, putResp.Miss)
@@ -75,6 +76,7 @@ func TestApp_IterateInputAndResponses(t *testing.T) {
 	require.NotEmpty(t, putResp.DiskPath)
 
 	var getResp cacheprog.Response
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 	require.NoError(t, dec.Decode(&getResp))
 	require.Equal(t, int64(2), getResp.ID)
 	require.False(t, getResp.Miss)
@@ -101,8 +103,7 @@ func TestApp_IterateInput_RejectsDeclaredBodySizeMismatch(t *testing.T) {
 	resps := make(chan cacheprog.Response, 1)
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	proxy, err := NewProxy(store, nil, resps, ProxyParams{})
-	require.NoError(t, err)
+	proxy := NewProxy(store, nil, resps, ProxyParams{})
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())
 	})
@@ -121,7 +122,7 @@ func TestApp_IterateInput_RejectsDeclaredBodySizeMismatch(t *testing.T) {
 
 	err = app.IterateInput()
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "only got 5 bytes of declared 10")
+	require.Contains(t, err.Error(), "got 5 bytes of declared 10")
 }
 
 func TestApp_E2E_DirectWithRemoteCompression(t *testing.T) {
@@ -160,8 +161,7 @@ func TestApp_E2E_DirectWithRemoteCompression(t *testing.T) {
 	resps := make(chan cacheprog.Response, 10)
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
-	proxy, err := NewProxy(store, upstream, resps, ProxyParams{})
-	require.NoError(t, err)
+	proxy := NewProxy(store, upstream, resps, ProxyParams{})
 
 	// Preload the existing remote entry so the app-level "get" stays on the
 	// normal direct-mode path without racing an async remote miss and close.
@@ -218,12 +218,14 @@ func TestApp_E2E_DirectWithRemoteCompression(t *testing.T) {
 	dec := json.NewDecoder(bytes.NewReader(output.Bytes()))
 
 	var handshake cacheprog.Response
+	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 	require.NoError(t, dec.Decode(&handshake))
 	require.Equal(t, []cacheprog.Cmd{cacheprog.CmdPut, cacheprog.CmdGet, cacheprog.CmdClose}, handshake.KnownCommands)
 
 	var responses []cacheprog.Response
 	for i := 0; i < 3; i++ {
 		var resp cacheprog.Response
+		//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 		require.NoError(t, dec.Decode(&resp))
 		responses = append(responses, resp)
 	}
@@ -277,14 +279,18 @@ func TestApp_E2E_DirectWithRemoteCompression(t *testing.T) {
 
 	compressedReader, err := remotePut.CompressedBodyReader()
 	require.NoError(t, err)
-	defer compressedReader.Close()
+	defer func() {
+		require.NoError(t, compressedReader.Close())
+	}()
 	compressedBody, err := io.ReadAll(compressedReader)
 	require.NoError(t, err)
 	require.Len(t, compressedBody, 32)
 
 	uncompressedReader, err := remotePut.UncompressedBodyReader()
 	require.NoError(t, err)
-	defer uncompressedReader.Close()
+	defer func() {
+		require.NoError(t, uncompressedReader.Close())
+	}()
 	uncompressedBody, err := io.ReadAll(uncompressedReader)
 	require.NoError(t, err)
 	require.Len(t, uncompressedBody, len(putBody))

@@ -3,6 +3,7 @@ package http
 import (
 	"bufio"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -26,7 +27,11 @@ func (h *Handler) CacheUsed(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	actionIDs, err := readActionIDs(r.Body)
-	defer r.Body.Close()
+	defer func() {
+		if closeErr := r.Body.Close(); closeErr != nil {
+			log.Print("close cache-used body")
+		}
+	}()
 
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)

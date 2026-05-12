@@ -1,6 +1,7 @@
 package local
 
 import (
+	//nolint:gosec // deterministic content fingerprinting is intentional; no security properties are required here.
 	"crypto/sha1"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ func CanonicalizeTimestamps(repoRoot string) error {
 	var dirs []dirEntryPath
 	filesUpdated := 0
 
+	//nolint:gosec // canonicalization intentionally walks the repo tree provided by the caller.
 	err = filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -82,13 +84,17 @@ func CanonicalizeTimestamps(repoRoot string) error {
 }
 
 func canonicalFileModTime(path string) (time.Time, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // path comes from the controlled repo walk above.
 	if err != nil {
 		return time.Time{}, err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			log.Printf("close canonicalize file %s: %s", path, closeErr.Error())
+		}
+	}()
 
-	h := sha1.New()
+	h := sha1.New() //nolint:gosec // deterministic content fingerprinting is intentional here.
 	if _, err := io.Copy(h, f); err != nil {
 		return time.Time{}, err
 	}

@@ -25,7 +25,11 @@ func (h *Handler) Put(rw http.ResponseWriter, r *http.Request) {
 
 		return h.store.Put(cache.Response{Items: []cache.ResponseItem{item}})
 	})
-	defer r.Body.Close()
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+		}
+	}()
 
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)

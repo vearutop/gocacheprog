@@ -3,6 +3,7 @@ package local
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -100,7 +102,7 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	}
 
 	indexPath := dc.indexPath()
-	d, err := os.ReadFile(indexPath)
+	d, err := os.ReadFile(indexPath) //nolint:gosec // indexPath is derived from the configured cache dir.
 	if err != nil {
 		if os.IsNotExist(err) {
 			return dc, nil
@@ -122,7 +124,7 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 
 func toAbsPath(path string) (string, error) {
 	if path == "" {
-		return "", fmt.Errorf("empty path")
+		return "", errors.New("empty path")
 	}
 
 	// If it's already absolute, return it (cleaned)
@@ -234,6 +236,7 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 		err error
 	)
 
+	//nolint:nestif // compression and storage-mode combinations are clearer as explicit branches.
 	if item.IsCompressed {
 		if !dc.compress {
 			// Decompress a compressed body.
@@ -286,11 +289,11 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 }
 
 func writeAtomic(outputFile string, rd io.Reader) (err error) {
-	if err := os.MkdirAll(filepath.Dir(outputFile), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(outputFile), 0o750); err != nil {
 		return fmt.Errorf("mkdir output dir: %w", err)
 	}
 
-	f, err := os.Create(outputFile + ".tmp")
+	f, err := os.Create(outputFile + ".tmp") //nolint:gosec // outputFile is derived from the configured cache dir.
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
@@ -298,7 +301,9 @@ func writeAtomic(outputFile string, rd io.Reader) (err error) {
 	if rd != nil {
 		_, err = io.Copy(f, rd)
 		if err != nil {
-			f.Close()
+			if closeErr := f.Close(); closeErr != nil {
+				log.Printf("close temp file after copy failure: %s", closeErr.Error())
+			}
 			return fmt.Errorf("copy to file: %w", err)
 		}
 	}
@@ -410,6 +415,7 @@ func (dc *Store) PostCacheUsed(commit string, changesID string, buildType string
 		}
 	}
 
+	//nolint:nestif // commit/changes manifest update rules are clearer as explicit branches.
 	if changesID != "" {
 		manifestPath, err := dc.changesManifestPath(changesID, buildType)
 		if err != nil {
@@ -498,11 +504,15 @@ func (dc *Store) loadChangesManifest(changesID string, buildType string) ([]stri
 }
 
 func (dc *Store) loadManifest(manifestPath string, name string) ([]string, error) {
-	f, err := os.Open(manifestPath)
+	f, err := os.Open(manifestPath) //nolint:gosec // manifestPath is derived from the configured cache dir.
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			log.Printf("close manifest file %s: %s", manifestPath, closeErr.Error())
+		}
+	}()
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
@@ -738,7 +748,7 @@ func lruTimeMicro(ie indexEntry) int64 {
 }
 
 func (dc *Store) writeManifest(manifestPath string, body string) error {
-	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o750); err != nil {
 		return fmt.Errorf("create manifest dir: %w", err)
 	}
 
@@ -799,33 +809,34 @@ func (dc *Store) Stats() map[string]string {
 	defer dc.mu.Unlock()
 
 	return map[string]string{
-		"hits":                  fmt.Sprintf("%d", dc.hits),
-		"misses":                fmt.Sprintf("%d", dc.misses),
-		"puts":                  fmt.Sprintf("%d", dc.puts),
-		"putsExist":             fmt.Sprintf("%d", dc.putsExist),
-		"putsCompleted":         fmt.Sprintf("%d", dc.putsCompleted),
-		"index":                 fmt.Sprintf("%d", len(dc.index)),
-		"diskBytes":             fmt.Sprintf("%d", dc.currentDiskBytes),
-		"maxDiskBytes":          fmt.Sprintf("%d", dc.maxDiskBytes),
-		"uniqueOutputFiles":     fmt.Sprintf("%d", len(dc.outputRefs)),
-		"evictionScheduled":     fmt.Sprintf("%t", dc.evictionScheduled),
-		"lastEvictionUnixMicro": fmt.Sprintf("%d", dc.lastEvictionUnixMicro),
-		"errors":                fmt.Sprintf("%d", dc.errors),
+		"hits":                  strconv.FormatInt(dc.hits, 10),
+		"misses":                strconv.FormatInt(dc.misses, 10),
+		"puts":                  strconv.FormatInt(dc.puts, 10),
+		"putsExist":             strconv.FormatInt(dc.putsExist, 10),
+		"putsCompleted":         strconv.FormatInt(dc.putsCompleted, 10),
+		"index":                 strconv.Itoa(len(dc.index)),
+		"diskBytes":             strconv.FormatInt(dc.currentDiskBytes, 10),
+		"maxDiskBytes":          strconv.FormatInt(dc.maxDiskBytes, 10),
+		"uniqueOutputFiles":     strconv.Itoa(len(dc.outputRefs)),
+		"evictionScheduled":     strconv.FormatBool(dc.evictionScheduled),
+		"lastEvictionUnixMicro": strconv.FormatInt(dc.lastEvictionUnixMicro, 10),
+		"errors":                strconv.FormatInt(dc.errors, 10),
 	}
 }
 
 func (dc *Store) PrintStats() {
 	st := dc.Stats()
 
-	stats := ""
+	var stats strings.Builder
 	for _, k := range slices.Sorted(maps.Keys(st)) {
 		v := st[k]
 
-		stats += fmt.Sprintf("%s: %s ", k, v)
+		_, _ = fmt.Fprintf(&stats, "%s: %s ", k, v)
 	}
 
-	if stats != dc.prevStats {
-		log.Print(stats)
-		dc.prevStats = stats
+	statsText := stats.String()
+	if statsText != dc.prevStats {
+		log.Print(statsText)
+		dc.prevStats = statsText
 	}
 }

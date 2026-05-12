@@ -2,6 +2,8 @@ package http
 
 import (
 	"encoding/json"
+	"log"
+	"math"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -12,7 +14,7 @@ type statsProvider interface {
 	Stats() map[string]string
 }
 
-func (h *Handler) Status(rw http.ResponseWriter, r *http.Request) {
+func (h *Handler) Status(rw http.ResponseWriter, _ *http.Request) {
 	resp := map[string]any{}
 
 	if s, ok := h.store.(statsProvider); ok {
@@ -30,13 +32,15 @@ func (h *Handler) Status(rw http.ResponseWriter, r *http.Request) {
 	runtime.ReadMemStats(&ms)
 	resp["runtime"] = map[string]any{
 		"heapInuseBytes": ms.HeapInuse,
-		"heapInuse":      byteSize(int64(ms.HeapInuse)),
+		"heapInuse":      byteSize(uint64ToInt64(ms.HeapInuse)),
 	}
 
 	rw.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(rw)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(resp)
+	if err := enc.Encode(resp); err != nil {
+		log.Printf("encode status response: %s", err.Error())
+	}
 }
 
 func augmentStatusStats(stats map[string]string) {
@@ -66,4 +70,12 @@ func addHumanByteStat(stats map[string]string, key string) {
 		return
 	}
 	stats[key+"Human"] = byteSize(n)
+}
+
+func uint64ToInt64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+
+	return int64(v)
 }
