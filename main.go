@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -28,17 +29,31 @@ func run() error {
 	params := parseProxyParams()
 	dir := flag.String("cache-dir", "", "cache directory; empty means automatic")
 	listen := flag.String("listen", "", "listen address or unix socket path; when set, run as server instead of cache helper")
+	stop := flag.String("stop", "", "stop a running local daemon listening on the given unix/tcp address")
 	dumpLogs := flag.String("dump-log", "", "dump req/resp logs to file")
 	remoteURL := flag.String("remote-url", "", "remote HTTP server cache source, e.g. https://example.com:8080")
 	authToken := flag.String("auth-token", "", "optional bearer token for the remote HTTP cache server")
 	maxDiskBytes := flag.Int64("max-disk-bytes", 0, "optional total on-disk cache size limit in bytes; 0 disables eviction")
 	preloadLimit := flag.Int("preload-limit", 2, "maximum number of concurrent preload preparations in server mode")
+	preloadOnly := flag.Bool("preload-only", false, "preload cache into -cache-dir and exit without running as helper or uploading cache-used")
 	canonicalize := flag.String("canonicalize-timestamps", "", "canonicalize file and directory timestamps under this repo root and exit")
 
 	flag.Parse()
 
 	if *canonicalize != "" {
 		return local.CanonicalizeTimestamps(*canonicalize)
+	}
+
+	if *stop != "" {
+		lines, err := local.StopShimServer(*stop, *authToken)
+		for _, line := range lines {
+			log.Print(line)
+		}
+		return err
+	}
+
+	if isLocalRemoteURL(*remoteURL) && *listen == "" && !*preloadOnly {
+		return runShim(*remoteURL, *authToken, *dumpLogs)
 	}
 
 	if *dir == "" {
@@ -55,16 +70,22 @@ func run() error {
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
 
+	if *preloadOnly {
+		if *listen != "" {
+			return fmt.Errorf("-preload-only cannot be combined with -listen")
+		}
+		if *remoteURL == "" {
+			return fmt.Errorf("-preload-only requires -remote-url")
+		}
+		params.DisableCacheUsed = true
+	}
+
 	if *listen != "" {
 		if *remoteURL == "" {
 			return runStoreServer(*listen, *dir, *authToken, *maxDiskBytes, *preloadLimit)
 		}
 
-		return runDaemon(*listen, *dir, *remoteURL, *authToken, *maxDiskBytes, params)
-	}
-
-	if isLocalRemoteURL(*remoteURL) {
-		return runShim(*remoteURL, *authToken, *dumpLogs)
+		return runDaemon(*listen, *dir, *remoteURL, *authToken, *maxDiskBytes, *params)
 	}
 
 	println("starting at dir", *dir)
@@ -99,7 +120,7 @@ func run() error {
 			StartedAt: sessionStartedAt,
 			PID:       os.Getpid(),
 			CacheDir:  *dir,
-			Params:    params,
+			Params:    *params,
 		})
 		if err != nil {
 			return fmt.Errorf("remote client: %w", err)
@@ -111,11 +132,20 @@ func run() error {
 		return fmt.Errorf("new cache store: %w", err)
 	}
 
-	dc := local.NewProxy(store, upstream, resps, params)
+	dc := local.NewProxy(store, upstream, resps, *params)
 
 	app := local.NewApp(os.Stdin, os.Stdout, dc, resps, logDump)
 	if err := dc.MaybePreload(); err != nil {
 		return err
+	}
+
+	if *preloadOnly {
+		if err := dc.Close(); err != nil {
+			return fmt.Errorf("close cache after preload-only: %w", err)
+		}
+		close(resps)
+		dc.PrintStats()
+		return nil
 	}
 
 	go func() {
@@ -146,9 +176,10 @@ func runServer(listen string, store *local.Store, authToken string, preloadLimit
 	return local.RunServer(listen, store, authToken, preloadLimit)
 }
 
-func parseProxyParams() local.ProxyParams {
-	params := local.ProxyParams{}
+func parseProxyParams() *local.ProxyParams {
+	params := &local.ProxyParams{}
 	flag.BoolVar(&params.Preload, "preload", false, "preload cache from remote server")
+	flag.BoolVar(&params.SkipPreload, "skip-preload", false, "skip preload even when preload scope flags are present")
 	flag.Int64Var(&params.PreloadSize, "preload-size", 1000000, "preload cache from remote server fo items up to this size")
 	flag.StringVar(&params.Commit, "commit", "", "current commit SHA used to upload cache usage manifest")
 	flag.StringVar(&params.ChangesID, "changes-id", "", "stable change stream label used to upload and preload latest cache usage manifest")
@@ -185,7 +216,8 @@ func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, par
 
 	resps := make(chan cacheprog.Response, 100)
 	proxy := local.NewProxy(store, upstream, resps, params)
-	proxy.Verbose = true
+	recentLogf := newRecentLogf(20)
+	proxy.Logf = recentLogf.Logf
 
 	ready := make(chan struct{})
 	var preloadMu sync.Mutex
@@ -206,8 +238,22 @@ func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, par
 		return preloadErr
 	})
 	err = server.Serve(listen, preloadErrCh)
+	stopRequested := errors.Is(err, local.ErrStopRequested)
+	if stopRequested {
+		err = nil
+	}
+	proxy.PrintStats()
 	closeErr := proxy.Close()
 	close(resps)
+	if stopRequested {
+		resp := local.ShimStopResponse{Lines: recentLogf.Lines()}
+		if err != nil {
+			resp.Err = err.Error()
+		} else if closeErr != nil {
+			resp.Err = fmt.Sprintf("close daemon proxy: %s", closeErr.Error())
+		}
+		server.ReplyStop(resp)
+	}
 	if err != nil {
 		return err
 	}
@@ -216,6 +262,36 @@ func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, par
 	}
 
 	return nil
+}
+
+type recentLogf struct {
+	limit int
+	mu    sync.Mutex
+	lines []string
+}
+
+func newRecentLogf(limit int) *recentLogf {
+	return &recentLogf{limit: limit}
+}
+
+func (r *recentLogf) Logf(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	log.Print(line)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.lines = append(r.lines, line)
+	if len(r.lines) > r.limit {
+		r.lines = append([]string(nil), r.lines[len(r.lines)-r.limit:]...)
+	}
+}
+
+func (r *recentLogf) Lines() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]string(nil), r.lines...)
 }
 
 func newUpstreamClient(remoteURL, authToken, cacheDir string, params local.ProxyParams) (cache.Store, error) {

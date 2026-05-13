@@ -120,6 +120,40 @@ export GOCACHEPROG="/path/to/gocacheprog -remote-url unix:///tmp/gocacheprog.soc
 go test ./...
 ```
 
+### Explicit Preload Then Daemon
+
+If you want preload in a separate CI step, use `-preload-only` against the same cache dir:
+
+```bash
+/path/to/gocacheprog \
+  -cache-dir ./build-cache \
+  -remote-url https://cache.example.com \
+  -preload-only \
+  -preload-size 3000000 \
+  -changes-id "$CHANGES_ID" \
+  -build-type lint \
+  -base-commit "$BASE_COMMIT"
+```
+
+This preloads into `./build-cache` and exits without uploading `cache-used`.
+
+Then start daemon + shim later with the same cache dir:
+
+```bash
+/path/to/gocacheprog \
+  -listen unix:///tmp/gocacheprog.sock \
+  -cache-dir ./build-cache \
+  -remote-url https://cache.example.com \
+  -skip-preload \
+  -commit "$COMMIT" \
+  -changes-id "$CHANGES_ID" \
+  -build-type lint \
+  -base-commit "$BASE_COMMIT" \
+  > /tmp/gocacheprog-daemon.log 2>&1 &
+```
+
+The daemon will skip preload explicitly and still upload `cache-used` on shutdown.
+
 Why this is better:
 
 - one local owner of `./build-cache`

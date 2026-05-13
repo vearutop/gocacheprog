@@ -319,7 +319,7 @@ func TestShimServer_ClosedReadyProcessesRequestsEvenWhenPreloadFailed(t *testing
 		closePipeConn(t, clientConn)
 	})
 
-	go server.serveConn(serverConn)
+	server.startConn(serverConn)
 
 	enc := json.NewEncoder(clientConn)
 	dec := json.NewDecoder(bufio.NewReader(clientConn))
@@ -354,6 +354,48 @@ func TestShimServer_ClosedReadyProcessesRequestsEvenWhenPreloadFailed(t *testing
 	//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 	err = dec.Decode(&resp)
 	require.Error(t, err, "request unexpectedly succeeded after a failed preload signal")
+}
+
+func TestStopShimServer_RequestsDaemonShutdown(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	resps := make(chan cacheprog.Response, 10)
+	proxy := NewProxy(store, nil, resps, ProxyParams{})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+		close(resps)
+	})
+
+	server := NewShimServer(proxy, resps, "secret", nil, nil)
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("gocacheprog-stop-%d.sock", time.Now().UnixNano()))
+	done := make(chan error, 1)
+
+	go func() {
+		err := server.Serve("unix://"+socketPath, nil)
+		if errors.Is(err, ErrStopRequested) {
+			server.ReplyStop(ShimStopResponse{Lines: []string{"stopped"}})
+			done <- nil
+			return
+		}
+		done <- err
+	}()
+
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(socketPath)
+		return err == nil
+	}, time.Second, 10*time.Millisecond)
+
+	lines, err := StopShimServer("unix://"+socketPath, "secret")
+	require.NoError(t, err)
+	require.Equal(t, []string{"stopped"}, lines)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for shim server to stop")
+	}
 }
 
 func TestShimClient_DoCanStealResponsesFromOtherConsumers(t *testing.T) {
@@ -459,7 +501,7 @@ func startTestShimServer(t *testing.T, server *ShimServer) string {
 				return
 			}
 
-			go server.serveConn(conn)
+			server.startConn(conn)
 		}
 	}()
 

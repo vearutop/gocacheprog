@@ -48,6 +48,24 @@ func TestProxyClose_CacheUsedNoOpWithoutUsageRecorder(t *testing.T) {
 	require.NoError(t, proxy.Close())
 }
 
+func TestProxyClose_CacheUsedSkippedWhenDisabled(t *testing.T) {
+	upstream := &usageRecorderStub{}
+
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
+		Commit:           "commit123",
+		ChangesID:        "repo/pr-123",
+		BuildType:        "unit",
+		DisableCacheUsed: true,
+	})
+
+	proxy.recordUsedActionID("actionId1")
+
+	require.NoError(t, proxy.Close())
+	require.False(t, upstream.called)
+}
+
 func TestProxyHasLocalEntries(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
@@ -65,6 +83,23 @@ func TestProxyHasLocalEntries(t *testing.T) {
 	}, []byte("body-1"))
 
 	require.Eventually(t, proxy.HasLocalEntries, time.Second, 10*time.Millisecond)
+}
+
+func TestProxyMaybePreload_SkipsWhenDisabled(t *testing.T) {
+	upstream := &preloaderStub{}
+
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
+		Preload:     true,
+		SkipPreload: true,
+	})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	require.NoError(t, proxy.MaybePreload())
+	require.False(t, upstream.called)
 }
 
 func TestProxyStats_HitBreakdown(t *testing.T) {
@@ -132,5 +167,22 @@ func (noopStore) Get(req cache.Request, cb func(resp cache.ResponseItem)) error 
 }
 
 func (noopStore) Put(values cache.Response) error {
+	return nil
+}
+
+type preloaderStub struct {
+	called bool
+}
+
+func (p *preloaderStub) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
+	return nil
+}
+
+func (p *preloaderStub) Put(values cache.Response) error {
+	return nil
+}
+
+func (p *preloaderStub) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
+	p.called = true
 	return nil
 }

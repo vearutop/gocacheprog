@@ -51,13 +51,15 @@ type Proxy struct {
 }
 
 type ProxyParams struct {
-	Commit       string
-	ChangesID    string
-	BuildType    string
-	BaseCommit   string
-	ParentCommit string
-	Preload      bool
-	PreloadSize  int64
+	Commit           string
+	ChangesID        string
+	BuildType        string
+	BaseCommit       string
+	ParentCommit     string
+	Preload          bool
+	SkipPreload      bool
+	PreloadSize      int64
+	DisableCacheUsed bool
 }
 
 func (p ProxyParams) SessionCommit() string {
@@ -108,9 +110,83 @@ func (dc *Proxy) Close() error {
 	close(dc.put)
 	dc.wg.Wait()
 
-	if err := dc.postCacheUsedOnClose(); err != nil {
+	actionIDs := dc.UsedActionIDs()
+	commit := dc.params.Commit
+	changesID := dc.params.ChangesID
+	buildType := dc.params.BuildType
+	baseCommit := dc.params.BaseCommit
+	parentCommit := dc.params.ParentCommit
+	replaceChanges := !dc.initialLocalEntries
+
+	if dc.params.DisableCacheUsed {
+		dc.logf(
+			"cache-used skipped: disabled, commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q action_ids=%d",
+			commit,
+			changesID,
+			buildType,
+			baseCommit,
+			parentCommit,
+			len(actionIDs),
+		)
+		return dc.disk.Close()
+	}
+
+	if commit == "" && changesID == "" {
+		dc.logf(
+			"cache-used skipped: no commit or changes-id, build_type=%q base_commit=%q parent_commit=%q action_ids=%d",
+			buildType,
+			baseCommit,
+			parentCommit,
+			len(actionIDs),
+		)
+		return dc.disk.Close()
+	}
+
+	if _, ok := dc.upstream.(cache.UsageRecorder); !ok {
+		dc.logf(
+			"cache-used skipped: upstream does not support usage recording, commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q action_ids=%d",
+			commit,
+			changesID,
+			buildType,
+			baseCommit,
+			parentCommit,
+			len(actionIDs),
+		)
+		return dc.disk.Close()
+	}
+
+	dc.logf(
+		"cache-used uploading: commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q action_ids=%d replace_changes=%t",
+		commit,
+		changesID,
+		buildType,
+		baseCommit,
+		parentCommit,
+		len(actionIDs),
+		replaceChanges,
+	)
+
+	startedAt := time.Now()
+	if err := dc.postCacheUsed(commit, changesID, buildType, replaceChanges, actionIDs); err != nil {
+		dc.logf(
+			"cache-used upload failed: commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q action_ids=%d replace_changes=%t err=%s",
+			commit,
+			changesID,
+			buildType,
+			baseCommit,
+			parentCommit,
+			len(actionIDs),
+			replaceChanges,
+			err.Error(),
+		)
 		return err
 	}
+
+	dc.logf(
+		"cache-used uploaded: action_ids=%d duration=%s",
+		len(actionIDs),
+		time.Since(startedAt).String(),
+	)
 
 	return dc.disk.Close()
 }
@@ -159,7 +235,11 @@ func (dc *Proxy) UsedActionIDs() []string {
 	return res
 }
 
-func (dc *Proxy) postCacheUsed(commit string, changesID string, buildType string, replaceChanges bool) error {
+func (dc *Proxy) postCacheUsed(commit string, changesID string, buildType string, replaceChanges bool, actionIDs []string) error {
+	if dc.params.DisableCacheUsed {
+		return nil
+	}
+
 	if commit == "" && changesID == "" {
 		return nil
 	}
@@ -169,59 +249,107 @@ func (dc *Proxy) postCacheUsed(commit string, changesID string, buildType string
 		return nil
 	}
 
-	return recorder.PostCacheUsed(commit, changesID, buildType, dc.UsedActionIDs(), replaceChanges)
-}
-
-func (dc *Proxy) postCacheUsedOnClose() error {
-	return dc.postCacheUsed(
-		dc.params.Commit,
-		dc.params.ChangesID,
-		dc.params.BuildType,
-		!dc.initialLocalEntries,
-	)
+	return recorder.PostCacheUsed(commit, changesID, buildType, actionIDs, replaceChanges)
 }
 
 func (dc *Proxy) MaybePreload() error {
-	if !dc.params.Preload &&
-		dc.params.Commit == "" &&
-		dc.params.ChangesID == "" &&
-		dc.params.BuildType == "" &&
-		dc.params.BaseCommit == "" &&
-		dc.params.ParentCommit == "" {
-		return nil
-	}
-
-	if dc.HasLocalEntries() {
-		println("skipping preload because local cache dir is already populated")
-		return nil
-	}
-
-	st := time.Now()
-	println("preloading cache up to", dc.params.PreloadSize, "bytes per item from remote server ...")
-	if err := dc.Preload(cache.PreloadRequest{
+	req := cache.PreloadRequest{
 		MaxSize:      dc.params.PreloadSize,
 		Commit:       dc.params.Commit,
 		ChangesID:    dc.params.ChangesID,
 		BuildType:    dc.params.BuildType,
 		BaseCommit:   dc.params.BaseCommit,
 		ParentCommit: dc.params.ParentCommit,
-	}); err != nil {
+	}
+
+	if dc.params.SkipPreload {
+		log.Printf(
+			"preload skipped: -skip-preload is set, commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q max_size=%d",
+			req.Commit,
+			req.ChangesID,
+			req.BuildType,
+			req.BaseCommit,
+			req.ParentCommit,
+			req.MaxSize,
+		)
+		return nil
+	}
+
+	if !dc.params.Preload &&
+		dc.params.Commit == "" &&
+		dc.params.ChangesID == "" &&
+		dc.params.BuildType == "" &&
+		dc.params.BaseCommit == "" &&
+		dc.params.ParentCommit == "" {
+		log.Printf("preload skipped: no preload flag and no scope hints")
+		return nil
+	}
+
+	if dc.HasLocalEntries() {
+		log.Printf(
+			"preload skipped: local cache dir is already populated, commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q max_size=%d",
+			req.Commit,
+			req.ChangesID,
+			req.BuildType,
+			req.BaseCommit,
+			req.ParentCommit,
+			req.MaxSize,
+		)
+		return nil
+	}
+
+	st := time.Now()
+	log.Printf(
+		"preload starting: commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q max_size=%d",
+		req.Commit,
+		req.ChangesID,
+		req.BuildType,
+		req.BaseCommit,
+		req.ParentCommit,
+		req.MaxSize,
+	)
+	if err := dc.Preload(req); err != nil {
 		return fmt.Errorf("preload cache: %w", err)
 	}
 
+	sources := "unavailable"
 	if s, ok := dc.upstream.(interface{ LastPreloadSources() string }); ok {
-		if sources := s.LastPreloadSources(); sources != "" {
-			println("preload sources:", sources)
+		if lastSources := s.LastPreloadSources(); lastSources != "" {
+			sources = lastSources
+		} else {
+			sources = "none"
 		}
 	}
 
-	println("preload done in", time.Since(st).String())
+	preloadBytes := "unknown"
+	if s, ok := dc.upstream.(interface{ Stats() map[string]string }); ok {
+		if stats := s.Stats(); stats != nil {
+			if v := stats["preload_bytes"]; v != "" {
+				preloadBytes = v
+			}
+		}
+	}
+
+	log.Printf(
+		"preload done: sources=%s items=%d bytes=%s duration=%s",
+		sources,
+		dc.preloadedCount(),
+		preloadBytes,
+		time.Since(st).String(),
+	)
 
 	return nil
 }
 
 func (dc *Proxy) HasLocalEntries() bool {
 	return dc.disk.HasEntries()
+}
+
+func (dc *Proxy) preloadedCount() int {
+	dc.preloadedMu.Lock()
+	defer dc.preloadedMu.Unlock()
+
+	return len(dc.preloadedActionIDs)
 }
 
 const (
@@ -360,7 +488,6 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 		dc.markPreloaded(resp.ActionID)
 	})
 
-	println("preloaded", items, "items")
 	return err
 }
 
@@ -489,7 +616,7 @@ func (dc *Proxy) PrintStats() {
 		fmt.Fprintf(&sb, " %s: %s", k, st[k])
 	}
 
-	log.Println(sb.String())
+	dc.logf("%s", sb.String())
 }
 
 func (dc *Proxy) putRespItem(item cache.ResponseItem, body []byte) error {

@@ -20,9 +20,22 @@ import (
 	"github.com/vearutop/gocacheprog/internal/cacheprog"
 )
 
+var ErrStopRequested = errors.New("shim stop requested")
+
 type shimHello struct {
 	SessionID string `json:"session_id,omitempty"`
 	AuthToken string `json:"auth_token,omitempty"`
+	Stop      bool   `json:"stop,omitempty"`
+}
+
+type shimStopRequest struct {
+	replyCh chan ShimStopResponse
+	doneCh  chan struct{}
+}
+
+type ShimStopResponse struct {
+	Lines []string `json:"lines,omitempty"`
+	Err   string   `json:"err,omitempty"`
 }
 
 type shimEnvelope struct {
@@ -60,6 +73,15 @@ type ShimServer struct {
 	nextID  int64
 	waiters map[int64]shimPending
 	mu      sync.Mutex
+
+	connMu          sync.Mutex
+	conns           map[net.Conn]struct{}
+	connWg          sync.WaitGroup
+	shutdownOnce    sync.Once
+	stopReqCh       chan shimStopRequest
+	stopReplyMu     sync.Mutex
+	stopReplyCh     chan ShimStopResponse
+	stopReplyDoneCh chan struct{}
 }
 
 func NewShimServer(proxy *Proxy, resps <-chan cacheprog.Response, authToken string, ready <-chan struct{}, readyErr func() error) *ShimServer {
@@ -70,6 +92,8 @@ func NewShimServer(proxy *Proxy, resps <-chan cacheprog.Response, authToken stri
 		ready:     ready,
 		readyErr:  readyErr,
 		waiters:   map[int64]shimPending{},
+		conns:     map[net.Conn]struct{}{},
+		stopReqCh: make(chan shimStopRequest, 1),
 	}
 
 	go s.dispatchResponses()
@@ -119,7 +143,7 @@ func (s *ShimServer) Serve(listen string, preloadErrCh <-chan error) error {
 				return
 			}
 
-			go s.serveConn(conn)
+			s.startConn(conn)
 		}
 	}()
 
@@ -130,7 +154,13 @@ func (s *ShimServer) Serve(listen string, preloadErrCh <-chan error) error {
 		select {
 		case sig := <-stop:
 			s.proxy.logf("Shutting down on %s ...", sig)
+			s.shutdown(ln)
 			return nil
+		case req := <-s.stopReqCh:
+			s.setStopReply(req.replyCh, req.doneCh)
+			s.proxy.logf("Shutting down on remote stop request ...")
+			s.shutdown(ln)
+			return ErrStopRequested
 		case <-ready:
 			if s.readyErr != nil {
 				if err := s.readyErr(); err != nil {
@@ -149,6 +179,60 @@ func (s *ShimServer) Serve(listen string, preloadErrCh <-chan error) error {
 			}
 			return nil
 		}
+	}
+}
+
+func (s *ShimServer) shutdown(ln net.Listener) {
+	s.shutdownOnce.Do(func() {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.proxy.logf("close shim listener during shutdown: %s", err.Error())
+		}
+
+		s.connMu.Lock()
+		conns := make([]net.Conn, 0, len(s.conns))
+		for conn := range s.conns {
+			conns = append(conns, conn)
+		}
+		s.connMu.Unlock()
+
+		for _, conn := range conns {
+			if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				s.proxy.logf("close shim conn during shutdown: %s", err.Error())
+			}
+		}
+
+		s.connWg.Wait()
+	})
+}
+
+func (s *ShimServer) startConn(conn net.Conn) {
+	s.connWg.Add(1)
+	go s.serveConn(conn)
+}
+
+func (s *ShimServer) setStopReply(replyCh chan ShimStopResponse, doneCh chan struct{}) {
+	s.stopReplyMu.Lock()
+	defer s.stopReplyMu.Unlock()
+	s.stopReplyCh = replyCh
+	s.stopReplyDoneCh = doneCh
+}
+
+func (s *ShimServer) ReplyStop(resp ShimStopResponse) {
+	s.stopReplyMu.Lock()
+	replyCh := s.stopReplyCh
+	doneCh := s.stopReplyDoneCh
+	s.stopReplyCh = nil
+	s.stopReplyDoneCh = nil
+	s.stopReplyMu.Unlock()
+
+	if replyCh == nil {
+		return
+	}
+
+	replyCh <- resp
+	close(replyCh)
+	if doneCh != nil {
+		<-doneCh
 	}
 }
 
@@ -171,7 +255,19 @@ func prepareShimListener(network string, addr string) (net.Listener, error) {
 }
 
 func (s *ShimServer) serveConn(conn net.Conn) {
+	s.connMu.Lock()
+	s.conns[conn] = struct{}{}
+	s.connMu.Unlock()
+	tracked := true
+
 	defer func() {
+		if tracked {
+			s.connMu.Lock()
+			delete(s.conns, conn)
+			s.connMu.Unlock()
+			s.connWg.Done()
+		}
+
 		if err := conn.Close(); err != nil {
 			s.proxy.logf("close shim conn: %s", err.Error())
 		}
@@ -188,6 +284,35 @@ func (s *ShimServer) serveConn(conn net.Conn) {
 
 	if s.authToken != "" && strings.TrimSpace(hello.AuthToken) != s.authToken {
 		s.proxy.logf("reject shim session %q: invalid auth", hello.SessionID)
+		return
+	}
+
+	if hello.Stop {
+		s.connMu.Lock()
+		delete(s.conns, conn)
+		s.connMu.Unlock()
+		s.connWg.Done()
+		tracked = false
+
+		replyCh := make(chan ShimStopResponse, 1)
+		doneCh := make(chan struct{})
+		select {
+		case s.stopReqCh <- shimStopRequest{replyCh: replyCh, doneCh: doneCh}:
+		default:
+			replyCh <- ShimStopResponse{Err: "stop already in progress"}
+			close(replyCh)
+			close(doneCh)
+		}
+
+		resp, ok := <-replyCh
+		if !ok {
+			return
+		}
+
+		if err := je.Encode(resp); err != nil {
+			s.proxy.logf("write shim stop response: %s", err.Error())
+		}
+		close(doneCh)
 		return
 	}
 
@@ -423,6 +548,42 @@ func (c *ShimClient) Send(req cacheprog.Request, body []byte) error {
 
 func (c *ShimClient) Close() error {
 	return c.conn.Close()
+}
+
+func StopShimServer(remoteURL string, authToken string) ([]string, error) {
+	network, addr, err := shimNetworkAndAddr(remoteURL)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.DialTimeout(network, addr, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	enc := json.NewEncoder(conn)
+	//nolint:gosec // local shim auth token is an expected protocol field.
+	if err := enc.Encode(shimHello{AuthToken: authToken, Stop: true}); err != nil {
+		return nil, err
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return nil, err
+	}
+
+	var resp ShimStopResponse
+	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		return nil, err
+	}
+
+	if resp.Err != "" {
+		return resp.Lines, errors.New(resp.Err)
+	}
+
+	return resp.Lines, nil
 }
 
 func shimNetworkAndAddr(remoteURL string) (string, string, error) {
