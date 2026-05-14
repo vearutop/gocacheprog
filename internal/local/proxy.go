@@ -40,11 +40,14 @@ type Proxy struct {
 	putsExist   int64
 	batchPuts   int64
 
-	usedMu             sync.Mutex
-	usedActionIDs      map[string]struct{}
-	preloadedMu        sync.Mutex
-	preloadedActionIDs map[string]struct{}
-	usedPreloadedIDs   map[string]struct{}
+	usedMu               sync.Mutex
+	usedActionIDs        map[string]struct{}
+	preloadedMu          sync.Mutex
+	preloadedActionIDs   map[string]struct{}
+	usedPreloadedIDs     map[string]struct{}
+	preloadBytesMu       sync.Mutex
+	lastPreloadSize      int64
+	remoteGetLimitLogged atomic.Bool
 
 	initialLocalEntries bool
 	params              ProxyParams
@@ -58,6 +61,7 @@ type ProxyParams struct {
 	ParentCommit     string
 	Preload          bool
 	SkipPreload      bool
+	MaxRemoteGetTime time.Duration
 	PreloadSize      int64
 	DisableCacheUsed bool
 }
@@ -208,7 +212,47 @@ func (dc *Proxy) Lookup(req cacheprog.Request) {
 	}
 
 	atomic.AddInt64(&dc.lookups, 1)
+
+	if dc.shouldSkipRemoteGet() {
+		resp := dc.Get(req)
+		if resp.Miss {
+			atomic.AddInt64(&dc.misses, 1)
+		} else {
+			atomic.AddInt64(&dc.hits, 1)
+			dc.recordHitKind(req.ActionID)
+		}
+
+		dc.resps <- resp
+		return
+	}
+
 	dc.lookup <- req
+}
+
+func (dc *Proxy) shouldSkipRemoteGet() bool {
+	if dc.params.MaxRemoteGetTime <= 0 {
+		return false
+	}
+
+	timed, ok := dc.upstream.(interface{ GetTotalTime() time.Duration })
+	if !ok {
+		return false
+	}
+
+	total := timed.GetTotalTime()
+	if total < dc.params.MaxRemoteGetTime {
+		return false
+	}
+
+	if dc.remoteGetLimitLogged.CompareAndSwap(false, true) {
+		dc.logf(
+			"remote get budget exhausted: get_total_time=%s max_remote_get_time=%s; local misses will stop querying remote",
+			total.String(),
+			dc.params.MaxRemoteGetTime.String(),
+		)
+	}
+
+	return true
 }
 
 func (dc *Proxy) recordUsedActionID(actionID string) {
@@ -330,12 +374,34 @@ func (dc *Proxy) MaybePreload() error {
 		}
 	}
 
+	queueWait, prepareTime, totalTime := "unknown", "unknown", "unknown"
+	if s, ok := dc.upstream.(interface {
+		LastPreloadTimings() (string, string, string)
+	}); ok {
+		queueWait, prepareTime, totalTime = s.LastPreloadTimings()
+		if queueWait == "" {
+			queueWait = "unknown"
+		}
+		if prepareTime == "" {
+			prepareTime = "unknown"
+		}
+		if totalTime == "" {
+			totalTime = "unknown"
+		}
+	}
+
+	uncompressedBytes := humanBytes(dc.lastPreloadSizeBytes())
+
 	log.Printf(
-		"preload done: sources=%s items=%d bytes=%s duration=%s",
+		"preload done: sources=%s items=%d bytes=%s uncompressed_bytes=%s duration=%s queue_wait=%s prepare_time=%s total_time=%s",
 		sources,
 		dc.preloadedCount(),
 		preloadBytes,
+		uncompressedBytes,
 		time.Since(st).String(),
+		queueWait,
+		prepareTime,
+		totalTime,
 	)
 
 	return nil
@@ -350,6 +416,29 @@ func (dc *Proxy) preloadedCount() int {
 	defer dc.preloadedMu.Unlock()
 
 	return len(dc.preloadedActionIDs)
+}
+
+func (dc *Proxy) lastPreloadSizeBytes() int64 {
+	dc.preloadBytesMu.Lock()
+	defer dc.preloadBytesMu.Unlock()
+
+	return dc.lastPreloadSize
+}
+
+func humanBytes(bytes int64) string {
+	if bytes < 1000 {
+		return fmt.Sprintf("%dB", bytes)
+	}
+
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	v := float64(bytes)
+	unit := 0
+	for v >= 1000 && unit < len(units)-1 {
+		v /= 1000
+		unit++
+	}
+
+	return fmt.Sprintf("%.1f%s", v, units[unit])
 }
 
 const (
@@ -455,9 +544,11 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 	}
 
 	items := 0
+	var uncompressedBytes int64
 
 	err := p.Preload(req, func(resp cache.ResponseItem) {
 		items++
+		uncompressedBytes += resp.Size
 
 		br, err := resp.WireBodyReader()
 		if err != nil {
@@ -487,6 +578,10 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 
 		dc.markPreloaded(resp.ActionID)
 	})
+
+	dc.preloadBytesMu.Lock()
+	dc.lastPreloadSize = uncompressedBytes
+	dc.preloadBytesMu.Unlock()
 
 	return err
 }

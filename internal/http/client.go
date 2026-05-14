@@ -24,16 +24,19 @@ import (
 var gatewayRetryDelay = 5 * time.Second
 
 const (
-	headerSessionID      = "X-Gocacheprog-Session-Id"
-	headerStartedAt      = "X-Gocacheprog-Started-At"
-	headerPID            = "X-Gocacheprog-Pid"
-	headerCacheDir       = "X-Gocacheprog-Cache-Dir"
-	headerCommit         = "X-Gocacheprog-Commit"
-	headerParent         = "X-Gocacheprog-Parent"
-	headerChanges        = "X-Gocacheprog-Changes"
-	headerBuildType      = "X-Gocacheprog-Build-Type"
-	headerBase           = "X-Gocacheprog-Base"
-	headerPreloadSources = "X-Gocacheprog-Preload-Sources"
+	headerSessionID          = "X-Gocacheprog-Session-Id"
+	headerStartedAt          = "X-Gocacheprog-Started-At"
+	headerPID                = "X-Gocacheprog-Pid"
+	headerCacheDir           = "X-Gocacheprog-Cache-Dir"
+	headerCommit             = "X-Gocacheprog-Commit"
+	headerParent             = "X-Gocacheprog-Parent"
+	headerChanges            = "X-Gocacheprog-Changes"
+	headerBuildType          = "X-Gocacheprog-Build-Type"
+	headerBase               = "X-Gocacheprog-Base"
+	headerPreloadSources     = "X-Gocacheprog-Preload-Sources"
+	headerPreloadQueueWait   = "X-Gocacheprog-Preload-Queue-Wait"
+	headerPreloadPrepareTime = "X-Gocacheprog-Preload-Prepare-Time"
+	headerPreloadTotalTime   = "X-Gocacheprog-Preload-Total-Time"
 )
 
 type SessionInfo struct {
@@ -67,10 +70,14 @@ type Client struct {
 	preloadItems int64
 	getCnt       int64
 	getReqCnt    int64
+	getTotalNs   int64
 	putCnt       int64
 
-	mu                 sync.Mutex
-	lastPreloadSources string
+	mu                     sync.Mutex
+	lastPreloadSources     string
+	lastPreloadQueueWait   string
+	lastPreloadPrepareTime string
+	lastPreloadTotalTime   string
 }
 
 func NewClient(baseURL string, authToken string) (*Client, error) {
@@ -234,6 +241,9 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 
 	c.mu.Lock()
 	c.lastPreloadSources = strings.TrimSpace(res.Header.Get(headerPreloadSources))
+	c.lastPreloadQueueWait = strings.TrimSpace(res.Header.Get(headerPreloadQueueWait))
+	c.lastPreloadPrepareTime = strings.TrimSpace(res.Header.Get(headerPreloadPrepareTime))
+	c.lastPreloadTotalTime = strings.TrimSpace(res.Header.Get(headerPreloadTotalTime))
 	c.mu.Unlock()
 
 	var resp cache.Response
@@ -364,7 +374,9 @@ func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error 
 		return nil
 	})
 
-	c.latencyGet.Add(1000 * time.Since(st).Seconds())
+	elapsed := time.Since(st)
+	c.latencyGet.Add(1000 * elapsed.Seconds())
+	atomic.AddInt64(&c.getTotalNs, elapsed.Nanoseconds())
 
 	return err
 }
@@ -517,19 +529,26 @@ func checkStatus(res *http.Response, expected int, op string) error {
 func (c *Client) Stats() map[string]string {
 	c.mu.Lock()
 	lastPreloadSources := c.lastPreloadSources
+	lastPreloadQueueWait := c.lastPreloadQueueWait
+	lastPreloadPrepareTime := c.lastPreloadPrepareTime
+	lastPreloadTotalTime := c.lastPreloadTotalTime
 	c.mu.Unlock()
 
 	return map[string]string{
-		"bytes_read":      byteSize(atomic.LoadInt64(&c.bytesRead)),
-		"bytes_written":   byteSize(atomic.LoadInt64(&c.bytesWritten)),
-		"preload_bytes":   byteSize(atomic.LoadInt64(&c.preloadBytes)),
-		"preload_sources": lastPreloadSources,
-		"preloaded":       strconv.FormatInt(atomic.LoadInt64(&c.preloadItems), 10),
-		"get_95%":         fmt.Sprintf("%.2fms", c.latencyGet.Percentile(95)),
-		"get_cnt":         strconv.FormatInt(atomic.LoadInt64(&c.getCnt), 10),
-		"get_req_cnt":     strconv.FormatInt(atomic.LoadInt64(&c.getReqCnt), 10),
-		"put_95%":         fmt.Sprintf("%.2fms", c.latencyPut.Percentile(95)),
-		"put_cnt":         strconv.FormatInt(atomic.LoadInt64(&c.putCnt), 10),
+		"bytes_read":           byteSize(atomic.LoadInt64(&c.bytesRead)),
+		"bytes_written":        byteSize(atomic.LoadInt64(&c.bytesWritten)),
+		"preload_bytes":        byteSize(atomic.LoadInt64(&c.preloadBytes)),
+		"preload_sources":      lastPreloadSources,
+		"preload_queue_wait":   lastPreloadQueueWait,
+		"preload_prepare_time": lastPreloadPrepareTime,
+		"preload_total_time":   lastPreloadTotalTime,
+		"preloaded":            strconv.FormatInt(atomic.LoadInt64(&c.preloadItems), 10),
+		"get_95%":              fmt.Sprintf("%.2fms", c.latencyGet.Percentile(95)),
+		"get_cnt":              strconv.FormatInt(atomic.LoadInt64(&c.getCnt), 10),
+		"get_req_cnt":          strconv.FormatInt(atomic.LoadInt64(&c.getReqCnt), 10),
+		"get_total_time":       time.Duration(atomic.LoadInt64(&c.getTotalNs)).String(),
+		"put_95%":              fmt.Sprintf("%.2fms", c.latencyPut.Percentile(95)),
+		"put_cnt":              strconv.FormatInt(atomic.LoadInt64(&c.putCnt), 10),
 	}
 }
 
@@ -538,6 +557,17 @@ func (c *Client) LastPreloadSources() string {
 	defer c.mu.Unlock()
 
 	return c.lastPreloadSources
+}
+
+func (c *Client) LastPreloadTimings() (queueWait string, prepareTime string, totalTime string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.lastPreloadQueueWait, c.lastPreloadPrepareTime, c.lastPreloadTotalTime
+}
+
+func (c *Client) GetTotalTime() time.Duration {
+	return time.Duration(atomic.LoadInt64(&c.getTotalNs))
 }
 
 func setAuthHeader(r *http.Request, authToken string) {

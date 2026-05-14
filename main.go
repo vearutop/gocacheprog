@@ -180,6 +180,7 @@ func parseProxyParams() *local.ProxyParams {
 	params := &local.ProxyParams{}
 	flag.BoolVar(&params.Preload, "preload", false, "preload cache from remote server")
 	flag.BoolVar(&params.SkipPreload, "skip-preload", false, "skip preload even when preload scope flags are present")
+	flag.DurationVar(&params.MaxRemoteGetTime, "max-remote-get-time", 0, "once cumulative remote get time exceeds this duration, local misses stop querying remote and return immediately")
 	flag.Int64Var(&params.PreloadSize, "preload-size", 1000000, "preload cache from remote server fo items up to this size")
 	flag.StringVar(&params.Commit, "commit", "", "current commit SHA used to upload cache usage manifest")
 	flag.StringVar(&params.ChangesID, "changes-id", "", "stable change stream label used to upload and preload latest cache usage manifest")

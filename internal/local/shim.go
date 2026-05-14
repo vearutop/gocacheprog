@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"maps"
 	"net"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,9 +27,10 @@ import (
 var ErrStopRequested = errors.New("shim stop requested")
 
 type shimHello struct {
-	SessionID string `json:"session_id,omitempty"`
-	AuthToken string `json:"auth_token,omitempty"`
-	Stop      bool   `json:"stop,omitempty"`
+	SessionID         string `json:"session_id,omitempty"`
+	AuthToken         string `json:"auth_token,omitempty"`
+	Stop              bool   `json:"stop,omitempty"`
+	StartedAtUnixNano int64  `json:"started_at_unix_nano,omitempty"`
 }
 
 type shimStopRequest struct {
@@ -49,10 +54,12 @@ type shimPending struct {
 }
 
 type shimSession struct {
-	sessionID string
-	conn      net.Conn
-	enc       *json.Encoder
-	mu        sync.Mutex
+	sessionID      string
+	conn           net.Conn
+	enc            *json.Encoder
+	startedAt      time.Time
+	firstGetLogged atomic.Bool
+	mu             sync.Mutex
 }
 
 func (s *shimSession) writeResponse(resp cacheprog.Response) error {
@@ -82,6 +89,11 @@ type ShimServer struct {
 	stopReplyMu     sync.Mutex
 	stopReplyCh     chan ShimStopResponse
 	stopReplyDoneCh chan struct{}
+	sessionsSeen    int64
+	activeSessions  int64
+	firstGetsServed int64
+	firstGetTotalNs int64
+	firstGetMaxNs   int64
 }
 
 func NewShimServer(proxy *Proxy, resps <-chan cacheprog.Response, authToken string, ready <-chan struct{}, readyErr func() error) *ShimServer {
@@ -107,7 +119,7 @@ func (s *ShimServer) Serve(listen string, preloadErrCh <-chan error) error {
 		go func() {
 			for {
 				time.Sleep(5 * time.Second)
-				s.proxy.PrintStats()
+				s.PrintStats()
 			}
 		}()
 	}
@@ -208,6 +220,38 @@ func (s *ShimServer) shutdown(ln net.Listener) {
 func (s *ShimServer) startConn(conn net.Conn) {
 	s.connWg.Add(1)
 	go s.serveConn(conn)
+}
+
+func (s *ShimServer) Stats() map[string]string {
+	firstGetsServed := atomic.LoadInt64(&s.firstGetsServed)
+	firstGetAvg := "0s"
+	if firstGetsServed > 0 {
+		firstGetAvg = (time.Duration(atomic.LoadInt64(&s.firstGetTotalNs)) / time.Duration(firstGetsServed)).String()
+	}
+
+	return map[string]string{
+		"sessions_seen":    strconv.FormatInt(atomic.LoadInt64(&s.sessionsSeen), 10),
+		"active_sessions":  strconv.FormatInt(atomic.LoadInt64(&s.activeSessions), 10),
+		"first_get_served": strconv.FormatInt(firstGetsServed, 10),
+		"first_get_avg":    firstGetAvg,
+		"first_get_max":    time.Duration(atomic.LoadInt64(&s.firstGetMaxNs)).String(),
+	}
+}
+
+func (s *ShimServer) PrintStats() {
+	if s.proxy != nil {
+		s.proxy.PrintStats()
+	}
+
+	st := s.Stats()
+	var sb strings.Builder
+	for _, k := range slices.Sorted(maps.Keys(st)) {
+		fmt.Fprintf(&sb, " %s: %s", k, st[k])
+	}
+
+	if s.proxy != nil {
+		s.proxy.logf("shim:%s", sb.String())
+	}
 }
 
 func (s *ShimServer) setStopReply(replyCh chan ShimStopResponse, doneCh chan struct{}) {
@@ -320,7 +364,14 @@ func (s *ShimServer) serveConn(conn net.Conn) {
 		sessionID: hello.SessionID,
 		conn:      conn,
 		enc:       je,
+		startedAt: time.Now(),
 	}
+	if hello.StartedAtUnixNano > 0 {
+		session.startedAt = time.Unix(0, hello.StartedAtUnixNano)
+	}
+	atomic.AddInt64(&s.sessionsSeen, 1)
+	atomic.AddInt64(&s.activeSessions, 1)
+	defer atomic.AddInt64(&s.activeSessions, -1)
 
 	if s.ready != nil {
 		select {
@@ -413,6 +464,22 @@ func (s *ShimServer) dispatchResponses() {
 			continue
 		}
 
+		if pending.session.firstGetLogged.CompareAndSwap(false, true) {
+			latency := time.Since(pending.session.startedAt)
+			atomic.AddInt64(&s.firstGetsServed, 1)
+			atomic.AddInt64(&s.firstGetTotalNs, latency.Nanoseconds())
+			for {
+				prev := atomic.LoadInt64(&s.firstGetMaxNs)
+				if latency.Nanoseconds() <= prev {
+					break
+				}
+				if atomic.CompareAndSwapInt64(&s.firstGetMaxNs, prev, latency.Nanoseconds()) {
+					break
+				}
+			}
+			s.proxy.logf("shim session %q first_get_latency=%s", pending.session.sessionID, latency.String())
+		}
+
 		resp.ID = pending.originalID
 		if err := pending.session.writeResponse(resp); err != nil {
 			s.proxy.logf("write shim get response: %s", err.Error())
@@ -423,6 +490,7 @@ func (s *ShimServer) dispatchResponses() {
 type ShimClient struct {
 	sessionID string
 	authToken string
+	startedAt time.Time
 	conn      net.Conn
 	enc       *json.Encoder
 	jd        *json.Decoder
@@ -433,6 +501,7 @@ type ShimClient struct {
 }
 
 func NewShimClient(remoteURL string, authToken string, sessionID string) (*ShimClient, error) {
+	startedAt := time.Now()
 	network, addr, err := shimNetworkAndAddr(remoteURL)
 	if err != nil {
 		return nil, err
@@ -456,6 +525,7 @@ func NewShimClient(remoteURL string, authToken string, sessionID string) (*ShimC
 	c := &ShimClient{
 		sessionID: sessionID,
 		authToken: authToken,
+		startedAt: startedAt,
 		conn:      conn,
 		enc:       json.NewEncoder(conn),
 		jd:        json.NewDecoder(bufio.NewReader(conn)),
@@ -464,7 +534,11 @@ func NewShimClient(remoteURL string, authToken string, sessionID string) (*ShimC
 	}
 
 	//nolint:gosec // local shim auth token is an expected protocol field.
-	if err := c.enc.Encode(shimHello{SessionID: sessionID, AuthToken: authToken}); err != nil {
+	if err := c.enc.Encode(shimHello{
+		SessionID:         sessionID,
+		AuthToken:         authToken,
+		StartedAtUnixNano: startedAt.UnixNano(),
+	}); err != nil {
 		if closeErr := conn.Close(); closeErr != nil {
 			return nil, fmt.Errorf("close shim conn after hello failure: %w", closeErr)
 		}
@@ -618,9 +692,13 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 	errCh := make(chan error, 1)
 	var pending sync.WaitGroup
 	var inFlight atomic.Int64
+	var firstGetLogged atomic.Bool
 
 	go func() {
 		for resp := range client.Responses() {
+			if firstGetLogged.CompareAndSwap(false, true) {
+				log.Printf("shim first_get_latency=%s", time.Since(client.startedAt).String())
+			}
 			//nolint:musttag // cacheprog.Response is defined by the Go cache protocol.
 			if err := je.Encode(resp); err != nil {
 				errCh <- fmt.Errorf("encode response: %w", err)

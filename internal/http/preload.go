@@ -106,6 +106,9 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 
 	prepareTime := time.Since(prepareStartedAt)
 	totalTime := queueWait + prepareTime
+	rw.Header().Set(headerPreloadQueueWait, queueWait.String())
+	rw.Header().Set(headerPreloadPrepareTime, prepareTime.String())
+	rw.Header().Set(headerPreloadTotalTime, totalTime.String())
 
 	//nolint:gosec // preload request metadata is intentionally logged for diagnostics.
 	log.Printf(

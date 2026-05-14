@@ -1,6 +1,7 @@
 package local
 
 import (
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -102,6 +103,26 @@ func TestProxyMaybePreload_SkipsWhenDisabled(t *testing.T) {
 	require.False(t, upstream.called)
 }
 
+func TestProxyLookup_SkipsRemoteGetAfterTimeBudget(t *testing.T) {
+	upstream := &remoteBudgetStub{getTotalTime: time.Second}
+
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	resps := make(chan cacheprog.Response, 1)
+	proxy := NewProxy(store, upstream, resps, ProxyParams{
+		MaxRemoteGetTime: 500 * time.Millisecond,
+	})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	proxy.Lookup(cacheprog.Request{ID: 1, ActionID: "missing"})
+
+	resp := <-resps
+	require.True(t, resp.Miss)
+	require.False(t, upstream.getCalled)
+}
+
 func TestProxyStats_HitBreakdown(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
@@ -185,4 +206,54 @@ func (p *preloaderStub) Put(values cache.Response) error {
 func (p *preloaderStub) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
 	p.called = true
 	return nil
+}
+
+type remoteBudgetStub struct {
+	getCalled    bool
+	getTotalTime time.Duration
+}
+
+func (r *remoteBudgetStub) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
+	r.getCalled = true
+	return nil
+}
+
+func (r *remoteBudgetStub) Put(values cache.Response) error {
+	return nil
+}
+
+func (r *remoteBudgetStub) GetTotalTime() time.Duration {
+	return r.getTotalTime
+}
+
+func (r *remoteBudgetStub) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string, replaceChanges bool) error {
+	return nil
+}
+
+func (r *remoteBudgetStub) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
+	return nil
+}
+
+func (r *remoteBudgetStub) Stats() map[string]string {
+	return map[string]string{}
+}
+
+func (r *remoteBudgetStub) LastPreloadSources() string {
+	return ""
+}
+
+func (r *remoteBudgetStub) LastPreloadTimings() (string, string, string) {
+	return "", "", ""
+}
+
+func (r *remoteBudgetStub) Head(req cache.Request) (cache.Response, error) {
+	return cache.Response{}, nil
+}
+
+func (r *remoteBudgetStub) Close() error {
+	return nil
+}
+
+func (r *remoteBudgetStub) ReaderFrom(body io.Reader, cb func(item cache.ResponseItem, body io.Reader) error) (int64, error) {
+	return 0, nil
 }
