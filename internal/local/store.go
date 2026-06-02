@@ -26,12 +26,15 @@ type Store struct {
 	dir           string
 	compress      bool
 	maxDiskBytes  int64
+	maxFileBytes  int64
 	evictionDelay time.Duration
 
 	mu                    sync.Mutex
 	index                 map[string]indexEntry
 	outputRefs            map[string]int
 	outputSizes           map[string]int64
+	dirty                 bool
+	ready                 bool
 	currentDiskBytes      int64
 	evictionScheduled     bool
 	lastEvictionUnixMicro int64
@@ -78,6 +81,12 @@ func WithMaxDiskBytes(maxDiskBytes int64) StoreOption {
 	}
 }
 
+func WithMaxFileBytes(maxFileBytes int64) StoreOption {
+	return func(s *Store) {
+		s.maxFileBytes = maxFileBytes
+	}
+}
+
 func WithEvictionDelay(evictionDelay time.Duration) StoreOption {
 	return func(s *Store) {
 		s.evictionDelay = evictionDelay
@@ -105,6 +114,7 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	d, err := os.ReadFile(indexPath) //nolint:gosec // indexPath is derived from the configured cache dir.
 	if err != nil {
 		if os.IsNotExist(err) {
+			dc.ready = true
 			return dc, nil
 		}
 		return nil, fmt.Errorf("read %s: %w", indexPath, err)
@@ -114,10 +124,19 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal %s: %w", indexPath, err)
 	}
+	if dc.maxFileBytes > 0 {
+		for actionID, ie := range dc.index {
+			if ie.Size > dc.maxFileBytes {
+				delete(dc.index, actionID)
+				dc.dirty = true
+			}
+		}
+	}
 
 	if err := dc.rebuildStorageState(); err != nil {
 		return nil, err
 	}
+	dc.ready = true
 
 	return dc, nil
 }
@@ -171,10 +190,15 @@ func (dc *Store) getOne(actionID string) cache.ResponseItem {
 
 		return cache.ResponseItem{ActionID: actionID, Miss: true}
 	}
+	if dc.maxFileBytes > 0 && ie.Size > dc.maxFileBytes {
+		atomic.AddInt64(&dc.misses, 1)
+		return cache.ResponseItem{ActionID: actionID, Miss: true}
+	}
 
 	atomic.AddInt64(&dc.hits, 1)
 	ie.AccessTimeMicro = time.Now().UTC().UnixMicro()
 	dc.index[actionID] = ie
+	dc.dirty = true
 
 	return dc.responseItem(actionID, ie)
 }
@@ -205,6 +229,10 @@ func (dc *Store) Put(values cache.Response) error {
 }
 
 func (dc *Store) putOne(item cache.ResponseItem) error {
+	if dc.maxFileBytes > 0 && item.Size > dc.maxFileBytes {
+		return nil
+	}
+
 	outputFile := dc.OutputFilename(item.OutputID)
 	now := time.Now().UTC()
 
@@ -281,6 +309,7 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 		dc.addOutputRefLocked(ie.OutputID, newStoredSize)
 	}
 	dc.index[item.ActionID] = ie
+	dc.dirty = true
 	dc.scheduleEvictionLocked()
 
 	atomic.AddInt64(&dc.putsCompleted, 1)
@@ -315,13 +344,32 @@ func writeAtomic(outputFile string, rd io.Reader) (err error) {
 	return os.Rename(outputFile+".tmp", outputFile)
 }
 
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return fmt.Errorf("mkdir output dir: %w", err)
+	}
+	if err := os.WriteFile(path+".tmp", data, mode); err != nil {
+		return err
+	}
+	return os.Rename(path+".tmp", path)
+}
+
 func (dc *Store) Close() error {
+	if !dc.ready || !dc.dirty {
+		return nil
+	}
+
 	d, err := json.Marshal(dc.index)
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(dc.indexPath(), d, 0o600)
+	if err := writeFileAtomic(dc.indexPath(), d, 0o600); err != nil {
+		return err
+	}
+
+	dc.dirty = false
+	return nil
 }
 
 func (dc *Store) OutputFilename(outputID string) string {
@@ -736,6 +784,7 @@ func (dc *Store) evictIfNeededLocked() {
 		delete(dc.index, evictActionID)
 		dc.releaseOutputRefLocked(evictEntry.OutputID)
 		dc.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
+		dc.dirty = true
 		log.Printf("evicted cache entry action_id=%s output_id=%s current_disk_bytes=%d max_disk_bytes=%d", evictActionID, evictEntry.OutputID, dc.currentDiskBytes, dc.maxDiskBytes)
 	}
 }

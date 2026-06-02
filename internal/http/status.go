@@ -23,6 +23,12 @@ func (h *Handler) Status(rw http.ResponseWriter, _ *http.Request) {
 		resp["store"] = stats
 	}
 
+	if s, ok := any(h.gocacheStore).(statsProvider); ok && h.gocacheStore != nil {
+		stats := s.Stats()
+		augmentStatusStats(stats)
+		resp["gocache"] = stats
+	}
+
 	httpStats := h.Stats()
 	if len(httpStats) > 0 {
 		resp["http"] = httpStats

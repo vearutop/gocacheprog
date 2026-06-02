@@ -195,6 +195,46 @@ func TestStorePut_WritesEntriesUnderPrefixedDir(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestStoreMaxFileBytes_SkipsPutAndServe(t *testing.T) {
+	dir := t.TempDir()
+
+	unlimitedStore, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, unlimitedStore.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("smallAction", "smallOutput", "1234", &now),
+		testItem("largeAction", "largeOutput", "123456", &now),
+	}}))
+	require.NoError(t, unlimitedStore.Close())
+
+	limitedStore, err := NewStore(dir, WithCompression(), WithMaxFileBytes(5))
+	require.NoError(t, err)
+
+	var got []string
+	require.NoError(t, limitedStore.Get(cache.Request{ActionIDs: []string{"smallAction", "largeAction"}}, func(resp cache.ResponseItem) {
+		if !resp.Miss {
+			got = append(got, resp.ActionID)
+		}
+	}))
+	require.Equal(t, []string{"smallAction"}, got)
+
+	limitedPutStore, err := NewStore(t.TempDir(), WithCompression(), WithMaxFileBytes(5))
+	require.NoError(t, err)
+	require.NoError(t, limitedPutStore.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("smallAction", "smallOutput", "1234", &now),
+		testItem("largeAction", "largeOutput", "123456", &now),
+	}}))
+
+	var gotAfterPut []string
+	require.NoError(t, limitedPutStore.Get(cache.Request{ActionIDs: []string{"smallAction", "largeAction"}}, func(resp cache.ResponseItem) {
+		if !resp.Miss {
+			gotAfterPut = append(gotAfterPut, resp.ActionID)
+		}
+	}))
+	require.Equal(t, []string{"smallAction"}, gotAfterPut)
+}
+
 func TestStoreEvictsLeastRecentlyUsedWhenSizeLimitExceeded(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewStore(dir, WithCompression(), WithMaxDiskBytes(10), WithEvictionDelay(10*time.Millisecond))

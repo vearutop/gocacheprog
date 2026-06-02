@@ -11,6 +11,7 @@
 
 - a direct `GOCACHEPROG` helper
 - a local daemon + shim pair for CI
+- a batch restore/save tool for native `GOCACHE`
 - a remote HTTP cache server when started with `-listen`
 
 The project is aimed at large CI workloads where:
@@ -25,6 +26,7 @@ At a high level:
 
 - `gocacheprog -listen ...` stores cached Go action results and serves them over HTTP
 - `gocacheprog` keeps a local on-disk cache and proxies misses to the remote server
+- `gocacheprog -restore-cache` and `-save-cache` sync native `GOCACHE` files in batch mode
 - preload can pull a relevant working set into the local cache before the build starts
 - cache usage manifests store the list of cached entries actually used by a build, so later runs can preload only likely-needed entries
 
@@ -54,11 +56,12 @@ rm linux_amd64.tar.gz
 
 ## Modes
 
-`gocacheprog` has three practical modes selected by `-listen` and `-remote-url`:
+`gocacheprog` has four practical modes:
 
 1. Direct mode
 2. Daemon mode
 3. Shim mode
+4. Native `GOCACHE` batch mode
 
 Important flags:
 
@@ -72,7 +75,22 @@ Important flags:
 - `-build-type`
 - `-base-commit`
 - `-parent-commit`
+- `-max-file-bytes`
 - `-canonicalize-timestamps`
+
+Important batch-mode flags:
+
+- `-restore-cache`
+- `-save-cache`
+- `-max-file-bytes`
+- `-save-cache-chunk-bytes`
+- `-cache-dir`
+- `-remote-url`
+- `-commit`
+- `-changes-id`
+- `-build-type`
+- `-base-commit`
+- `-parent-commit`
 
 ### Direct Mode
 
@@ -163,9 +181,65 @@ Why this is better:
 - shim talks to daemon over Unix socket with no local batching delay
 - daemon returns its own local `DiskPath`, and shim passes that through to the Go tool
 
+### Native `GOCACHE` Batch Mode
+
+This mode does not use `GOCACHEPROG` during the build.
+
+Instead:
+
+1. `gocacheprog -restore-cache` preloads likely-needed native cache files into a local `GOCACHE` directory
+2. Go commands run against that local `GOCACHE` normally
+3. `gocacheprog -save-cache` uploads freshly created native cache files after the build
+
+Example:
+
+```bash
+GOCACHE_DIR=./build-gocache
+
+/path/to/gocacheprog \
+  -restore-cache \
+  -cache-dir "${GOCACHE_DIR}" \
+  -remote-url https://cache.example.com \
+  -commit "$COMMIT" \
+  -changes-id "$CHANGES_ID" \
+  -build-type unit \
+  -base-commit "$BASE_COMMIT"
+
+export GOCACHE="${GOCACHE_DIR}"
+go test ./...
+
+/path/to/gocacheprog \
+  -save-cache \
+  -cache-dir "${GOCACHE_DIR}" \
+  -remote-url https://cache.example.com \
+  -commit "$COMMIT" \
+  -changes-id "$CHANGES_ID" \
+  -build-type unit \
+  -base-commit "$BASE_COMMIT"
+```
+
+Why this mode exists:
+
+- no remote cache roundtrips on the build hot path
+- native local `GOCACHE` behavior during the build
+- finer-grained restore/save than archive-style CI cache blobs
+- remote storage still uses compression and manifest-targeted restore
+
+How it works:
+
+- manifests contain relative native `GOCACHE` file paths, not `ActionID`s
+- restore streams matching files from the remote server and materializes native cache files locally
+- local restore preserves file contents and executable permission bits, but intentionally does not restore historical mtimes
+- `-max-file-bytes` can skip pathological large single cache files during both native restore and native save
+- save walks the local `GOCACHE` tree, skips files that were already restored in this job, compresses payloads client-side, and streams them to the server
+- the server stores compressed file objects and merges uploaded file paths into the relevant manifests; when the server also runs with `-max-file-bytes`, oversized objects are silently skipped on save and treated as misses on restore
+- large `-save-cache` uploads are split into outer HTTP chunks, so the mode can work behind restrictive reverse proxies such as default nginx `client_max_body_size=1m`
+
+In `GOCACHEPROG` mode, `-max-file-bytes` also skips remote `Put` uploads for oversized cache entries while still keeping them in the local cache. When the server is started with the same flag, oversized entries are also not stored in or served from the remote cache.
+
 ## Recommended CI Shape
 
-The sample workflow in [sample-workflow.yml](sample-workflow.yml) shows the intended GitHub Actions setup:
+For daemon + shim mode, the sample workflow in [sample-workflow.yml](sample-workflow.yml) shows the intended GitHub Actions setup:
 
 1. download `gocacheprog`
 2. canonicalize timestamps
@@ -173,6 +247,15 @@ The sample workflow in [sample-workflow.yml](sample-workflow.yml) shows the inte
 4. export `GOCACHEPROG` as shim mode
 5. run all Go tools
 6. stop daemon in an `always()` step
+
+For native batch mode, [sample-gocache-workflow.yml](sample-gocache-workflow.yml) shows the corresponding shape:
+
+1. download `gocacheprog`
+2. canonicalize timestamps
+3. restore native `GOCACHE`
+4. export `GOCACHE`
+5. run all Go tools normally
+6. save native `GOCACHE` in an `always()` step
 
 ## Timestamp Canonicalization
 
@@ -202,6 +285,8 @@ This is useful when:
 The server stores manifest sidecars separately from cache entries.
 
 Each manifest is a newline-delimited list of `ActionID`s that were actually used by a build or test run.
+
+In native `GOCACHE` batch mode, manifests instead contain relative native cache file paths.
 
 Scopes:
 
@@ -243,7 +328,7 @@ ${{ github.repository }}#${{ github.event.pull_request.number }}
 
 It is the preferred long-lived reuse key for PR-style CI.
 
-The `changes-id` manifest is treated as the most recent known manifest for that change stream and is overwritten on each fresh run.
+In both modes, `changes-id` is a rolling reuse key. In native `GOCACHE` batch mode it currently merges like `commit` rather than replacing prior state.
 
 ### `-build-type`
 
@@ -275,7 +360,7 @@ In daemon mode, this is intentionally separate from the local cache layout:
 
 There is a subtle CI edge case when one script runs many `go` invocations.
 
-Behavior:
+Behavior in `GOCACHEPROG` mode:
 
 - if local cache was empty at helper startup:
   - `changes-id` manifest is replaced on upload
@@ -285,6 +370,8 @@ Behavior:
   - this avoids secondary `go` invocations in the same job clobbering the first one
 
 `commit` manifests are merged/appended rather than treated as rolling pointers.
+
+In native `GOCACHE` batch mode, both `commit` and `changes-id` manifests are merged.
 
 In daemon mode this becomes naturally simpler because one daemon owns the whole local session.
 
@@ -313,6 +400,20 @@ Server mode supports a total on-disk cache size limit:
 ```bash
 gocacheprog -listen :8080 -max-disk-bytes 5000000000
 ```
+
+Native `GOCACHE` storage has a separate quota:
+
+```bash
+gocacheprog -listen :8080 -gocache-max-disk-bytes 5000000000
+```
+
+Native `GOCACHE` storage also has an age-based retirement policy, defaulting to `48h`:
+
+```bash
+gocacheprog -listen :8080 -gocache-max-age 48h
+```
+
+Set `-gocache-max-age 0` to disable age-based retirement.
 
 Eviction policy:
 
@@ -366,6 +467,46 @@ It returns JSON with:
   - heap in use
 
 Byte sizes are also humanized in the JSON.
+
+### Native cache admin endpoints
+
+When server mode has native `GOCACHE` storage enabled, two authenticated admin endpoints are available:
+
+- `/inspect?build-type=...`
+- `/clear?build-type=...`
+
+Optional identity narrowing:
+
+- `commit=...`
+- `changes-id=...`
+
+Examples:
+
+```text
+/inspect?build-type=backend-generate-check
+/inspect?build-type=backend-unit&changes-id=owner/repo-123
+/clear?build-type=backend-unit&commit=abcdef123456
+```
+
+`/inspect` returns JSON with:
+
+- manifest count
+- referenced file count
+- total compressed and uncompressed size
+- max file size
+- count and total size for files in the top 10% size band
+
+`/clear` removes matching manifests and deletes native cache objects only when they are no longer referenced by any remaining manifest.
+
+### Native restore/save summaries
+
+Native batch mode logs completion summaries that include:
+
+- file count
+- transfer time
+- compressed and uncompressed bytes
+- restore sources
+- server-side timing fields such as `server_prepare_time` and `server_total_time` when available
 
 ### Preload logs
 

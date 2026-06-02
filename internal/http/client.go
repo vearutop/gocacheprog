@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,9 +20,12 @@ import (
 
 	"github.com/vearutop/dynhist-go"
 	"github.com/vearutop/gocacheprog/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/gocache"
 )
 
 var gatewayRetryDelay = 5 * time.Second
+
+const DefaultSaveCacheChunkBytes int64 = 900 * 1024
 
 const (
 	headerSessionID          = "X-Gocacheprog-Session-Id"
@@ -37,6 +41,9 @@ const (
 	headerPreloadQueueWait   = "X-Gocacheprog-Preload-Queue-Wait"
 	headerPreloadPrepareTime = "X-Gocacheprog-Preload-Prepare-Time"
 	headerPreloadTotalTime   = "X-Gocacheprog-Preload-Total-Time"
+	headerRestorePrepareTime = "X-Gocacheprog-Restore-Prepare-Time"
+	headerRestoreTotalTime   = "X-Gocacheprog-Restore-Total-Time"
+	headerSaveTotalTime      = "X-Gocacheprog-Save-Total-Time"
 )
 
 type SessionInfo struct {
@@ -73,11 +80,17 @@ type Client struct {
 	getTotalNs   int64
 	putCnt       int64
 
+	saveCacheMaxRequestBytes int64
+
 	mu                     sync.Mutex
 	lastPreloadSources     string
 	lastPreloadQueueWait   string
 	lastPreloadPrepareTime string
 	lastPreloadTotalTime   string
+	lastRestoreSources     string
+	lastRestorePrepareTime string
+	lastRestoreTotalTime   string
+	lastSaveTotalTime      string
 }
 
 func NewClient(baseURL string, authToken string) (*Client, error) {
@@ -106,6 +119,8 @@ func NewClientWithSession(baseURL string, authToken string, sessionInfo *Session
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true,
 	}
+
+	client.saveCacheMaxRequestBytes = DefaultSaveCacheChunkBytes
 
 	d := &net.Dialer{
 		Timeout:   30 * time.Second,
@@ -273,6 +288,308 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	atomic.StoreInt64(&c.bytesWritten, 0)
 
 	return err
+}
+
+func (c *Client) RestoreCache(req gocache.Request, cb func(item gocache.FileItem, body io.Reader) error) (gocache.TransferStats, error) {
+	startedAt := time.Now()
+	r, err := http.NewRequest(http.MethodGet, c.baseURL+"/restore-cache?"+gocacheQuery(req).Encode(), nil)
+	if err != nil {
+		return gocache.TransferStats{}, err
+	}
+	setAuthHeader(r, c.authToken)
+
+	res, err := c.roundTrip(r)
+	if err != nil {
+		return gocache.TransferStats{}, err
+	}
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close restore-cache body: %s", err.Error())
+		}
+	}()
+
+	if err := checkStatus(res, http.StatusOK, "restore-cache"); err != nil {
+		return gocache.TransferStats{}, err
+	}
+
+	c.mu.Lock()
+	c.lastRestoreSources = strings.TrimSpace(res.Header.Get(headerRestoreSources))
+	c.lastRestorePrepareTime = strings.TrimSpace(res.Header.Get(headerRestorePrepareTime))
+	c.lastRestoreTotalTime = strings.TrimSpace(res.Header.Get(headerRestoreTotalTime))
+	c.mu.Unlock()
+
+	var stats gocache.TransferStats
+	_, err = gocache.ReadStream(res.Body, func(item gocache.FileItem, body io.Reader) error {
+		stats.Files++
+		stats.UncompressedBytes += item.Size
+		if item.WireSize != 0 {
+			stats.CompressedBytes += item.WireSize
+		} else {
+			stats.CompressedBytes += item.Size
+		}
+
+		if body != nil {
+			data, err := io.ReadAll(body)
+			if err != nil {
+				return err
+			}
+			item.SetBodyReader(func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(data)), nil
+			})
+
+			rd, err := item.UncompressedBodyReader()
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if closeErr := rd.Close(); closeErr != nil {
+					log.Printf("close restore-cache decoded reader: %s", closeErr.Error())
+				}
+			}()
+
+			return cb(item, rd)
+		}
+
+		return cb(item, nil)
+	})
+	c.mu.Lock()
+	if totalTime := strings.TrimSpace(res.Trailer.Get(headerRestoreTotalTime)); totalTime != "" {
+		c.lastRestoreTotalTime = totalTime
+	}
+	c.mu.Unlock()
+	stats.Duration = time.Since(startedAt)
+	return stats, err
+}
+
+func (c *Client) SaveCache(req gocache.Request, batch gocache.Batch) (gocache.TransferStats, error) {
+	atomic.AddInt64(&c.putCnt, 1)
+	startedAt := time.Now()
+	if len(batch.Items) == 0 {
+		return gocache.TransferStats{Duration: time.Since(startedAt)}, nil
+	}
+
+	uploadID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10) + "-" + strconv.Itoa(os.Getpid())
+	if err := c.startSaveCache(req, uploadID); err != nil {
+		return gocache.TransferStats{}, err
+	}
+
+	maxRequestBytes := c.saveCacheMaxRequestBytes
+	if maxRequestBytes <= 0 {
+		maxRequestBytes = DefaultSaveCacheChunkBytes
+	}
+
+	var (
+		stats             gocache.TransferStats
+		writerErrCh       = make(chan error, 1)
+		writerFiles       int64
+		writerWireBytes   int64
+		writerSourceBytes int64
+	)
+
+	pr, pw := io.Pipe()
+	go func() {
+		sw := gocache.NewStreamWriter(pw)
+		for _, item := range batch.Items {
+			atomic.AddInt64(&writerFiles, 1)
+			atomic.AddInt64(&writerSourceBytes, item.Size)
+
+			item, err := prepareSaveCacheItem(item)
+			if err != nil {
+				_ = pw.CloseWithError(err)
+				writerErrCh <- err
+				return
+			}
+			atomic.AddInt64(&writerWireBytes, wireBodySize(item))
+
+			if err := sw.WriteItem(item); err != nil {
+				_ = pw.CloseWithError(err)
+				writerErrCh <- err
+				return
+			}
+		}
+
+		if err := sw.Close(); err != nil {
+			_ = pw.CloseWithError(err)
+			writerErrCh <- err
+			return
+		}
+
+		if err := pw.Close(); err != nil {
+			log.Printf("close save-cache stream pipe writer: %s", err.Error())
+		}
+		writerErrCh <- nil
+	}()
+
+	buf := make([]byte, maxRequestBytes)
+	for {
+		n, err := io.ReadFull(pr, buf)
+		if n > 0 {
+			if chunkErr := c.saveCacheChunk(req, uploadID, buf[:n]); chunkErr != nil {
+				logAbortSaveCacheError(c.abortSaveCache(req, uploadID))
+				return gocache.TransferStats{}, chunkErr
+			}
+		}
+
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
+
+		logAbortSaveCacheError(c.abortSaveCache(req, uploadID))
+		return gocache.TransferStats{}, err
+	}
+
+	if writerErr := <-writerErrCh; writerErr != nil {
+		logAbortSaveCacheError(c.abortSaveCache(req, uploadID))
+		return gocache.TransferStats{}, writerErr
+	}
+
+	if err := c.finalizeSaveCache(req, uploadID); err != nil {
+		logAbortSaveCacheError(c.abortSaveCache(req, uploadID))
+		return gocache.TransferStats{}, err
+	}
+
+	stats.Files = int(atomic.LoadInt64(&writerFiles))
+	stats.CompressedBytes = atomic.LoadInt64(&writerWireBytes)
+	stats.UncompressedBytes = atomic.LoadInt64(&writerSourceBytes)
+	stats.Duration = time.Since(startedAt)
+	return stats, nil
+}
+
+func prepareSaveCacheItem(item gocache.FileItem) (gocache.FileItem, error) {
+	if item.Size < cache.MinCompressionSize {
+		if item.WireSize == 0 {
+			item.WireSize = item.Size
+		}
+		return item, nil
+	}
+
+	rd, err := item.CompressedBodyReader()
+	if err != nil {
+		return item, err
+	}
+
+	data, err := io.ReadAll(rd)
+	if closeErr := rd.Close(); closeErr != nil {
+		log.Printf("close save-cache compressed reader: %s", closeErr.Error())
+	}
+	if err != nil {
+		return item, err
+	}
+
+	item.IsCompressed = true
+	item.WireSize = int64(len(data))
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	})
+
+	return item, nil
+}
+
+func wireBodySize(item gocache.FileItem) int64 {
+	if item.WireSize > 0 {
+		return item.WireSize
+	}
+
+	return item.Size
+}
+
+func logAbortSaveCacheError(err error) {
+	if err != nil {
+		log.Print("abort save-cache upload failed")
+	}
+}
+
+func (c *Client) startSaveCache(req gocache.Request, uploadID string) error {
+	return c.postSaveCacheControl(req, uploadID, "/save-cache-start", "save-cache-start")
+}
+
+func (c *Client) saveCacheChunk(req gocache.Request, uploadID string, chunk []byte) error {
+	r, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.baseURL+"/save-cache-chunk?"+saveCacheQuery(req, uploadID).Encode(), bytes.NewReader(chunk))
+	if err != nil {
+		return err
+	}
+	setAuthHeader(r, c.authToken)
+
+	res, err := c.roundTrip(r)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close save-cache chunk body: %s", err.Error())
+		}
+	}()
+
+	return checkStatus(res, http.StatusNoContent, "save-cache-chunk")
+}
+
+func (c *Client) finalizeSaveCache(req gocache.Request, uploadID string) error {
+	return c.postSaveCacheControl(req, uploadID, "/save-cache-finalize", "save-cache-finalize")
+}
+
+func (c *Client) abortSaveCache(req gocache.Request, uploadID string) error {
+	return c.postSaveCacheControl(req, uploadID, "/save-cache-abort", "save-cache-abort")
+}
+
+func (c *Client) postSaveCacheControl(req gocache.Request, uploadID, path, op string) error {
+	r, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.baseURL+path+"?"+saveCacheQuery(req, uploadID).Encode(), nil)
+	if err != nil {
+		return err
+	}
+	setAuthHeader(r, c.authToken)
+
+	res, err := c.roundTrip(r)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close %s body: %s", op, err.Error())
+		}
+	}()
+
+	c.mu.Lock()
+	c.lastSaveTotalTime = strings.TrimSpace(res.Header.Get(headerSaveTotalTime))
+	c.mu.Unlock()
+
+	return checkStatus(res, http.StatusNoContent, op)
+}
+
+func gocacheQuery(req gocache.Request) url.Values {
+	v := url.Values{}
+	if req.Commit != "" {
+		v.Set("commit", req.Commit)
+	}
+	if req.ChangesID != "" {
+		v.Set("changes-id", req.ChangesID)
+	}
+	if req.BuildType != "" {
+		v.Set("build-type", req.BuildType)
+	}
+	if req.BaseCommit != "" {
+		v.Set("base-commit", req.BaseCommit)
+	}
+	if req.ParentCommit != "" {
+		v.Set("parent-commit", req.ParentCommit)
+	}
+	if req.MaxFileBytes > 0 {
+		v.Set("max-file-bytes", strconv.FormatInt(req.MaxFileBytes, 10))
+	}
+	return v
+}
+
+func saveCacheQuery(req gocache.Request, uploadID string) url.Values {
+	v := gocacheQuery(req)
+	if uploadID != "" {
+		v.Set("upload-id", uploadID)
+	}
+	return v
 }
 
 func (c *Client) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string, replaceChanges bool) error {
@@ -557,6 +874,35 @@ func (c *Client) LastPreloadSources() string {
 	defer c.mu.Unlock()
 
 	return c.lastPreloadSources
+}
+
+func (c *Client) SetSaveCacheChunkBytes(maxBytes int64) {
+	if maxBytes <= 0 {
+		maxBytes = DefaultSaveCacheChunkBytes
+	}
+
+	c.saveCacheMaxRequestBytes = maxBytes
+}
+
+func (c *Client) LastRestoreSources() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.lastRestoreSources
+}
+
+func (c *Client) LastRestoreTimings() (prepareTime string, totalTime string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.lastRestorePrepareTime, c.lastRestoreTotalTime
+}
+
+func (c *Client) LastSaveTiming() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.lastSaveTotalTime
 }
 
 func (c *Client) LastPreloadTimings() (queueWait string, prepareTime string, totalTime string) {

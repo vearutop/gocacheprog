@@ -153,6 +153,32 @@ func TestProxyStats_HitBreakdown(t *testing.T) {
 	require.Equal(t, "50.0%", stats["miss_rate"])
 }
 
+func TestProxyClose_SkipsRemotePutAboveMaxFileBytes(t *testing.T) {
+	upstream := &putRecorderStub{}
+
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
+		MaxFileBytes: 5,
+	})
+
+	proxy.Put(cacheprog.Request{
+		ActionID: "small",
+		OutputID: "small-out",
+		BodySize: 5,
+	}, []byte("12345"))
+	proxy.Put(cacheprog.Request{
+		ActionID: "large",
+		OutputID: "large-out",
+		BodySize: 6,
+	}, []byte("123456"))
+
+	require.NoError(t, proxy.Close())
+	require.Len(t, upstream.items, 1)
+	require.Equal(t, "small", upstream.items[0].ActionID)
+	require.Equal(t, "1", proxy.Stats()["skipped_puts"])
+}
+
 type usageRecorderStub struct {
 	called         bool
 	commit         string
@@ -188,6 +214,23 @@ func (noopStore) Get(req cache.Request, cb func(resp cache.ResponseItem)) error 
 }
 
 func (noopStore) Put(values cache.Response) error {
+	return nil
+}
+
+type putRecorderStub struct {
+	items []cache.ResponseItem
+}
+
+func (p *putRecorderStub) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
+	return nil
+}
+
+func (p *putRecorderStub) Put(values cache.Response) error {
+	p.items = append(p.items, values.Items...)
+	return nil
+}
+
+func (p *putRecorderStub) PostCacheUsed(commit string, changesID string, buildType string, actionIDs []string, replaceChanges bool) error {
 	return nil
 }
 

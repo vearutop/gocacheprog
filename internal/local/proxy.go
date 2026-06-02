@@ -39,6 +39,7 @@ type Proxy struct {
 	puts        int64
 	putsExist   int64
 	batchPuts   int64
+	skippedPuts int64
 
 	usedMu               sync.Mutex
 	usedActionIDs        map[string]struct{}
@@ -63,6 +64,7 @@ type ProxyParams struct {
 	SkipPreload      bool
 	MaxRemoteGetTime time.Duration
 	PreloadSize      int64
+	MaxFileBytes     int64
 	DisableCacheUsed bool
 }
 
@@ -510,6 +512,12 @@ func (dc *Proxy) consumePut() {
 			})
 		}
 
+		if dc.params.MaxFileBytes > 0 && item.Size > dc.params.MaxFileBytes {
+			atomic.AddInt64(&dc.skippedPuts, 1)
+			dc.logf("skip upstream put for %s: size=%d exceeds max-file-bytes=%d", item.ActionID, item.Size, dc.params.MaxFileBytes)
+			continue
+		}
+
 		puts = append(puts, item)
 		sumSize += int(item.Size)
 
@@ -794,6 +802,7 @@ func (dc *Proxy) Stats() map[string]string {
 		"miss_rate":           percent(misses, lookups),
 		"puts":                strconv.FormatInt(atomic.LoadInt64(&dc.puts), 10),
 		"putsExist":           strconv.FormatInt(atomic.LoadInt64(&dc.putsExist), 10),
+		"skipped_puts":        strconv.FormatInt(atomic.LoadInt64(&dc.skippedPuts), 10),
 	}
 
 	return stats

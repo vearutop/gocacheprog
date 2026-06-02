@@ -1,0 +1,74 @@
+name: test-unit-gocache
+on:
+  pull_request:
+env:
+  GO111MODULE: "on"
+jobs:
+  test:
+    strategy:
+      matrix:
+        go-version: [ stable ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download gocacheprog
+        run: |
+          wget -q -O /tmp/gocacheprog https://github.com/vearutop/gocacheprog/releases/download/dev/gocacheprog
+          chmod +x /tmp/gocacheprog
+
+      # Go test cache includes file mtimes for some repo-local inputs.
+      # Canonicalize them so fresh CI checkouts get stable cache keys.
+      - name: Canonicalize Timestamps
+        run: |
+          /tmp/gocacheprog -canonicalize-timestamps .
+
+      - name: Restore Native GOCACHE
+        run: |
+          BASE_COMMIT="${{ github.event.pull_request.base.sha }}"
+          COMMIT="${{ github.event.pull_request.head.sha }}"
+          CHANGES_ID="${{ github.repository }}#${{ github.event.pull_request.number }}"
+          BUILD_TYPE="unit"
+          GOCACHE_DIR="${{ github.workspace }}/build-gocache"
+
+          /tmp/gocacheprog \
+            -restore-cache \
+            -cache-dir "${GOCACHE_DIR}" \
+            -remote-url https://eq.p1cs.art \
+            -commit "${COMMIT}" \
+            -changes-id "${CHANGES_ID}" \
+            -build-type "${BUILD_TYPE}" \
+            -base-commit "${BASE_COMMIT}"
+
+          {
+            echo "GOCACHE=${GOCACHE_DIR}"
+            echo "GOCACHE_REMOTE_URL=https://eq.p1cs.art"
+            echo "GOCACHE_BUILD_TYPE=${BUILD_TYPE}"
+            echo "GOCACHE_COMMIT=${COMMIT}"
+            echo "GOCACHE_CHANGES_ID=${CHANGES_ID}"
+            echo "GOCACHE_BASE_COMMIT=${BASE_COMMIT}"
+          } >> "$GITHUB_ENV"
+
+      - name: Test
+        shell: bash
+        run: |
+          time go test -parallel 50 ./...
+
+      - name: Save Native GOCACHE
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          /tmp/gocacheprog \
+            -save-cache \
+            -cache-dir "${GOCACHE}" \
+            -remote-url "${GOCACHE_REMOTE_URL}" \
+            -commit "${GOCACHE_COMMIT}" \
+            -changes-id "${GOCACHE_CHANGES_ID}" \
+            -build-type "${GOCACHE_BUILD_TYPE}" \
+            -base-commit "${GOCACHE_BASE_COMMIT}"

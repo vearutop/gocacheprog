@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vearutop/gocacheprog/internal/cache"
 	"github.com/vearutop/gocacheprog/internal/cacheprog"
+	"github.com/vearutop/gocacheprog/internal/gocache"
 	"github.com/vearutop/gocacheprog/internal/http"
 	"github.com/vearutop/gocacheprog/internal/local"
 )
@@ -142,6 +143,98 @@ func TestClient_PostCacheUsed(t *testing.T) {
 	b, err = os.ReadFile(filepath.Join(dir, "manifests", "buildtype-unit", "changes", "re", "repo%2Fpr-123"))
 	require.NoError(t, err)
 	require.Equal(t, "actionId2\nactionId1\nactionId3\n", string(b))
+}
+
+func TestClient_SaveAndRestoreNativeGOCACHE(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir, local.WithCompression())
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	cacheDir := t.TempDir()
+	now := time.Date(2026, time.May, 14, 9, 30, 0, 0, time.UTC)
+	targetPath := filepath.Join(cacheDir, "ab", "cache-entry-a")
+	require.NoError(t, os.MkdirAll(filepath.Dir(targetPath), 0o750))
+	require.NoError(t, os.WriteFile(targetPath, []byte("native-cache-payload"), 0o600))
+	require.NoError(t, os.Chtimes(targetPath, now, now))
+
+	batch, err := gocache.CollectFreshFiles(cacheDir, 0)
+	require.NoError(t, err)
+	require.Len(t, batch.Items, 1)
+
+	req := gocache.Request{Commit: "commit123", ChangesID: "repo/pr-123", BuildType: "unit"}
+	saveStats, err := client.SaveCache(req, batch)
+	require.NoError(t, err)
+	require.Equal(t, 1, saveStats.Files)
+	require.NotZero(t, saveStats.Duration)
+
+	restoreDir := t.TempDir()
+	restoreStats, err := client.RestoreCache(req, func(item gocache.FileItem, body io.Reader) error {
+		return gocache.RestoreToDir(restoreDir, item, body)
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, restoreStats.Files)
+	require.NotZero(t, restoreStats.Duration)
+	require.Equal(t, "commit,changes", client.LastRestoreSources())
+
+	restoredPath := filepath.Join(restoreDir, "ab", "cache-entry-a")
+	body, err := os.ReadFile(restoredPath)
+	require.NoError(t, err)
+	require.Equal(t, "native-cache-payload", string(body))
+
+	info, err := os.Stat(restoredPath)
+	require.NoError(t, err)
+	require.NotEqual(t, now.Unix(), info.ModTime().Unix())
+}
+
+func TestClient_SaveCache_ChunksAndFinalizes(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir, local.WithCompression())
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+	client.SetSaveCacheChunkBytes(128)
+
+	cacheDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "ab"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "a"), []byte(strings.Repeat("a", 40)), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "b"), []byte(strings.Repeat("b", 40)), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "c"), []byte(strings.Repeat("c", 40)), 0o600))
+
+	batch, err := gocache.CollectFreshFiles(cacheDir, 0)
+	require.NoError(t, err)
+	require.Len(t, batch.Items, 3)
+
+	req := gocache.Request{Commit: "commit123", ChangesID: "repo/pr-123", BuildType: "unit"}
+	stats, err := client.SaveCache(req, batch)
+	require.NoError(t, err)
+	require.Equal(t, 3, stats.Files)
+
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "co", "commit123")
+	changesManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "changes", "re", "repo%2Fpr-123")
+
+	commitBody, err := os.ReadFile(commitManifestPath)
+	require.NoError(t, err)
+	require.Equal(t, "ab/a\nab/b\nab/c\n", string(commitBody))
+
+	changesBody, err := os.ReadFile(changesManifestPath)
+	require.NoError(t, err)
+	require.Equal(t, "ab/a\nab/b\nab/c\n", string(changesBody))
 }
 
 func TestPreload_UsesCommitManifestFilters(t *testing.T) {
@@ -363,8 +456,10 @@ func TestStatus(t *testing.T) {
 
 	localStore, err := local.NewStore(dir, local.WithCompression(), local.WithMaxDiskBytes(123456))
 	require.NoError(t, err)
+	gocacheStore, err := gocache.NewStore(filepath.Join(dir, "native"), gocache.WithCompression(), gocache.WithMaxDiskBytes(654321))
+	require.NoError(t, err)
 
-	h := http.NewHandler(localStore, "")
+	h := http.NewHandlerWithPreloadLimit(localStore, gocacheStore, "", 2)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -383,6 +478,12 @@ func TestStatus(t *testing.T) {
 	require.Equal(t, "123456", storeStats["maxDiskBytes"])
 	require.Equal(t, "120.6KB", storeStats["maxDiskBytesHuman"])
 	require.Contains(t, storeStats, "lastEviction")
+
+	gocacheStats, ok := body["gocache"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "654321", gocacheStats["maxDiskBytes"])
+	require.Contains(t, gocacheStats, "maxDiskBytesHuman")
+	require.Contains(t, gocacheStats, "lastEviction")
 
 	runtimeStats, ok := body["runtime"].(map[string]any)
 	require.True(t, ok)

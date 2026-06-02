@@ -298,6 +298,7 @@ func prepareShimListener(network string, addr string) (net.Listener, error) {
 	return ln, nil
 }
 
+//nolint:gocyclo // shim session protocol handling is intentionally centralized.
 func (s *ShimServer) serveConn(conn net.Conn) {
 	s.connMu.Lock()
 	s.conns[conn] = struct{}{}
@@ -635,7 +636,9 @@ func StopShimServer(remoteURL string, authToken string) ([]string, error) {
 		return nil, err
 	}
 	defer func() {
-		_ = conn.Close()
+		if closeErr := conn.Close(); closeErr != nil {
+			log.Printf("close stop shim conn: %s", closeErr.Error())
+		}
 	}()
 
 	enc := json.NewEncoder(conn)

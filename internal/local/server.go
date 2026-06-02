@@ -13,11 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vearutop/gocacheprog/internal/gocache"
 	cachehttp "github.com/vearutop/gocacheprog/internal/http"
 )
 
-func RunServer(listen string, store *Store, authToken string, preloadLimit int) error {
-	h := cachehttp.NewHandlerWithPreloadLimit(store, authToken, preloadLimit)
+func RunServer(listen string, store *Store, nativeStore *gocache.Store, authToken string, preloadLimit int) error {
+	h := cachehttp.NewHandlerWithPreloadLimit(store, nativeStore, authToken, preloadLimit)
 	return serveHTTP(listen, h, store.PrintStats)
 }
 

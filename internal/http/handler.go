@@ -1,38 +1,47 @@
 package http
 
 import (
+	"io"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bool64/dev/version"
 	"github.com/vearutop/gocacheprog/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/gocache"
 )
 
 type Handler struct {
 	store            cache.Store
+	gocacheStore     *gocache.Store
 	authToken        string
 	preloadSem       chan struct{}
+	saveSessionsMu   sync.Mutex
+	saveSessions     map[string]*saveCacheSession
 	preloadInFlight  int64
 	preloadStarted   int64
 	preloadCompleted int64
 }
 
 func NewHandler(store cache.Store, authToken string) *Handler {
-	return NewHandlerWithPreloadLimit(store, authToken, 2)
+	return NewHandlerWithPreloadLimit(store, nil, authToken, 2)
 }
 
-func NewHandlerWithPreloadLimit(store cache.Store, authToken string, preloadLimit int) *Handler {
+func NewHandlerWithPreloadLimit(store cache.Store, gocacheStore *gocache.Store, authToken string, preloadLimit int) *Handler {
 	if preloadLimit < 1 {
 		preloadLimit = 1
 	}
 
 	return &Handler{
-		store:      store,
-		authToken:  authToken,
-		preloadSem: make(chan struct{}, preloadLimit),
+		store:        store,
+		gocacheStore: gocacheStore,
+		authToken:    authToken,
+		preloadSem:   make(chan struct{}, preloadLimit),
+		saveSessions: make(map[string]*saveCacheSession),
 	}
 }
 
@@ -67,6 +76,46 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == "/restore-cache" {
+		h.RestoreCache(rw, r)
+		return
+	}
+
+	if r.URL.Path == "/clear" {
+		h.ClearCache(rw, r)
+		return
+	}
+
+	if r.URL.Path == "/inspect" {
+		h.InspectCache(rw, r)
+		return
+	}
+
+	if r.URL.Path == "/save-cache" {
+		h.SaveCache(rw, r)
+		return
+	}
+
+	if r.URL.Path == "/save-cache-chunk" {
+		h.SaveCacheChunk(rw, r)
+		return
+	}
+
+	if r.URL.Path == "/save-cache-start" {
+		h.StartSaveCache(rw, r)
+		return
+	}
+
+	if r.URL.Path == "/save-cache-finalize" {
+		h.FinalizeSaveCache(rw, r)
+		return
+	}
+
+	if r.URL.Path == "/save-cache-abort" {
+		h.AbortSaveCache(rw, r)
+		return
+	}
+
 	if r.URL.Path == "/put" {
 		h.Put(rw, r)
 		return
@@ -83,6 +132,12 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	http.NotFound(rw, r)
+}
+
+type saveCacheSession struct {
+	writer    io.WriteCloser
+	done      chan error
+	startedAt time.Time
 }
 
 func (h *Handler) authorized(r *http.Request) bool {
