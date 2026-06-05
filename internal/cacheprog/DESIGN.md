@@ -289,7 +289,7 @@ The daemon, not the shim, owns the remote/cache policy flags:
 - `-remote-url`
 - `-auth-token`
 - `-preload`
-- `-preload-size`
+- `-max-file-bytes`
 - `-commit`
 - `-changes-id`
 - `-build-type`

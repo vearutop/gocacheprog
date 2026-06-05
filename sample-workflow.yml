@@ -46,7 +46,7 @@ jobs:
             ${EXTRA_FLAGS} \
             -remote-url https://eq.p1cs.art \
             -preload \
-            -preload-size 3000000 \
+            -max-file-bytes 3000000 \
             >"${DAEMON_LOG}" 2>&1 &
           echo $! > "${DAEMON_PID_FILE}"
 

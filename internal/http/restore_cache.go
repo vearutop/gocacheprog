@@ -72,13 +72,20 @@ func parseGOCACHERequest(r *http.Request) gocache.Request {
 			maxFileBytes = parsed
 		}
 	}
+	restoreLimitBytes := int64(0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("restore-limit-bytes")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			restoreLimitBytes = parsed
+		}
+	}
 
 	return gocache.Request{
-		Commit:       strings.TrimSpace(r.URL.Query().Get("commit")),
-		ChangesID:    strings.TrimSpace(r.URL.Query().Get("changes-id")),
-		BuildType:    strings.TrimSpace(r.URL.Query().Get("build-type")),
-		BaseCommit:   strings.TrimSpace(r.URL.Query().Get("base-commit")),
-		ParentCommit: strings.TrimSpace(r.URL.Query().Get("parent-commit")),
-		MaxFileBytes: maxFileBytes,
+		Commit:            strings.TrimSpace(r.URL.Query().Get("commit")),
+		ChangesID:         strings.TrimSpace(r.URL.Query().Get("changes-id")),
+		BuildType:         strings.TrimSpace(r.URL.Query().Get("build-type")),
+		BaseCommit:        strings.TrimSpace(r.URL.Query().Get("base-commit")),
+		ParentCommit:      strings.TrimSpace(r.URL.Query().Get("parent-commit")),
+		MaxFileBytes:      maxFileBytes,
+		RestoreLimitBytes: restoreLimitBytes,
 	}
 }

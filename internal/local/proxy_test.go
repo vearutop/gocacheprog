@@ -103,6 +103,41 @@ func TestProxyMaybePreload_SkipsWhenDisabled(t *testing.T) {
 	require.False(t, upstream.called)
 }
 
+func TestProxyMaybePreload_UsesDefaultMaxFileBytesForPreload(t *testing.T) {
+	upstream := &preloaderStub{}
+
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
+		Preload: true,
+	})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	require.NoError(t, proxy.MaybePreload())
+	require.True(t, upstream.called)
+	require.Equal(t, defaultPreloadMaxSize, upstream.req.MaxSize)
+}
+
+func TestProxyMaybePreload_UsesMaxFileBytesForPreload(t *testing.T) {
+	upstream := &preloaderStub{}
+
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
+		Preload:      true,
+		MaxFileBytes: 3_000_000,
+	})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	require.NoError(t, proxy.MaybePreload())
+	require.True(t, upstream.called)
+	require.Equal(t, int64(3_000_000), upstream.req.MaxSize)
+}
+
 func TestProxyLookup_SkipsRemoteGetAfterTimeBudget(t *testing.T) {
 	upstream := &remoteBudgetStub{getTotalTime: time.Second}
 
@@ -236,6 +271,7 @@ func (p *putRecorderStub) PostCacheUsed(commit string, changesID string, buildTy
 
 type preloaderStub struct {
 	called bool
+	req    cache.PreloadRequest
 }
 
 func (p *preloaderStub) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
@@ -248,6 +284,7 @@ func (p *preloaderStub) Put(values cache.Response) error {
 
 func (p *preloaderStub) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
 	p.called = true
+	p.req = req
 	return nil
 }
 

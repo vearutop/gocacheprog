@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,12 +37,13 @@ var validScopedKeyName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 const maxManifestKeyLen = 100
 
 type Request struct {
-	Commit       string
-	ChangesID    string
-	BuildType    string
-	BaseCommit   string
-	ParentCommit string
-	MaxFileBytes int64
+	Commit            string
+	ChangesID         string
+	BuildType         string
+	BaseCommit        string
+	ParentCommit      string
+	MaxFileBytes      int64
+	RestoreLimitBytes int64
 }
 
 type FileItem struct {
@@ -119,6 +121,11 @@ type indexEntry struct {
 	Compressed      int64  `json:"c,omitempty"`
 	ModTimeMicro    int64  `json:"m,omitempty"`
 	AccessTimeMicro int64  `json:"a,omitempty"`
+}
+
+type restoreEntry struct {
+	path string
+	ie   indexEntry
 }
 
 type StoreOption func(*Store)
@@ -670,19 +677,13 @@ func (s *Store) Restore(req Request, cb func(FileItem)) ([]string, error) {
 		return nil, err
 	}
 
-	items := make([]FileItem, 0, len(paths))
 	nowUnixMicro := time.Now().UTC().UnixMicro()
+	entries := make([]restoreEntry, 0, len(paths))
 
 	s.mu.Lock()
 	for _, relPath := range paths {
 		ie, ok := s.index[relPath]
 		if !ok {
-			continue
-		}
-		if req.MaxFileBytes > 0 && ie.Size > req.MaxFileBytes {
-			continue
-		}
-		if s.maxFileBytes > 0 && ie.Size > s.maxFileBytes {
 			continue
 		}
 
@@ -696,11 +697,14 @@ func (s *Store) Restore(req Request, cb func(FileItem)) ([]string, error) {
 		}
 		s.dirty = true
 
-		items = append(items, s.responseItemLocked(relPath, ie))
+		entries = append(entries, restoreEntry{path: relPath, ie: ie})
 	}
 	s.mu.Unlock()
 
-	for _, item := range items {
+	entries = s.selectRestoreEntries(req, entries)
+
+	for _, entry := range entries {
+		item := s.responseItem(entry.path, entry.ie)
 		cb(item)
 		atomic.AddInt64(&s.hits, 1)
 	}
@@ -1018,7 +1022,7 @@ func (s *Store) putOne(item FileItem) error {
 	return nil
 }
 
-func (s *Store) responseItemLocked(relPath string, ie indexEntry) FileItem {
+func (s *Store) responseItem(relPath string, ie indexEntry) FileItem {
 	item := FileItem{
 		Path:         relPath,
 		Size:         ie.Size,
@@ -1035,6 +1039,49 @@ func (s *Store) responseItemLocked(relPath string, ie indexEntry) FileItem {
 		item.ModTime = &t
 	}
 	return item
+}
+
+func (s *Store) selectRestoreEntries(req Request, entries []restoreEntry) []restoreEntry {
+	filtered := entries[:0]
+	for _, entry := range entries {
+		if req.MaxFileBytes > 0 && entry.ie.Size > req.MaxFileBytes {
+			continue
+		}
+		if s.maxFileBytes > 0 && entry.ie.Size > s.maxFileBytes {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+
+	if req.RestoreLimitBytes <= 0 || len(filtered) < 2 {
+		if req.RestoreLimitBytes > 0 && len(filtered) == 1 && s.entryStoredSize(filtered[0].ie) > req.RestoreLimitBytes {
+			return filtered[:0]
+		}
+		return filtered
+	}
+
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if filtered[i].ie.ModTimeMicro != filtered[j].ie.ModTimeMicro {
+			return filtered[i].ie.ModTimeMicro > filtered[j].ie.ModTimeMicro
+		}
+		if filtered[i].ie.Size != filtered[j].ie.Size {
+			return filtered[i].ie.Size < filtered[j].ie.Size
+		}
+		return filtered[i].path < filtered[j].path
+	})
+
+	total := int64(0)
+	limit := 0
+	for _, entry := range filtered {
+		size := s.entryStoredSize(entry.ie)
+		if total+size > req.RestoreLimitBytes {
+			break
+		}
+		total += size
+		limit++
+	}
+
+	return filtered[:limit]
 }
 
 func (s *Store) restorePaths(req Request) ([]string, []string, error) {

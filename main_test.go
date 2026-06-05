@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"flag"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vearutop/gocacheprog/internal/gocache"
 	"github.com/vearutop/gocacheprog/internal/local"
 )
 
@@ -24,7 +29,6 @@ func TestParseProxyParams_FlagParseUpdatesReturnedStruct(t *testing.T) {
 	err := flag.CommandLine.Parse([]string{
 		"-preload",
 		"-skip-preload",
-		"-preload-size", "3000000",
 		"-commit", "commit123",
 		"-changes-id", "repo/pr-123",
 		"-build-type", "lint",
@@ -35,7 +39,6 @@ func TestParseProxyParams_FlagParseUpdatesReturnedStruct(t *testing.T) {
 
 	require.True(t, params.Preload)
 	require.True(t, params.SkipPreload)
-	require.Equal(t, int64(3000000), params.PreloadSize)
 	require.Equal(t, "commit123", params.Commit)
 	require.Equal(t, "repo/pr-123", params.ChangesID)
 	require.Equal(t, "lint", params.BuildType)
@@ -81,7 +84,7 @@ func TestRunNativeGOCACHEMode_SendsSessionHeadersOnVersionProbe(t *testing.T) {
 		ParentCommit: "parent123",
 	}
 
-	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 0, 1024, startedAt, params)
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 0, 0, 1024, startedAt, params)
 	require.NoError(t, err)
 	require.NotEmpty(t, gotHeaders["session_id"])
 	require.Equal(t, startedAt.Format(time.RFC3339Nano), gotHeaders["started_at"])
@@ -94,9 +97,213 @@ func TestRunNativeGOCACHEMode_SendsSessionHeadersOnVersionProbe(t *testing.T) {
 	require.Equal(t, "base123", gotHeaders["base"])
 }
 
+func TestRunNativeGOCACHEMode_RestoreCachePassesMaxFileBytes(t *testing.T) {
+	var gotReq struct {
+		maxFileBytes      string
+		restoreLimitBytes string
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/version":
+			_, err := rw.Write([]byte("gocacheprog test"))
+			require.NoError(t, err)
+		case "/restore-cache":
+			gotReq.maxFileBytes = r.URL.Query().Get("max-file-bytes")
+			gotReq.restoreLimitBytes = r.URL.Query().Get("restore-limit-bytes")
+			rw.WriteHeader(http.StatusOK)
+			require.NoError(t, binary.Write(rw, binary.BigEndian, int32(0)))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cacheDir := t.TempDir()
+	startedAt := time.Date(2026, time.June, 2, 9, 12, 26, 0, time.UTC)
+
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 1234, 4321, 1024, startedAt, &local.ProxyParams{})
+	require.NoError(t, err)
+	require.Equal(t, "1234", gotReq.maxFileBytes)
+	require.Equal(t, "4321", gotReq.restoreLimitBytes)
+}
+
+func TestRunNativeGOCACHEMode_SaveCacheSkipsOversizedFilesBeforeUpload(t *testing.T) {
+	var uploadedPaths []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/version":
+			_, err := rw.Write([]byte("gocacheprog test"))
+			require.NoError(t, err)
+		case "/save-cache-start":
+			require.Equal(t, "4", r.URL.Query().Get("max-file-bytes"))
+			rw.WriteHeader(http.StatusNoContent)
+		case "/save-cache-chunk":
+			require.Equal(t, "4", r.URL.Query().Get("max-file-bytes"))
+			_, err := gocache.ReadStream(r.Body, func(item gocache.FileItem, body io.Reader) error {
+				uploadedPaths = append(uploadedPaths, item.Path)
+				if body != nil {
+					_, err := io.Copy(io.Discard, body)
+					require.NoError(t, err)
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			rw.WriteHeader(http.StatusNoContent)
+		case "/save-cache-finalize":
+			require.Equal(t, "4", r.URL.Query().Get("max-file-bytes"))
+			rw.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cacheDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "ab"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "small"), []byte("1234"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "large"), []byte("123456"), 0o600))
+
+	startedAt := time.Date(2026, time.June, 2, 9, 12, 26, 0, time.UTC)
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", false, true, 4, 0, 1<<20, startedAt, &local.ProxyParams{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"ab/small"}, uploadedPaths)
+}
+
+func TestRunNativeGOCACHEMode_RestoreCacheSkipsOversizedFilesBeforeDownload(t *testing.T) {
+	cacheDir := t.TempDir()
+
+	smallBody := []byte("1234")
+	largeBody := []byte("123456")
+	now := time.Date(2026, time.June, 2, 9, 12, 26, 0, time.UTC)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/version":
+			_, err := rw.Write([]byte("gocacheprog test"))
+			require.NoError(t, err)
+		case "/restore-cache":
+			require.Equal(t, "4", r.URL.Query().Get("max-file-bytes"))
+			rw.WriteHeader(http.StatusOK)
+			sw := gocache.NewStreamWriter(rw)
+
+			small := gocache.FileItem{
+				Path:     "ab/small",
+				Size:     int64(len(smallBody)),
+				WireSize: int64(len(smallBody)),
+				ModTime:  &now,
+			}
+			small.SetBodyReader(func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(smallBody)), nil
+			})
+			require.NoError(t, sw.WriteItem(small))
+
+			if r.URL.Query().Get("max-file-bytes") == "" {
+				large := gocache.FileItem{
+					Path:     "ab/large",
+					Size:     int64(len(largeBody)),
+					WireSize: int64(len(largeBody)),
+					ModTime:  &now,
+				}
+				large.SetBodyReader(func() (io.ReadCloser, error) {
+					return io.NopCloser(bytes.NewReader(largeBody)), nil
+				})
+				require.NoError(t, sw.WriteItem(large))
+			}
+
+			require.NoError(t, sw.Close())
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	startedAt := time.Date(2026, time.June, 2, 9, 12, 26, 0, time.UTC)
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 4, 0, 1024, startedAt, &local.ProxyParams{})
+	require.NoError(t, err)
+
+	body, err := os.ReadFile(filepath.Join(cacheDir, "ab", "small"))
+	require.NoError(t, err)
+	require.Equal(t, smallBody, body)
+
+	_, err = os.Stat(filepath.Join(cacheDir, "ab", "large"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func TestHumanBytesPerSecond(t *testing.T) {
 	require.Equal(t, "0 B/s", humanBytesPerSecond(0, time.Second))
 	require.Equal(t, "0 B/s", humanBytesPerSecond(1024, 0))
 	require.Equal(t, "1.0 KiB/s", humanBytesPerSecond(2048, 2*time.Second))
 	require.Equal(t, "1.5 KiB/s", humanBytesPerSecond(1536, time.Second))
+}
+
+func TestNormalizeServerFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		httpListen  string
+		httpsListen string
+		httpsHost   string
+		wantHTTP    string
+		wantHTTPS   string
+		wantErr     string
+	}{
+		{
+			name:      "https host implies defaults",
+			httpsHost: "example.com",
+			wantHTTP:  ":80",
+			wantHTTPS: ":443",
+		},
+		{
+			name:        "https host with explicit https keeps http default",
+			httpsHost:   "example.com",
+			httpsListen: ":445",
+			wantHTTP:    ":80",
+			wantHTTPS:   ":445",
+		},
+		{
+			name:       "http only stays http",
+			httpListen: "192.168.1.23:1234",
+			wantHTTP:   "192.168.1.23:1234",
+		},
+		{
+			name:       "unix http allowed without https",
+			httpListen: "unix:///tmp/gocacheprog.sock",
+			wantHTTP:   "unix:///tmp/gocacheprog.sock",
+		},
+		{
+			name:        "https requires host",
+			httpsListen: ":443",
+			wantErr:     "-https requires -https-host",
+		},
+		{
+			name:       "https host rejects custom http port",
+			httpListen: ":9882",
+			httpsHost:  "example.com",
+			wantErr:    "-https-host requires -http on port 80",
+		},
+		{
+			name:       "https host rejects unix",
+			httpListen: "unix:///tmp/gocacheprog.sock",
+			httpsHost:  "example.com",
+			wantErr:    "-https-host cannot be combined with unix -http",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			httpListen := tc.httpListen
+			httpsListen := tc.httpsListen
+			httpsHost := tc.httpsHost
+
+			err := normalizeServerFlags(&httpListen, &httpsListen, &httpsHost)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.wantHTTP, httpListen)
+			require.Equal(t, tc.wantHTTPS, httpsListen)
+		})
+	}
 }
