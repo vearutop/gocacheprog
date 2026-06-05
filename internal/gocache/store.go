@@ -1022,10 +1022,6 @@ func (s *Store) putOne(item FileItem) error {
 	return nil
 }
 
-func (s *Store) responseItemLocked(relPath string, ie indexEntry) FileItem {
-	return s.responseItem(relPath, ie)
-}
-
 func (s *Store) responseItem(relPath string, ie indexEntry) FileItem {
 	item := FileItem{
 		Path:         relPath,

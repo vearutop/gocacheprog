@@ -28,7 +28,7 @@ func main() {
 	}
 }
 
-//nolint:gocyclo // CLI mode dispatch is intentionally centralized here.
+//nolint:gocyclo,maintidx // CLI mode dispatch is intentionally centralized here.
 func run() error {
 	startedAt := time.Now().UTC()
 	params := parseProxyParams()
