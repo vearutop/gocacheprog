@@ -21,7 +21,7 @@ jobs:
   test:
     strategy:
       matrix:
-        go-version: [ stable, oldstable ]
+        go-version: [ stable ]
     runs-on: ubuntu-latest
     steps:
       - name: Install Go

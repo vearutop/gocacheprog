@@ -54,6 +54,8 @@ type Proxy struct {
 	params              ProxyParams
 }
 
+const defaultPreloadMaxSize int64 = 1_000_000
+
 type ProxyParams struct {
 	Commit           string
 	ChangesID        string
@@ -63,7 +65,6 @@ type ProxyParams struct {
 	Preload          bool
 	SkipPreload      bool
 	MaxRemoteGetTime time.Duration
-	PreloadSize      int64
 	MaxFileBytes     int64
 	DisableCacheUsed bool
 }
@@ -299,8 +300,13 @@ func (dc *Proxy) postCacheUsed(commit string, changesID string, buildType string
 }
 
 func (dc *Proxy) MaybePreload() error {
+	maxSize := dc.params.MaxFileBytes
+	if maxSize == 0 {
+		maxSize = defaultPreloadMaxSize
+	}
+
 	req := cache.PreloadRequest{
-		MaxSize:      dc.params.PreloadSize,
+		MaxSize:      maxSize,
 		Commit:       dc.params.Commit,
 		ChangesID:    dc.params.ChangesID,
 		BuildType:    dc.params.BuildType,

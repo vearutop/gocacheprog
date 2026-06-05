@@ -140,6 +140,103 @@ func TestRestore_RespectsMaxFileBytes(t *testing.T) {
 	require.Equal(t, []string{"small"}, restored)
 }
 
+func TestRestore_RespectsRestoreLimitBytesOrdering(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	now := time.Date(2026, time.June, 3, 10, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		path string
+		body string
+		at   time.Time
+	}{
+		{path: "older", body: "1234", at: now.Add(-2 * time.Minute)},
+		{path: "new-large", body: "123456", at: now},
+		{path: "new-small", body: "1234", at: now},
+		{path: "new-tiny", body: "12", at: now},
+	} {
+		tc := tc
+		item := FileItem{
+			Path:     tc.path,
+			Size:     int64(len(tc.body)),
+			WireSize: int64(len(tc.body)),
+			ModTime:  &tc.at,
+		}
+		item.SetBodyReader(func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte(tc.body))), nil
+		})
+		require.NoError(t, store.Save(Request{Commit: "commit123"}, Batch{Items: []FileItem{item}}))
+	}
+
+	store.mu.Lock()
+	for path, at := range map[string]time.Time{
+		"older":     now.Add(-2 * time.Minute),
+		"new-large": now,
+		"new-small": now,
+		"new-tiny":  now,
+	} {
+		ie := store.index[path]
+		ie.ModTimeMicro = at.UnixMicro()
+		store.index[path] = ie
+	}
+	store.mu.Unlock()
+
+	var restored []string
+	sources, err := store.Restore(Request{Commit: "commit123", RestoreLimitBytes: 6}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"commit"}, sources)
+	require.Equal(t, []string{"new-tiny", "new-small"}, restored)
+}
+
+func TestRestore_RespectsMaxFileBytesBeforeRestoreLimitBytes(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	now := time.Date(2026, time.June, 3, 10, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		path string
+		body string
+		at   time.Time
+	}{
+		{path: "too-big", body: "1234567", at: now},
+		{path: "fit-a", body: "1234", at: now},
+		{path: "fit-b", body: "12", at: now},
+	} {
+		tc := tc
+		item := FileItem{
+			Path:     tc.path,
+			Size:     int64(len(tc.body)),
+			WireSize: int64(len(tc.body)),
+			ModTime:  &tc.at,
+		}
+		item.SetBodyReader(func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte(tc.body))), nil
+		})
+		require.NoError(t, store.Save(Request{Commit: "commit123"}, Batch{Items: []FileItem{item}}))
+	}
+
+	store.mu.Lock()
+	for path := range store.index {
+		ie := store.index[path]
+		ie.ModTimeMicro = now.UnixMicro()
+		store.index[path] = ie
+	}
+	store.mu.Unlock()
+
+	var restored []string
+	_, err = store.Restore(Request{Commit: "commit123", MaxFileBytes: 5, RestoreLimitBytes: 6}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"fit-b", "fit-a"}, restored)
+}
+
 func TestStoreMaxFileBytes_SkipsSaveAndRestore(t *testing.T) {
 	dir := t.TempDir()
 

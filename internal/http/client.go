@@ -581,6 +581,9 @@ func gocacheQuery(req gocache.Request) url.Values {
 	if req.MaxFileBytes > 0 {
 		v.Set("max-file-bytes", strconv.FormatInt(req.MaxFileBytes, 10))
 	}
+	if req.RestoreLimitBytes > 0 {
+		v.Set("restore-limit-bytes", strconv.FormatInt(req.RestoreLimitBytes, 10))
+	}
 	return v
 }
 

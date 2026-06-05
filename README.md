@@ -12,7 +12,7 @@
 - a direct `GOCACHEPROG` helper
 - a local daemon + shim pair for CI
 - a batch restore/save tool for native `GOCACHE`
-- a remote HTTP cache server when started with `-listen`
+- a remote HTTP or HTTPS cache server when started with `-http`
 
 The project is aimed at large CI workloads where:
 
@@ -24,7 +24,7 @@ The project is aimed at large CI workloads where:
 
 At a high level:
 
-- `gocacheprog -listen ...` stores cached Go action results and serves them over HTTP
+- `gocacheprog -http ...` stores cached Go action results and serves them over HTTP or HTTPS
 - `gocacheprog` keeps a local on-disk cache and proxies misses to the remote server
 - `gocacheprog -restore-cache` and `-save-cache` sync native `GOCACHE` files in batch mode
 - preload can pull a relevant working set into the local cache before the build starts
@@ -45,13 +45,79 @@ go install github.com/vearutop/gocacheprog@latest
 
 Or download binaries from [releases](https://github.com/vearutop/gocacheprog/releases).
 
-Example on Linux AMD64:
+Linux AMD64:
 
 ```bash
 wget https://github.com/vearutop/gocacheprog/releases/latest/download/linux_amd64.tar.gz
 tar xf linux_amd64.tar.gz
 rm linux_amd64.tar.gz
-./gocacheprog -help
+./gocacheprog -version
+```
+
+## Usage
+
+```
+Usage of ./bin/gocacheprog:
+  -auth-token string
+        optional bearer token for the remote HTTP cache server
+  -base-commit string
+        base commit SHA used to scope preload
+  -build-type string
+        optional build type label to isolate cache manifests, e.g. unit or race
+  -cache-dir string
+        cache directory; empty means automatic
+  -canonicalize-timestamps string
+        canonicalize file and directory timestamps under this repo root and exit
+  -changes-id string
+        stable change stream label used to upload and preload latest cache usage manifest
+  -commit string
+        current commit SHA used to upload cache usage manifest
+  -dump-log string
+        dump req/resp logs to file
+  -gocache-max-age duration
+        maximum age for native GOCACHE objects on the remote server; 0 disables age-based retirement (default 48h0m0s)
+  -gocache-max-disk-bytes int
+        optional total on-disk native cache storage size limit in bytes on the remote server; 0 disables eviction
+  -http string
+        HTTP listen address or unix socket path
+  -https string
+        HTTPS listen address
+  -https-host string
+        public hostname for automatic Let's Encrypt certificates
+  -job-start-unix int
+        job start Unix timestamp in nanoseconds for -save-cache; when empty, read the marker written by -restore-cache
+  -max-disk-bytes int
+        optional total on-disk cache size limit in bytes; 0 disables eviction
+  -max-file-bytes int
+        maximum single file size in bytes for remote cache storage, preload item wire size, and native -restore-cache/-save-cache; 0 disables the limit except preload defaults to 1000000
+  -max-remote-get-time duration
+        once cumulative remote get time exceeds this duration, local misses stop querying remote and return immediately
+  -parent-commit string
+        parent commit SHA used to scope preload
+  -preload
+        preload cache from remote server
+  -preload-limit int
+        maximum number of concurrent preload preparations in server mode (default 2)
+  -preload-only
+        preload cache into -cache-dir and exit without running as helper or uploading cache-used
+  -remote-url string
+        remote HTTP server cache source, e.g. https://example.com:8080
+  -restore-cache
+        restore native GOCACHE files into -cache-dir and exit
+  -restore-limit-bytes int
+        maximum total compressed bytes to download during native -restore-cache after -max-file-bytes filtering; 0 disables the limit
+  -save-cache
+        save freshly created native GOCACHE files from -cache-dir and exit
+  -save-cache-chunk-bytes int
+        maximum size in bytes for a single native -save-cache HTTP chunk request body (default 921600)
+  -save-cache-max-file-bytes int
+        deprecated alias for -max-file-bytes
+  -skip-preload
+        skip preload even when preload scope flags are present
+  -stop string
+        stop a running local daemon listening on the given unix/tcp address
+  -version
+        print version and exit
 ```
 
 ## Modes
@@ -63,45 +129,16 @@ rm linux_amd64.tar.gz
 3. Shim mode
 4. Native `GOCACHE` batch mode
 
-Important flags:
-
-- `-cache-dir`
-- `-remote-url`
-- `-auth-token`
-- `-preload`
-- `-preload-size`
-- `-commit`
-- `-changes-id`
-- `-build-type`
-- `-base-commit`
-- `-parent-commit`
-- `-max-file-bytes`
-- `-canonicalize-timestamps`
-
-Important batch-mode flags:
-
-- `-restore-cache`
-- `-save-cache`
-- `-max-file-bytes`
-- `-save-cache-chunk-bytes`
-- `-cache-dir`
-- `-remote-url`
-- `-commit`
-- `-changes-id`
-- `-build-type`
-- `-base-commit`
-- `-parent-commit`
-
 ### Direct Mode
 
-This is the original mode where each `go` invocation starts its own helper:
+Each `go` invocation starts its own helper that uses remote cache directly:
 
 ```bash
 export GOCACHEPROG="/path/to/gocacheprog \
   -cache-dir ./build-cache \
   -remote-url https://cache.example.com \
   -preload \
-  -preload-size 3000000 \
+  -max-file-bytes 3000000 \
   -commit $COMMIT \
   -changes-id $CHANGES_ID \
   -build-type unit \
@@ -113,17 +150,21 @@ This works well for simple flows with one Go invocation per step.
 
 ### Daemon + Shim Mode
 
-This is the preferred CI setup for complex jobs.
+If the job runs multiple `go` invocations, for example, during `go generate`, direct mode cannot properly work with preload.
+Daemon + shim is recommended for this case, daemon starts once and acts as a preloading proxy to remote cache. 
+Daemon serves on a local unix socket and synchronizes multiple shim invocations.
+
+Shim works in a lightweight mode that it connects to the local daemon instead of a remote server.
 
 Start a local daemon once:
 
 ```bash
 /path/to/gocacheprog \
-  -listen unix:///tmp/gocacheprog.sock \
+  -http unix:///tmp/gocacheprog.sock \
   -cache-dir ./build-cache \
   -remote-url https://cache.example.com \
   -preload \
-  -preload-size 3000000 \
+  -max-file-bytes 3000000 \
   -commit "$COMMIT" \
   -changes-id "$CHANGES_ID" \
   -build-type unit \
@@ -135,8 +176,11 @@ Then point `GOCACHEPROG` at the shim:
 
 ```bash
 export GOCACHEPROG="/path/to/gocacheprog -remote-url unix:///tmp/gocacheprog.sock"
-go test ./...
+go generate ./...
 ```
+
+Requests from shims are blocked until the preload in daemon is ready with a timeout of 30 seconds. 
+For large preloads it may make sense to preload explicitly before starting the job.  
 
 ### Explicit Preload Then Daemon
 
@@ -147,7 +191,7 @@ If you want preload in a separate CI step, use `-preload-only` against the same 
   -cache-dir ./build-cache \
   -remote-url https://cache.example.com \
   -preload-only \
-  -preload-size 3000000 \
+  -max-file-bytes 3000000 \
   -changes-id "$CHANGES_ID" \
   -build-type lint \
   -base-commit "$BASE_COMMIT"
@@ -159,7 +203,7 @@ Then start daemon + shim later with the same cache dir:
 
 ```bash
 /path/to/gocacheprog \
-  -listen unix:///tmp/gocacheprog.sock \
+  -http unix:///tmp/gocacheprog.sock \
   -cache-dir ./build-cache \
   -remote-url https://cache.example.com \
   -skip-preload \
@@ -172,18 +216,15 @@ Then start daemon + shim later with the same cache dir:
 
 The daemon will skip preload explicitly and still upload `cache-used` on shutdown.
 
-Why this is better:
-
-- one local owner of `./build-cache`
-- one preload per job/cache scope instead of one per `go` invocation
-- no local preload storm when one script starts many `go` commands
-- daemon preserves the remote batching behavior
-- shim talks to daemon over Unix socket with no local batching delay
-- daemon returns its own local `DiskPath`, and shim passes that through to the Go tool
-
 ### Native `GOCACHE` Batch Mode
 
+`GOCACHEPROG` protocol is great for precise CI caching, but it comes with overhead, even for locally hosted data it is 
+still slower than native `GOCACHE` batch mode (especially in large builds with many cache lookups). 
+
 This mode does not use `GOCACHEPROG` during the build.
+
+It talks directly to a remote store server that has native `GOCACHE` storage enabled, for example
+`gocacheprog -http :8080 ...` without `-remote-url`.
 
 Instead:
 
@@ -231,9 +272,12 @@ How it works:
 - restore streams matching files from the remote server and materializes native cache files locally
 - local restore preserves file contents and executable permission bits, but intentionally does not restore historical mtimes
 - `-max-file-bytes` can skip pathological large single cache files during both native restore and native save
-- save walks the local `GOCACHE` tree, skips files that were already restored in this job, compresses payloads client-side, and streams them to the server
+- `-restore-limit-bytes` caps total compressed native restore download after `-max-file-bytes` filtering; eligible files are ordered by timestamp descending, then size ascending, and only the leading prefix that fits is restored
+- restore writes local bookkeeping files so save can distinguish restored files from freshly created ones
+- save walks the local `GOCACHE` tree, skips files that were already restored in this job, skips helper bookkeeping files, compresses payloads client-side, and streams them to the server
 - the server stores compressed file objects and merges uploaded file paths into the relevant manifests; when the server also runs with `-max-file-bytes`, oversized objects are silently skipped on save and treated as misses on restore
 - large `-save-cache` uploads are split into outer HTTP chunks, so the mode can work behind restrictive reverse proxies such as default nginx `client_max_body_size=1m`
+- `-job-start-unix` is currently accepted by the CLI but is not used by the current native save selection logic
 
 In `GOCACHEPROG` mode, `-max-file-bytes` also skips remote `Put` uploads for oversized cache entries while still keeping them in the local cache. When the server is started with the same flag, oversized entries are also not stored in or served from the remote cache.
 
@@ -398,19 +442,19 @@ This avoids mixing actual cached blobs with sidecar metadata.
 Server mode supports a total on-disk cache size limit:
 
 ```bash
-gocacheprog -listen :8080 -max-disk-bytes 5000000000
+gocacheprog -http :8080 -max-disk-bytes 5000000000
 ```
 
 Native `GOCACHE` storage has a separate quota:
 
 ```bash
-gocacheprog -listen :8080 -gocache-max-disk-bytes 5000000000
+gocacheprog -http :8080 -gocache-max-disk-bytes 5000000000
 ```
 
 Native `GOCACHE` storage also has an age-based retirement policy, defaulting to `48h`:
 
 ```bash
-gocacheprog -listen :8080 -gocache-max-age 48h
+gocacheprog -http :8080 -gocache-max-age 48h
 ```
 
 Set `-gocache-max-age 0` to disable age-based retirement.
@@ -430,8 +474,32 @@ Optional bearer token auth is supported on both client and server.
 Server:
 
 ```bash
-gocacheprog -listen :8080 -auth-token secret-token
+gocacheprog -http :8080 -auth-token secret-token
 ```
+
+Automatic HTTPS with Let's Encrypt:
+
+```bash
+gocacheprog -https-host cache.example.com -auth-token secret-token
+```
+
+This implies:
+
+- `-http :80`
+- `-https :443`
+- certificate cache in `<cache-dir>/autocert`
+
+You can override only the HTTPS bind address:
+
+```bash
+gocacheprog -https-host cache.example.com -https :445
+```
+
+Constraints:
+
+- `-https-host` requires TCP `-http` on port `80`
+- `-https-host` rejects `unix://...`
+- `-https` requires `-https-host`
 
 Client:
 
@@ -551,7 +619,7 @@ This protects the server from thrashing, but under heavy multi-session startup i
 If needed, raise it moderately, for example:
 
 ```bash
-gocacheprog -listen :8080 -preload-limit 4
+gocacheprog -http :8080 -preload-limit 4
 ```
 
 Do not jump straight to very high values without observing:
