@@ -23,11 +23,15 @@ import (
 	"github.com/vearutop/gocacheprog/internal/gocache"
 )
 
-var gatewayRetryDelay = 5 * time.Second
-var saveCacheRetryDelay = 5 * time.Second
+var (
+	gatewayRetryDelay   = 5 * time.Second
+	saveCacheRetryDelay = 5 * time.Second
+)
 
-const DefaultSaveCacheChunkBytes int64 = 900 * 1024
-const saveCacheMaxRetries = 3
+const (
+	DefaultSaveCacheChunkBytes int64 = 900 * 1024
+	saveCacheMaxRetries              = 3
+)
 
 const (
 	headerSessionID          = "X-Gocacheprog-Session-Id"
