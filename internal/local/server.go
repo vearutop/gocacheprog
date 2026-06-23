@@ -127,6 +127,7 @@ func serveHTTPAndHTTPS(httpListen, httpsListen, httpsHost, certCacheDir string, 
 	defer httpsCleanup()
 
 	httpsServer.TLSConfig = manager.TLSConfig()
+	httpsServer.TLSConfig.MinVersion = tls.VersionTLS12
 	if httpsServer.TLSConfig.NextProtos == nil {
 		httpsServer.TLSConfig.NextProtos = []string{acme.ALPNProto, "h2", "http/1.1"}
 	}
@@ -136,7 +137,41 @@ func serveHTTPAndHTTPS(httpListen, httpsListen, httpsHost, certCacheDir string, 
 			{name: "http", addr: httpLogAddr, serve: func() error { return httpServer.Serve(httpLn) }, close: func() error { return httpServer.Close() }},
 			{name: "https", addr: httpsLogAddr, serve: func() error { return httpsServer.Serve(tls.NewListener(httpsLn, httpsServer.TLSConfig)) }, close: func() error { return httpsServer.Close() }},
 		},
+		func() {
+			if err := warmAutocertCertificate(manager, httpsHost); err != nil {
+				log.Printf("warm autocert certificate for %s: %s", httpsHost, err.Error())
+			}
+		},
 	)
+}
+
+func warmAutocertCertificate(manager *autocert.Manager, httpsHost string) error {
+	cert, err := manager.GetCertificate(&tls.ClientHelloInfo{
+		ServerName: httpsHost,
+		SupportedProtos: []string{
+			"h2",
+			"http/1.1",
+		},
+		SignatureSchemes: []tls.SignatureScheme{
+			tls.ECDSAWithP256AndSHA256,
+			tls.PSSWithSHA256,
+		},
+		SupportedCurves: []tls.CurveID{
+			tls.CurveP256,
+		},
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if cert.Leaf != nil {
+		log.Printf("warmed autocert certificate for %s, expires at %s", httpsHost, cert.Leaf.NotAfter.Format(time.RFC3339))
+		return nil
+	}
+	log.Printf("warmed autocert certificate for %s", httpsHost)
+	return nil
 }
 
 func autocertHTTPHandler(httpsHost string, manager *autocert.Manager) nethttp.Handler {
@@ -152,7 +187,7 @@ type serverRunner struct {
 	close func() error
 }
 
-func runServers(servers []serverRunner) error {
+func runServers(servers []serverRunner, onStarted func()) error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(stop)
@@ -164,6 +199,9 @@ func runServers(servers []serverRunner) error {
 			errCh <- srv.serve()
 		}()
 		log.Printf("Listening on %s://%s ...", srv.name, srv.addr)
+	}
+	if onStarted != nil {
+		onStarted()
 	}
 
 	select {
