@@ -2,6 +2,7 @@ package http_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	nethttp "net/http"
@@ -235,6 +236,61 @@ func TestClient_SaveCache_ChunksAndFinalizes(t *testing.T) {
 	changesBody, err := os.ReadFile(changesManifestPath)
 	require.NoError(t, err)
 	require.Equal(t, "ab/a\nab/b\nab/c\n", string(changesBody))
+}
+
+func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir, local.WithCompression())
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	t.Cleanup(srv.Close)
+
+	uploadID := "test-upload"
+	startResp, err := srv.Client().Post(srv.URL+"/save-cache-start?upload-id="+uploadID+"&commit=commit123", "application/octet-stream", nil)
+	require.NoError(t, err)
+	require.NoError(t, startResp.Body.Close())
+	require.Equal(t, nethttp.StatusNoContent, startResp.StatusCode)
+
+	item := gocache.FileItem{
+		Path:     "ab/a",
+		Size:     10,
+		WireSize: 10,
+	}
+	itemJSON, err := json.Marshal(item)
+	require.NoError(t, err)
+
+	var chunk bytes.Buffer
+	require.NoError(t, binary.Write(&chunk, binary.BigEndian, int32(len(itemJSON))))
+	_, err = chunk.Write(itemJSON)
+	require.NoError(t, err)
+	_, err = chunk.WriteString("short")
+	require.NoError(t, err)
+
+	chunkResp, err := srv.Client().Post(srv.URL+"/save-cache-chunk?upload-id="+uploadID+"&commit=commit123", "application/octet-stream", bytes.NewReader(chunk.Bytes()))
+	require.NoError(t, err)
+	require.NoError(t, chunkResp.Body.Close())
+	require.Equal(t, nethttp.StatusNoContent, chunkResp.StatusCode)
+
+	finalizeResp, err := srv.Client().Post(srv.URL+"/save-cache-finalize?upload-id="+uploadID+"&commit=commit123", "application/octet-stream", nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, finalizeResp.Body.Close())
+	}()
+
+	body, err := io.ReadAll(finalizeResp.Body)
+	require.NoError(t, err)
+	msg := string(body)
+
+	require.Equal(t, nethttp.StatusInternalServerError, finalizeResp.StatusCode)
+	require.Contains(t, msg, "save-cache upload test-upload finalize failed")
+	require.Contains(t, msg, "path=\"ab/a\"")
+	require.Contains(t, msg, "wire_size=10")
+	require.Contains(t, msg, "read_wire_bytes=5")
+	require.Contains(t, msg, "truncated item body")
 }
 
 func TestPreload_UsesCommitManifestFilters(t *testing.T) {

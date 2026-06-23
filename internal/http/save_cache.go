@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/vearutop/gocacheprog/internal/gocache"
@@ -20,7 +21,7 @@ func (h *Handler) SaveCache(rw http.ResponseWriter, r *http.Request) {
 	defer closeRequestBody(r)
 
 	req := parseGOCACHERequest(r)
-	if err := h.processSaveCacheStream(req, r.Body); err != nil {
+	if err := h.processSaveCacheStream(req, r.Body, "single-request"); err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -58,7 +59,7 @@ func (h *Handler) StartSaveCache(rw http.ResponseWriter, r *http.Request) {
 	h.saveSessionsMu.Unlock()
 
 	go func() {
-		done <- h.processSaveCacheStream(req, pr)
+		done <- h.processSaveCacheStream(req, pr, uploadID)
 	}()
 
 	rw.WriteHeader(http.StatusNoContent)
@@ -78,10 +79,13 @@ func (h *Handler) SaveCacheChunk(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := io.Copy(session.writer, r.Body); err != nil {
+	n, err := io.Copy(session.writer, r.Body)
+	atomic.AddInt64(&session.chunks, 1)
+	atomic.AddInt64(&session.bytes, n)
+	if err != nil {
 		closeWithLog(session.writer, "close save-cache session writer after chunk failure")
 		h.deleteSaveSession(uploadID)
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		http.Error(rw, fmt.Sprintf("save-cache upload %s chunk failed after %d chunks, %d bytes: %s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), err.Error()), http.StatusInternalServerError)
 		return
 	}
 
@@ -111,7 +115,7 @@ func (h *Handler) FinalizeSaveCache(rw http.ResponseWriter, r *http.Request) {
 	err = <-session.done
 	h.deleteSaveSession(uploadID)
 	if err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		http.Error(rw, fmt.Sprintf("save-cache upload %s finalize failed after %d chunks, %d bytes, duration %s: %s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt), err.Error()), http.StatusInternalServerError)
 		return
 	}
 
@@ -140,29 +144,71 @@ func (h *Handler) AbortSaveCache(rw http.ResponseWriter, r *http.Request) {
 	rw.WriteHeader(http.StatusNoContent)
 }
 
-func (h *Handler) processSaveCacheStream(req gocache.Request, body io.Reader) error {
+func (h *Handler) processSaveCacheStream(req gocache.Request, body io.Reader, uploadID string) error {
 	paths := make([]string, 0)
-	_, err := gocache.ReadStream(body, func(item gocache.FileItem, itemBody io.Reader) error {
+	progress := saveCacheProgress{uploadID: uploadID}
+	streamBytes, err := gocache.ReadStream(body, func(item gocache.FileItem, itemBody io.Reader) error {
 		if item.Size != 0 && itemBody == nil {
-			return fmt.Errorf("empty body for %s", item.Path)
+			return fmt.Errorf("upload_id=%s item=%d path=%q size=%d wire_size=%d: empty body", uploadID, progress.items+1, item.Path, item.Size, item.WireSize)
 		}
 
+		progress.items++
+		progress.path = item.Path
+		progress.sourceBytes += item.Size
+		expectedWireSize := item.WireSize
+		if expectedWireSize == 0 {
+			expectedWireSize = item.Size
+		}
+
+		var counted *countingReader
 		if itemBody != nil {
+			counted = &countingReader{rd: itemBody}
 			item.SetBodyReader(func() (io.ReadCloser, error) {
-				return io.NopCloser(itemBody), nil
+				return io.NopCloser(counted), nil
 			})
 		}
 		if err := h.gocacheStore.SaveItem(item); err != nil {
-			return err
+			readBytes := int64(0)
+			if counted != nil {
+				readBytes = counted.n
+			}
+			return fmt.Errorf("upload_id=%s item=%d path=%q size=%d wire_size=%d read_wire_bytes=%d: save item: %w", uploadID, progress.items, item.Path, item.Size, expectedWireSize, readBytes, err)
 		}
+		if counted != nil && counted.n != expectedWireSize {
+			return fmt.Errorf("upload_id=%s item=%d path=%q size=%d wire_size=%d read_wire_bytes=%d: truncated item body", uploadID, progress.items, item.Path, item.Size, expectedWireSize, counted.n)
+		}
+		progress.wireBytes += expectedWireSize
 		paths = append(paths, item.Path)
 		return nil
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("read save-cache stream upload_id=%s items=%d wire_bytes=%d source_bytes=%d stream_bytes=%d last_path=%q: %w", uploadID, progress.items, progress.wireBytes, progress.sourceBytes, streamBytes, progress.path, err)
 	}
 
-	return h.gocacheStore.MergeSavedPaths(req, paths)
+	if err := h.gocacheStore.MergeSavedPaths(req, paths); err != nil {
+		return fmt.Errorf("merge save-cache manifests upload_id=%s items=%d wire_bytes=%d source_bytes=%d: %w", uploadID, progress.items, progress.wireBytes, progress.sourceBytes, err)
+	}
+
+	return nil
+}
+
+type saveCacheProgress struct {
+	uploadID    string
+	items       int
+	wireBytes   int64
+	sourceBytes int64
+	path        string
+}
+
+type countingReader struct {
+	rd io.Reader
+	n  int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.rd.Read(p)
+	r.n += int64(n)
+	return n, err
 }
 
 func (h *Handler) lookupSaveSession(r *http.Request) (*saveCacheSession, string, error) {

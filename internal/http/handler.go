@@ -138,6 +138,8 @@ type saveCacheSession struct {
 	writer    io.WriteCloser
 	done      chan error
 	startedAt time.Time
+	chunks    int64
+	bytes     int64
 }
 
 func (h *Handler) authorized(r *http.Request) bool {
