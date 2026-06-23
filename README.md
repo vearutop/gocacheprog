@@ -54,6 +54,75 @@ rm linux_amd64.tar.gz
 ./gocacheprog -version
 ```
 
+## Docker
+
+Images are published to GitHub Container Registry on each release:
+
+```bash
+docker pull ghcr.io/vearutop/gocacheprog:latest
+```
+
+### Running the cache server
+
+Mount a local directory to `/data` for persistent cache storage.
+All flags after the image name are passed directly to `gocacheprog`; `-cache-dir /data` is injected automatically.
+
+```bash
+docker run -d \
+  -v ./gocache-store:/data \
+  -p 80:80 -p 443:443 \
+  --name gocacheprog \
+  ghcr.io/vearutop/gocacheprog:latest \
+  -auth-token secret-token \
+  -max-disk-bytes 2000000000 \
+  -gocache-max-disk-bytes 5000000000 \
+  -preload-limit 4 \
+  -max-file-bytes 5000000 \
+  -https-host cache.example.com
+```
+
+TLS certificates acquired via Let's Encrypt are stored under `/data/autocert` and survive container restarts as long as the volume is mounted.
+
+For plain HTTP (no TLS):
+
+```bash
+docker run -d \
+  -v ./gocache-store:/data \
+  -p 8080:8080 \
+  --name gocacheprog \
+  ghcr.io/vearutop/gocacheprog:latest \
+  -http :8080 \
+  -auth-token secret-token \
+  -max-disk-bytes 2000000000
+```
+
+### Docker Compose
+
+```yaml
+services:
+  gocacheprog:
+    image: ghcr.io/vearutop/gocacheprog:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./gocache-store:/data
+    command:
+      - -auth-token
+      - "secret-token"
+      - -max-disk-bytes
+      - "2000000000"
+      - -gocache-max-disk-bytes
+      - "5000000000"
+      - -preload-limit
+      - "4"
+      - -max-file-bytes
+      - "5000000"
+      - -https-host
+      - "cache.example.com"
+    restart: unless-stopped
+```
+
 ## Usage
 
 ```
