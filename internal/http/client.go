@@ -29,8 +29,9 @@ var (
 )
 
 const (
-	DefaultSaveCacheChunkBytes int64 = 900 * 1024
-	saveCacheMaxRetries              = 3
+	DefaultSaveCacheChunkBytes   int64 = 900 * 1024
+	saveCacheMaxRetries                = 3
+	saveCacheProgressLogInterval       = 10 * time.Second
 )
 
 const (
@@ -374,11 +375,19 @@ func (c *Client) SaveCache(req gocache.Request, batch gocache.Batch) (gocache.Tr
 		return gocache.TransferStats{Duration: time.Since(startedAt)}, nil
 	}
 
+	var sourceBytes int64
+	for _, item := range batch.Items {
+		sourceBytes += item.Size
+	}
+	log.Printf("save-cache upload starting: files=%d source_bytes=%d", len(batch.Items), sourceBytes)
+
 	var lastErr error
 	for attempt := 1; attempt <= saveCacheMaxRetries+1; attempt++ {
+		log.Printf("save-cache upload attempt %d/%d starting", attempt, saveCacheMaxRetries+1)
 		stats, err := c.saveCacheOnce(req, batch, startedAt)
 		if err == nil {
 			stats.Duration = time.Since(startedAt)
+			log.Printf("save-cache upload succeeded: files=%d wire_bytes=%d source_bytes=%d duration=%s", stats.Files, stats.CompressedBytes, stats.UncompressedBytes, stats.Duration)
 			return stats, nil
 		}
 
@@ -446,13 +455,24 @@ func (c *Client) saveCacheOnce(req gocache.Request, batch gocache.Batch, started
 		writerErrCh <- nil
 	}()
 
+	var batchSourceBytes int64
+	for _, item := range batch.Items {
+		batchSourceBytes += item.Size
+	}
+	log.Printf("save-cache upload_id=%s sending: files=%d source_bytes=%d chunk_bytes=%d", uploadID, len(batch.Items), batchSourceBytes, maxRequestBytes)
+
 	buf := make([]byte, maxRequestBytes)
+	lastLog := time.Now()
 	for {
 		n, err := io.ReadFull(pr, buf)
 		if n > 0 {
 			if chunkErr := c.saveCacheChunk(req, uploadID, buf[:n]); chunkErr != nil {
 				logAbortSaveCacheError(c.abortSaveCache(req, uploadID))
 				return gocache.TransferStats{}, fmt.Errorf("save-cache chunk upload failed upload_id=%s chunk_bytes=%d sent_files=%d sent_wire_bytes=%d sent_source_bytes=%d: %w", uploadID, n, atomic.LoadInt64(&writerFiles), atomic.LoadInt64(&writerWireBytes), atomic.LoadInt64(&writerSourceBytes), chunkErr)
+			}
+			if time.Since(lastLog) >= saveCacheProgressLogInterval {
+				log.Printf("save-cache upload_id=%s progress: sent_files=%d sent_wire_bytes=%d sent_source_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&writerFiles), atomic.LoadInt64(&writerWireBytes), atomic.LoadInt64(&writerSourceBytes), time.Since(startedAt))
+				lastLog = time.Now()
 			}
 		}
 
@@ -474,6 +494,8 @@ func (c *Client) saveCacheOnce(req gocache.Request, batch gocache.Batch, started
 		logAbortSaveCacheError(c.abortSaveCache(req, uploadID))
 		return gocache.TransferStats{}, fmt.Errorf("build save-cache stream failed upload_id=%s sent_files=%d sent_wire_bytes=%d sent_source_bytes=%d: %w", uploadID, atomic.LoadInt64(&writerFiles), atomic.LoadInt64(&writerWireBytes), atomic.LoadInt64(&writerSourceBytes), writerErr)
 	}
+
+	log.Printf("save-cache upload_id=%s all chunks sent, finalizing: sent_files=%d sent_wire_bytes=%d sent_source_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&writerFiles), atomic.LoadInt64(&writerWireBytes), atomic.LoadInt64(&writerSourceBytes), time.Since(startedAt))
 
 	if err := c.finalizeSaveCache(req, uploadID); err != nil {
 		logAbortSaveCacheError(c.abortSaveCache(req, uploadID))
