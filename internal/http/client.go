@@ -51,6 +51,7 @@ const (
 	headerRestorePrepareTime = "X-Gocacheprog-Restore-Prepare-Time"
 	headerRestoreTotalTime   = "X-Gocacheprog-Restore-Total-Time"
 	headerSaveTotalTime      = "X-Gocacheprog-Save-Total-Time"
+	headerSaveMaxFileBytes   = "X-Gocacheprog-Save-Max-File-Bytes"
 )
 
 type SessionInfo struct {
@@ -404,7 +405,8 @@ func (c *Client) SaveCache(req gocache.Request, batch gocache.Batch) (gocache.Tr
 
 func (c *Client) saveCacheOnce(req gocache.Request, batch gocache.Batch, startedAt time.Time) (gocache.TransferStats, error) {
 	uploadID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10) + "-" + strconv.Itoa(os.Getpid())
-	if err := c.startSaveCache(req, uploadID); err != nil {
+	serverMaxFileBytes, err := c.startSaveCache(req, uploadID)
+	if err != nil {
 		return gocache.TransferStats{}, err
 	}
 
@@ -425,6 +427,10 @@ func (c *Client) saveCacheOnce(req gocache.Request, batch gocache.Batch, started
 	go func() {
 		sw := gocache.NewStreamWriter(pw)
 		for _, item := range batch.Items {
+			if serverMaxFileBytes > 0 && item.Size > serverMaxFileBytes {
+				continue
+			}
+
 			atomic.AddInt64(&writerFiles, 1)
 			atomic.AddInt64(&writerSourceBytes, item.Size)
 
@@ -553,8 +559,42 @@ func logAbortSaveCacheError(err error) {
 	}
 }
 
-func (c *Client) startSaveCache(req gocache.Request, uploadID string) error {
-	return c.postSaveCacheControl(req, uploadID, "/save-cache-start", "save-cache-start")
+// startSaveCache begins a save-cache upload session and returns the server's
+// configured single-file size limit (0 if the server has no limit), so the
+// client can skip oversized files before spending time compressing and
+// sending them, without requiring a matching -max-file-bytes flag locally.
+func (c *Client) startSaveCache(req gocache.Request, uploadID string) (int64, error) {
+	r, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.baseURL+"/save-cache-start?"+saveCacheQuery(req, uploadID).Encode(), nil)
+	if err != nil {
+		return 0, err
+	}
+	setAuthHeader(r, c.authToken)
+
+	res, err := c.roundTrip(r)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close save-cache-start body: %s", err.Error())
+		}
+	}()
+
+	if err := checkStatus(res, http.StatusNoContent, "save-cache-start"); err != nil {
+		return 0, err
+	}
+
+	var serverMaxFileBytes int64
+	if v := strings.TrimSpace(res.Header.Get(headerSaveMaxFileBytes)); v != "" {
+		parsed, parseErr := strconv.ParseInt(v, 10, 64)
+		if parseErr != nil {
+			log.Printf("parse %s header %q: %s", headerSaveMaxFileBytes, v, parseErr.Error())
+		} else {
+			serverMaxFileBytes = parsed
+		}
+	}
+
+	return serverMaxFileBytes, nil
 }
 
 func (c *Client) saveCacheChunk(req gocache.Request, uploadID string, chunk []byte) error {
