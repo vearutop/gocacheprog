@@ -59,7 +59,7 @@ func (h *Handler) StartSaveCache(rw http.ResponseWriter, r *http.Request) {
 	h.saveSessions[uploadID] = &saveCacheSession{writer: pw, done: done, startedAt: now, lastLogUnixNano: now.UnixNano()}
 	h.saveSessionsMu.Unlock()
 
-	log.Printf("save-cache upload_id=%s start received: commit=%s changes=%s build_type=%s", uploadID, req.Commit, req.ChangesID, req.BuildType)
+	log.Printf("save-cache upload_id=%q start received: commit=%q changes=%q build_type=%q", uploadID, req.Commit, req.ChangesID, req.BuildType)
 
 	go func() {
 		done <- h.processSaveCacheStream(req, pr, uploadID)
@@ -107,7 +107,7 @@ func logSaveCacheProgress(uploadID string, session *saveCacheSession) {
 		return
 	}
 
-	log.Printf("save-cache upload_id=%s progress: received_chunks=%d received_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), now.Sub(session.startedAt))
+	log.Printf("save-cache upload_id=%q progress: received_chunks=%d received_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), now.Sub(session.startedAt))
 }
 
 func (h *Handler) FinalizeSaveCache(rw http.ResponseWriter, r *http.Request) {
@@ -124,7 +124,7 @@ func (h *Handler) FinalizeSaveCache(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("save-cache upload_id=%s finalize received: received_chunks=%d received_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt))
+	log.Printf("save-cache upload_id=%q finalize received: received_chunks=%d received_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt))
 
 	if err := session.writer.Close(); err != nil {
 		h.deleteSaveSession(uploadID)
@@ -139,7 +139,7 @@ func (h *Handler) FinalizeSaveCache(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("save-cache upload_id=%s finalize succeeded: received_chunks=%d received_bytes=%d duration=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt))
+	log.Printf("save-cache upload_id=%q finalize succeeded: received_chunks=%d received_bytes=%d duration=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt))
 
 	rw.Header().Set(headerSaveTotalTime, time.Since(session.startedAt).String())
 	rw.WriteHeader(http.StatusNoContent)
@@ -159,7 +159,7 @@ func (h *Handler) AbortSaveCache(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("save-cache upload_id=%s abort received: received_chunks=%d received_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt))
+	log.Printf("save-cache upload_id=%q abort received: received_chunks=%d received_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt))
 
 	closeWithLog(session.writer, "close save-cache session writer on abort")
 	h.deleteSaveSession(uploadID)
