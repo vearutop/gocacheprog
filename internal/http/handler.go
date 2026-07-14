@@ -135,11 +135,12 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 }
 
 type saveCacheSession struct {
-	writer    io.WriteCloser
-	done      chan error
-	startedAt time.Time
-	chunks    int64
-	bytes     int64
+	writer          io.WriteCloser
+	done            chan error
+	startedAt       time.Time
+	chunks          int64
+	bytes           int64
+	lastLogUnixNano int64
 }
 
 func (h *Handler) authorized(r *http.Request) bool {
@@ -157,7 +158,6 @@ func (h *Handler) authorized(r *http.Request) bool {
 }
 
 func logVersionProbe(r *http.Request) {
-	//nolint:gosec // request metadata is intentionally logged for debugging shim/daemon session fan-out.
 	log.Printf(
 		"version; remote=%s; session_id=%q; started_at=%q; pid=%q; cache_dir=%q; commit=%q; parent=%q; changes=%q; build_type=%q; base=%q",
 		r.RemoteAddr,

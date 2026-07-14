@@ -305,6 +305,47 @@ func TestStoreMaxFileBytes_SkipsSaveAndRestore(t *testing.T) {
 	require.Equal(t, []string{"small"}, restoredAfterSave)
 }
 
+// TestReadStream_DrainsSkippedItemBody guards against stream desync: if a
+// callback (e.g. Store.putOne skipping an oversized item) returns without
+// reading an item's body, ReadStream must still discard the unread bytes
+// itself so the next item's header is read from the correct offset.
+func TestReadStream_DrainsSkippedItemBody(t *testing.T) {
+	var buf bytes.Buffer
+	sw := NewStreamWriter(&buf)
+
+	skipped := FileItem{Path: "large", Size: 10, WireSize: 10}
+	skipped.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("1234567890")), nil
+	})
+	require.NoError(t, sw.WriteItem(skipped))
+
+	kept := FileItem{Path: "small", Size: 4, WireSize: 4}
+	kept.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("abcd")), nil
+	})
+	require.NoError(t, sw.WriteItem(kept))
+	require.NoError(t, sw.Close())
+
+	var paths []string
+	var bodies []string
+	_, err := ReadStream(&buf, func(item FileItem, body io.Reader) error {
+		if item.Path == "large" {
+			// Simulate putOne skipping an oversized item without reading its body.
+			return nil
+		}
+		paths = append(paths, item.Path)
+		data, err := io.ReadAll(body)
+		if err != nil {
+			return err
+		}
+		bodies = append(bodies, string(data))
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"small"}, paths)
+	require.Equal(t, []string{"abcd"}, bodies)
+}
+
 func TestMergeSavedPaths_ChangesIDMerges(t *testing.T) {
 	dir := t.TempDir()
 
