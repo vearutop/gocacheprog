@@ -135,11 +135,12 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 }
 
 type saveCacheSession struct {
-	writer    io.WriteCloser
-	done      chan error
-	startedAt time.Time
-	chunks    int64
-	bytes     int64
+	writer          io.WriteCloser
+	done            chan error
+	startedAt       time.Time
+	chunks          int64
+	bytes           int64
+	lastLogUnixNano int64
 }
 
 func (h *Handler) authorized(r *http.Request) bool {

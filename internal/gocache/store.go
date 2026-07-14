@@ -658,8 +658,14 @@ func ReadStream(rd io.Reader, read func(item FileItem, body io.Reader) error) (i
 
 		if wireSize > 0 {
 			bodyReader := io.LimitReader(rd, wireSize)
-			if err := read(item, bodyReader); err != nil {
-				return total, err
+			readErr := read(item, bodyReader)
+			// Drain whatever the callback left unread so the stream stays framed
+			// correctly for the next item, regardless of what read() did with the body.
+			if _, discardErr := io.Copy(io.Discard, bodyReader); discardErr != nil && readErr == nil {
+				readErr = fmt.Errorf("drain item body: %w", discardErr)
+			}
+			if readErr != nil {
+				return total, readErr
 			}
 			total += wireSize
 			continue
