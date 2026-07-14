@@ -238,6 +238,43 @@ func TestClient_SaveCache_ChunksAndFinalizes(t *testing.T) {
 	require.Equal(t, "ab/a\nab/b\nab/c\n", string(changesBody))
 }
 
+func TestClient_SaveCache_SkipsFilesExceedingServerMaxFileBytesWithoutClientFlag(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir, local.WithCompression())
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression(), gocache.WithMaxFileBytes(20))
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+	client.SetSaveCacheChunkBytes(128)
+
+	cacheDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "ab"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "small"), []byte(strings.Repeat("a", 10)), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "large"), []byte(strings.Repeat("b", 40)), 0o600))
+
+	// Client collects files with no local -max-file-bytes filtering (0, matching real CI usage),
+	// relying entirely on the server-advertised limit learned during save-cache-start.
+	batch, err := gocache.CollectFreshFiles(cacheDir, 0)
+	require.NoError(t, err)
+	require.Len(t, batch.Items, 2)
+
+	req := gocache.Request{Commit: "commit123", ChangesID: "repo/pr-123", BuildType: "unit"}
+	stats, err := client.SaveCache(req, batch)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Files)
+
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "co", "commit123")
+	commitBody, err := os.ReadFile(commitManifestPath)
+	require.NoError(t, err)
+	require.Equal(t, "ab/small\n", string(commitBody))
+}
+
 func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {
 	serverDir := t.TempDir()
 	localStore, err := local.NewStore(serverDir, local.WithCompression())
@@ -291,6 +328,75 @@ func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {
 	require.Contains(t, msg, "wire_size=10")
 	require.Contains(t, msg, "read_wire_bytes=5")
 	require.Contains(t, msg, "truncated item body")
+}
+
+// TestSaveCacheChunk_OversizedItemFollowedByAnotherDoesNotDeadlock guards
+// against a real deadlock: when Store.putOne silently skips an item over
+// -max-file-bytes, the save-cache callback must not mistake that intentional
+// skip for a truncated upload. Doing so used to make the stream-processing
+// goroutine return (and stop draining the pipe) while the SaveCacheChunk
+// HTTP handler was still writing the rest of that same chunk (the next
+// item) into the pipe — an unrecoverable hang with no error on either side.
+// A bounded client timeout turns a regression into a clear test failure
+// instead of hanging the test suite.
+func TestSaveCacheChunk_OversizedItemFollowedByAnotherDoesNotDeadlock(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir, local.WithCompression())
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression(), gocache.WithMaxFileBytes(20))
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	t.Cleanup(srv.Close)
+
+	uploadID := "deadlock-test"
+	startResp, err := srv.Client().Post(srv.URL+"/save-cache-start?upload-id="+uploadID+"&commit=commit123", "application/octet-stream", nil)
+	require.NoError(t, err)
+	require.NoError(t, startResp.Body.Close())
+	require.Equal(t, nethttp.StatusNoContent, startResp.StatusCode)
+
+	var chunk bytes.Buffer
+	oversized := gocache.FileItem{Path: "ab/oversized", Size: 30, WireSize: 30}
+	oversizedJSON, err := json.Marshal(oversized)
+	require.NoError(t, err)
+	require.NoError(t, binary.Write(&chunk, binary.BigEndian, int32(len(oversizedJSON))))
+	_, err = chunk.Write(oversizedJSON)
+	require.NoError(t, err)
+	_, err = chunk.WriteString(strings.Repeat("x", 30))
+	require.NoError(t, err)
+
+	normal := gocache.FileItem{Path: "ab/normal", Size: 10, WireSize: 10}
+	normalJSON, err := json.Marshal(normal)
+	require.NoError(t, err)
+	require.NoError(t, binary.Write(&chunk, binary.BigEndian, int32(len(normalJSON))))
+	_, err = chunk.Write(normalJSON)
+	require.NoError(t, err)
+	_, err = chunk.WriteString(strings.Repeat("y", 10))
+	require.NoError(t, err)
+
+	require.NoError(t, binary.Write(&chunk, binary.BigEndian, int32(0)))
+
+	boundedClient := *srv.Client()
+	boundedClient.Timeout = 5 * time.Second
+
+	chunkResp, err := boundedClient.Post(srv.URL+"/save-cache-chunk?upload-id="+uploadID+"&commit=commit123", "application/octet-stream", bytes.NewReader(chunk.Bytes()))
+	require.NoError(t, err, "chunk request must not hang/time out")
+	require.NoError(t, chunkResp.Body.Close())
+	require.Equal(t, nethttp.StatusNoContent, chunkResp.StatusCode)
+
+	finalizeResp, err := boundedClient.Post(srv.URL+"/save-cache-finalize?upload-id="+uploadID+"&commit=commit123", "application/octet-stream", nil)
+	require.NoError(t, err)
+	require.NoError(t, finalizeResp.Body.Close())
+	require.Equal(t, nethttp.StatusNoContent, finalizeResp.StatusCode)
+
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "default", "co", "commit123")
+	commitBody, err := os.ReadFile(commitManifestPath)
+	require.NoError(t, err)
+	require.Equal(t, "ab/normal\n", string(commitBody))
+
+	require.NoFileExists(t, filepath.Join(serverDir, "native", "objects", "ab", "oversized"))
+	require.FileExists(t, filepath.Join(serverDir, "native", "objects", "ab", "normal"))
 }
 
 func TestPreload_UsesCommitManifestFilters(t *testing.T) {

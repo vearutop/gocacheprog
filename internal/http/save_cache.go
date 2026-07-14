@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -65,6 +66,9 @@ func (h *Handler) StartSaveCache(rw http.ResponseWriter, r *http.Request) {
 		done <- h.processSaveCacheStream(req, pr, uploadID)
 	}()
 
+	if maxFileBytes := h.gocacheStore.MaxFileBytes(); maxFileBytes > 0 {
+		rw.Header().Set(headerSaveMaxFileBytes, strconv.FormatInt(maxFileBytes, 10))
+	}
 	rw.WriteHeader(http.StatusNoContent)
 }
 
@@ -179,6 +183,16 @@ func (h *Handler) processSaveCacheStream(req gocache.Request, body io.Reader, up
 		progress.items++
 		progress.path = item.Path
 		progress.sourceBytes += item.Size
+
+		if maxFileBytes := h.gocacheStore.MaxFileBytes(); maxFileBytes > 0 && item.Size > maxFileBytes {
+			// Store.SaveItem would skip this item without reading its body (it
+			// exceeds -max-file-bytes). Recognize that here too, before the
+			// truncation check below, so an intentional skip isn't mistaken for a
+			// truncated upload: ReadStream still drains the unread body bytes on
+			// its own regardless of what this callback does with itemBody.
+			return nil
+		}
+
 		expectedWireSize := item.WireSize
 		if expectedWireSize == 0 {
 			expectedWireSize = item.Size

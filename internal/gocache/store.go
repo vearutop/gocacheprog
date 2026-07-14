@@ -148,6 +148,11 @@ func WithMaxFileBytes(maxFileBytes int64) StoreOption {
 	}
 }
 
+// MaxFileBytes returns the configured single-file size limit, or 0 if unlimited.
+func (s *Store) MaxFileBytes() int64 {
+	return s.maxFileBytes
+}
+
 func WithMaxAge(maxAge time.Duration) StoreOption {
 	return func(s *Store) {
 		s.maxAge = maxAge
