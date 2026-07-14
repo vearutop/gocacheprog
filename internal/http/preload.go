@@ -110,7 +110,6 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set(headerPreloadPrepareTime, prepareTime.String())
 	rw.Header().Set(headerPreloadTotalTime, totalTime.String())
 
-	//nolint:gosec // preload request metadata is intentionally logged for diagnostics.
 	log.Printf(
 		"preload queue_wait=%s prepare_time=%s total_time=%s; remote=%s; commit=%q; parent=%q; changes=%q; build_type=%q; sources=%s; items=%d; content_length=%d",
 		queueWait,

@@ -158,7 +158,6 @@ func (h *Handler) authorized(r *http.Request) bool {
 }
 
 func logVersionProbe(r *http.Request) {
-	//nolint:gosec // request metadata is intentionally logged for debugging shim/daemon session fan-out.
 	log.Printf(
 		"version; remote=%s; session_id=%q; started_at=%q; pid=%q; cache_dir=%q; commit=%q; parent=%q; changes=%q; build_type=%q; base=%q",
 		r.RemoteAddr,
