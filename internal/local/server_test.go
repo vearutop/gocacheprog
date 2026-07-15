@@ -10,12 +10,26 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/acme/autocert"
 )
+
+func TestAutocertHTTPHandler_RedirectsToHTTPSHostPreservingPathAndQuery(t *testing.T) {
+	manager := &autocert.Manager{Prompt: autocert.AcceptTOS}
+	handler := autocertHTTPHandler("cache.example.com", manager)
+
+	req := httptest.NewRequest(http.MethodGet, "http://attacker.example.com/status?foo=bar", nil)
+	rw := httptest.NewRecorder()
+
+	handler.ServeHTTP(rw, req)
+
+	require.Equal(t, "https://cache.example.com/status?foo=bar", rw.Header().Get("Location"))
+}
 
 func TestWarmAutocertCertificateLoadsCachedECDSACert(t *testing.T) {
 	cacheDir := t.TempDir()

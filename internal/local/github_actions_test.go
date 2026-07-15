@@ -109,7 +109,7 @@ func TestGithubContext_PullRequestMissingEventPath(t *testing.T) {
 	t.Setenv("GITHUB_EVENT_NAME", "pull_request")
 	t.Setenv("GITHUB_EVENT_PATH", "")
 
-	_, _, _, err := githubContext()
+	_, _, _, err := githubContext() //nolint:dogsled // all three scope values are irrelevant when an error is expected.
 	require.Error(t, err)
 }
 
