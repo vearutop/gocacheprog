@@ -648,6 +648,7 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 		m := make(map[string]cacheprog.Response, len(batch))
 		r := cache.Request{ActionIDs: make([]string, 0, len(batch))}
 		reqs := map[string]cacheprog.Request{}
+		answered := make(map[string]bool, len(batch))
 
 		for _, req := range batch {
 			m[req.ActionID] = cacheprog.Response{ID: req.ID, Miss: true}
@@ -656,6 +657,8 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 		}
 
 		err := dc.upstream.Get(r, func(resp cache.ResponseItem) {
+			answered[resp.ActionID] = true
+
 			rs := m[resp.ActionID]
 			defer func() {
 				dc.resps <- rs
@@ -703,6 +706,17 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 		})
 		if err != nil {
 			dc.logf("upstream get failed: %s", err.Error())
+		}
+
+		// If the upstream call errored before (or partway through) streaming results, some
+		// or all of this batch's items never reached the callback above and so never got a
+		// response. Without this, cmd/go would hang forever waiting on those specific
+		// request IDs instead of just seeing a (recoverable) cache miss.
+		for actionID, req := range reqs {
+			if !answered[actionID] {
+				atomic.AddInt64(&dc.misses, 1)
+				dc.resps <- cacheprog.Response{ID: req.ID, Miss: true}
+			}
 		}
 
 		return
