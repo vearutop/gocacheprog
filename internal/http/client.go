@@ -34,6 +34,12 @@ const (
 	saveCacheProgressLogInterval       = 10 * time.Second
 )
 
+// defaultResponseHeaderTimeout bounds how long a request waits for the server to start
+// responding at all (not the full body transfer) before giving up. Healthy round trips are
+// normally well under a second; this only needs to be generous enough to absorb a slow-but-fine
+// request, not a genuinely stuck one.
+const defaultResponseHeaderTimeout = 3 * time.Second
+
 const (
 	headerSessionID          = "X-Gocacheprog-Session-Id"
 	headerStartedAt          = "X-Gocacheprog-Started-At"
@@ -126,6 +132,11 @@ func NewClientWithSession(baseURL string, authToken string, sessionInfo *Session
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true,
+		// Bounds time-to-first-byte only, not the full response body transfer, so a server
+		// that accepts a connection and then never responds (deadlock, overload, a stalled
+		// proxy in front of it) can't hang a request forever; a slow-but-actively-streaming
+		// large preload/restore body is unaffected once headers arrive.
+		ResponseHeaderTimeout: defaultResponseHeaderTimeout,
 	}
 
 	client.saveCacheMaxRequestBytes = DefaultSaveCacheChunkBytes

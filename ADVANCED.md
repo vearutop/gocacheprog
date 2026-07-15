@@ -720,6 +720,21 @@ Daemon mode collapses those into one local owner and one preload stream.
 
 ## Edge Cases
 
+### A stalled or unreachable remote server degrades to cache misses, not a hang
+
+Every remote HTTP request has a 3-second timeout on receiving response *headers*
+(`ResponseHeaderTimeout` in `internal/http/client.go`) — this only bounds time-to-first-byte, not
+the full body transfer, so a large but healthy preload/restore/save transfer is unaffected once
+the server starts responding.
+
+Additionally, `resolveBatch` guarantees every request in a batch gets a response even if the
+upstream `Get` call errors (or times out) before, or partway through, streaming results — items
+that never reached a response fall back to a miss instead of being silently dropped.
+
+Together these mean a remote server that's down, unreachable, or stuck can only ever cost you a
+cache miss (and up to ~3s per affected batch) — never an indefinite hang of the `go` invocation
+waiting on a response that will never arrive.
+
 ### GitHub Actions shallow checkout is not enough by itself
 
 Git-based mtime restoration with shallow history may be too inaccurate for stable test cache keys.

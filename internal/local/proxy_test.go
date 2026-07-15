@@ -1,6 +1,7 @@
 package local
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -460,6 +461,66 @@ func (s *concurrencyTrackingStore) maxObserved() int {
 	defer s.mu.Unlock()
 
 	return s.max
+}
+
+// partialFailureStore's Get calls back for the first respondBeforeFailure action IDs (in
+// request order) and then returns an error without calling back for the rest, simulating an
+// upstream connection that dies partway through streaming a batched response (or, with
+// respondBeforeFailure 0, one that fails before it ever starts responding at all).
+type partialFailureStore struct {
+	noopStore
+	respondBeforeFailure int
+}
+
+func (s *partialFailureStore) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
+	for i, actionID := range req.ActionIDs {
+		if i >= s.respondBeforeFailure {
+			return errors.New("simulated upstream failure")
+		}
+		cb(cache.ResponseItem{ActionID: actionID, Miss: true})
+	}
+
+	return errors.New("simulated upstream failure")
+}
+
+// TestProxyResolveBatch_UpstreamErrorStillRespondsToEveryItem guards against cmd/go hanging
+// forever on a lookup whose upstream batch call failed (or timed out) before ever reaching that
+// item: every request in the batch must get a response regardless of how far the upstream call
+// got before failing.
+func TestProxyResolveBatch_UpstreamErrorStillRespondsToEveryItem(t *testing.T) {
+	for _, respondBeforeFailure := range []int{0, 1} {
+		t.Run(fmt.Sprintf("respondBeforeFailure=%d", respondBeforeFailure), func(t *testing.T) {
+			store, err := NewStore(t.TempDir())
+			require.NoError(t, err)
+
+			upstream := &partialFailureStore{respondBeforeFailure: respondBeforeFailure}
+			resps := make(chan cacheprog.Response, 10)
+			proxy := NewProxy(store, upstream, resps, ProxyParams{})
+			t.Cleanup(func() {
+				require.NoError(t, proxy.Close())
+			})
+
+			batch := []cacheprog.Request{
+				{ID: 1, ActionID: "action-1"},
+				{ID: 2, ActionID: "action-2"},
+				{ID: 3, ActionID: "action-3"},
+			}
+			proxy.resolveBatch(batch)
+
+			got := map[int64]cacheprog.Response{}
+			for i := 0; i < len(batch); i++ {
+				resp := <-resps
+				got[resp.ID] = resp
+			}
+
+			require.Len(t, got, len(batch), "every request in the batch must get a response")
+			for _, req := range batch {
+				resp, ok := got[req.ID]
+				require.True(t, ok, "missing response for request ID %d", req.ID)
+				require.True(t, resp.Miss)
+			}
+		})
+	}
 }
 
 func (r *remoteBudgetStub) Put(values cache.Response) error {
