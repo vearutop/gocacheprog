@@ -728,6 +728,56 @@ func (dc *Proxy) PrintStats() {
 	dc.logf("%s", sb.String())
 }
 
+// StatsSummary is a final, job-level cache report: hits/misses/puts plus, when a remote
+// upstream is configured, bytes transferred and time spent on remote round trips.
+type StatsSummary struct {
+	Hits    int64  `json:"hits"`
+	Misses  int64  `json:"misses"`
+	Puts    int64  `json:"puts"`
+	HitRate string `json:"hit_rate"`
+
+	BytesRead      string `json:"bytes_read,omitempty"`
+	BytesWritten   string `json:"bytes_written,omitempty"`
+	GetTotalTime   string `json:"get_total_time,omitempty"`
+	GetCount       string `json:"get_count,omitempty"`
+	PreloadedBytes string `json:"preloaded_bytes,omitempty"`
+}
+
+func (s StatsSummary) String() string {
+	str := fmt.Sprintf("hits=%d misses=%d puts=%d hit_rate=%s", s.Hits, s.Misses, s.Puts, s.HitRate)
+	if s.BytesRead != "" || s.BytesWritten != "" {
+		str += fmt.Sprintf(" bytes_read=%s bytes_written=%s round_trip_time=%s", s.BytesRead, s.BytesWritten, s.GetTotalTime)
+	}
+
+	return str
+}
+
+// StatsSummary returns the current cumulative StatsSummary for this Proxy.
+func (dc *Proxy) StatsSummary() StatsSummary {
+	hits := atomic.LoadInt64(&dc.hits)
+	misses := atomic.LoadInt64(&dc.misses)
+
+	summary := StatsSummary{
+		Hits:    hits,
+		Misses:  misses,
+		Puts:    atomic.LoadInt64(&dc.puts),
+		HitRate: percent(hits, hits+misses),
+	}
+
+	if dc.upstream != nil {
+		if s, ok := dc.upstream.(interface{ Stats() map[string]string }); ok {
+			st := s.Stats()
+			summary.BytesRead = st["bytes_read"]
+			summary.BytesWritten = st["bytes_written"]
+			summary.GetTotalTime = st["get_total_time"]
+			summary.GetCount = st["get_cnt"]
+			summary.PreloadedBytes = st["preload_bytes"]
+		}
+	}
+
+	return summary
+}
+
 func (dc *Proxy) putRespItem(item cache.ResponseItem, body []byte) error {
 	item.SetBodyReader(func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(body)), nil

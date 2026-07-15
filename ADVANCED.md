@@ -127,6 +127,8 @@ Usage of ./bin/gocacheprog:
         maximum number of concurrent preload preparations in server mode (default 2)
   -preload-only
         preload cache into -cache-dir and exit without running as helper or uploading cache-used
+  -quiet
+        suppress informational logging, keeping only fatal errors; used for GOCACHEPROG helper instances started via -github-actions-init so they don't clutter go build/test output
   -remote-url string
         remote HTTP server cache source, e.g. https://example.com:8080
   -restore-cache

@@ -28,6 +28,14 @@
 // own environment instead of being passed in: pull_request(_target) events use
 // event.pull_request.head/base.sha and "<repo>#<number>"; every other event uses
 // $GITHUB_SHA alone.
+//
+// GOCACHEPROG helper instances started for direct/shim mode (the ones cmd/go invokes directly)
+// always pass -quiet, so only a fatal error ever prints there instead of routine cache logging
+// mixing into go build/test output. -github-actions-done reports a final StatsSummary
+// (hits/misses/puts, bytes read/written, and round-trip time) once it finishes: shim mode reads
+// it back from the daemon's stop response, gocache mode combines restore (persisted via
+// GOCACHEPROG_GHA_RESTORE_STATS) and save stats, and direct mode aggregates whatever each -quiet
+// invocation appended via AppendQuietRunStats to quietRunStatsFilename next to the cache dir.
 package local
 
 import (
@@ -67,6 +75,7 @@ const (
 	envGHABuildType    = "GOCACHEPROG_GHA_BUILD_TYPE"
 	envGHABaseCommit   = "GOCACHEPROG_GHA_BASE_COMMIT"
 	envGHAMaxFileBytes = "GOCACHEPROG_GHA_MAX_FILE_BYTES"
+	envGHARestoreStats = "GOCACHEPROG_GHA_RESTORE_STATS"
 )
 
 type githubActionsConfig struct {
@@ -124,15 +133,16 @@ func GithubActionsInit(dsn string) error {
 }
 
 // GithubActionsDone finalizes caching started by -github-actions-init. It reads back the
-// state -github-actions-init left in $GITHUB_ENV and is a no-op for direct mode.
+// state -github-actions-init left in $GITHUB_ENV: it stops the daemon (shim mode), uploads
+// freshly-built cache entries (gocache mode), or just prints a final cache summary (direct
+// mode, which has no other background state to finalize).
 func GithubActionsDone() error {
 	mode := os.Getenv(envGHAMode)
 	log.Printf("github-actions-done: mode=%q", mode)
 
 	switch mode {
 	case "direct":
-		log.Printf("github-actions-done: direct mode has no background state to finalize")
-		return nil
+		return doneDirectMode()
 	case "shim":
 		return doneShimMode()
 	case "gocache":
@@ -354,13 +364,15 @@ func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, ch
 		"-cache-dir", cacheDir,
 		"-remote-url", cfg.remoteURL,
 		"-skip-preload",
+		"-quiet",
 		"-max-file-bytes", strconv.FormatInt(cfg.maxFileBytes, 10),
 	}
 	args = append(args, commonScopeArgs(cfg, commit, baseCommit, changesID)...)
 
 	env := map[string]string{
-		"GOCACHEPROG": shellJoin(self, args),
-		envGHAMode:    "direct",
+		"GOCACHEPROG":  shellJoin(self, args),
+		envGHAMode:     "direct",
+		envGHACacheDir: cacheDir,
 	}
 
 	log.Printf("github-actions-init: direct mode ready, GOCACHEPROG=%q", env["GOCACHEPROG"])
@@ -424,7 +436,7 @@ func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, chan
 	}
 	log.Printf("github-actions-init: daemon socket %s is ready", socket)
 
-	clientArgs := []string{"-remote-url", "unix://" + socket}
+	clientArgs := []string{"-remote-url", "unix://" + socket, "-quiet"}
 	if cfg.authToken != "" {
 		clientArgs = append(clientArgs, "-auth-token", cfg.authToken)
 	}
@@ -478,8 +490,14 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 	}
 
 	log.Printf("github-actions-init: restoring native GOCACHE into %s from %s", cacheDir, cfg.remoteURL)
-	if err := RestoreNativeCache(cacheDir, client, req, startedAt); err != nil {
+	restoreStats, err := RestoreNativeCache(cacheDir, client, req, startedAt)
+	if err != nil {
 		return fmt.Errorf("restore native cache: %w", err)
+	}
+
+	restoreStatsJSON, err := json.Marshal(restoreStats)
+	if err != nil {
+		return fmt.Errorf("marshal restore stats: %w", err)
 	}
 
 	env := map[string]string{
@@ -493,6 +511,7 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 		envGHABuildType:    cfg.buildType,
 		envGHABaseCommit:   baseCommit,
 		envGHAMaxFileBytes: strconv.FormatInt(cfg.maxFileBytes, 10),
+		envGHARestoreStats: string(restoreStatsJSON),
 	}
 
 	log.Printf("github-actions-init: gocache mode ready, GOCACHE=%q", cacheDir)
@@ -511,23 +530,21 @@ func doneShimMode() error {
 	}
 
 	log.Printf("github-actions-done: stopping daemon on socket %s", socket)
-	lines, stopErr := StopShimServer("unix://"+socket, auth)
-	for _, line := range lines {
-		log.Print(line)
-	}
+	resp, stopErr := StopShimServer("unix://"+socket, auth)
 
 	if stopErr != nil {
 		log.Printf("github-actions-done: graceful stop failed: %s", stopErr.Error())
 		if pidFile != "" {
 			killByPIDFile(pidFile)
 		}
-	} else {
-		log.Printf("github-actions-done: daemon stopped gracefully")
+		if logFile != "" {
+			log.Printf("github-actions-done: daemon log tail (%s):\n%s", logFile, tailFile(logFile, githubActionsLogTailBytes))
+		}
+		return nil
 	}
 
-	if logFile != "" {
-		log.Printf("github-actions-done: daemon log tail (%s):\n%s", logFile, tailFile(logFile, githubActionsLogTailBytes))
-	}
+	log.Printf("github-actions-done: daemon stopped gracefully")
+	log.Printf("github-actions-done: cache summary: %s", resp.Stats.String())
 
 	return nil
 }
@@ -576,7 +593,119 @@ func doneGocacheMode() error {
 	}
 
 	log.Printf("github-actions-done: saving native GOCACHE from %s to %s", cacheDir, remoteURL)
-	return SaveNativeCache(cacheDir, client, req, maxFileBytes)
+	saveStats, err := SaveNativeCache(cacheDir, client, req, maxFileBytes)
+	if err != nil {
+		return err
+	}
+
+	var restoreStats gocache.TransferStats
+	if raw := os.Getenv(envGHARestoreStats); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &restoreStats); err != nil {
+			log.Printf("github-actions-done: parse restore stats: %s", err.Error())
+		}
+	}
+
+	log.Printf(
+		"github-actions-done: cache summary: restore(files=%d compressed=%s uncompressed=%s time=%s) save(files=%d compressed=%s uncompressed=%s time=%s)",
+		restoreStats.Files,
+		humanBytesBinary(restoreStats.CompressedBytes),
+		humanBytesBinary(restoreStats.UncompressedBytes),
+		restoreStats.Duration,
+		saveStats.Files,
+		humanBytesBinary(saveStats.CompressedBytes),
+		humanBytesBinary(saveStats.UncompressedBytes),
+		saveStats.Duration,
+	)
+
+	return nil
+}
+
+// quietRunStatsFilename is where each -quiet direct-mode invocation appends its final
+// StatsSummary (one JSON line per invocation) so doneDirectMode can report a job-level summary.
+const quietRunStatsFilename = ".gocacheprog-run-stats.jsonl"
+
+// AppendQuietRunStats appends one StatsSummary line to the per-cache-dir run stats file used
+// by direct mode's -github-actions-done to report a final cache summary. A no-op if dir is empty.
+func AppendQuietRunStats(dir string, summary StatsSummary) error {
+	if dir == "" {
+		return nil
+	}
+
+	data, err := json.Marshal(summary)
+	if err != nil {
+		return fmt.Errorf("marshal run stats: %w", err)
+	}
+
+	f, err := os.OpenFile(filepath.Join(dir, quietRunStatsFilename), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644) //nolint:gosec // dir is the configured cache dir.
+	if err != nil {
+		return fmt.Errorf("open run stats file: %w", err)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			log.Printf("close run stats file: %s", closeErr.Error())
+		}
+	}()
+
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("write run stats: %w", err)
+	}
+
+	return nil
+}
+
+// doneDirectMode has no daemon or native GOCACHE state to finalize, so it just reports the
+// final cache summary accumulated by direct-mode invocation(s) recorded via AppendQuietRunStats.
+func doneDirectMode() error {
+	cacheDir := os.Getenv(envGHACacheDir)
+	if cacheDir == "" {
+		log.Printf("github-actions-done: direct mode recorded no cache dir, nothing to summarize")
+		return nil
+	}
+
+	statsPath := filepath.Join(cacheDir, quietRunStatsFilename)
+	data, err := os.ReadFile(statsPath) //nolint:gosec // statsPath is derived from the configured cache dir.
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("github-actions-done: no run stats recorded at %s", statsPath)
+			return nil
+		}
+		return fmt.Errorf("read run stats: %w", err)
+	}
+
+	var summaries []StatsSummary
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var summary StatsSummary
+		if err := json.Unmarshal([]byte(line), &summary); err != nil {
+			log.Printf("github-actions-done: parse run stats line: %s", err.Error())
+			continue
+		}
+		summaries = append(summaries, summary)
+	}
+
+	switch len(summaries) {
+	case 0:
+		log.Printf("github-actions-done: no run stats recorded at %s", statsPath)
+	case 1:
+		log.Printf("github-actions-done: cache summary: %s", summaries[0].String())
+	default:
+		var total StatsSummary
+		for _, s := range summaries {
+			total.Hits += s.Hits
+			total.Misses += s.Misses
+			total.Puts += s.Puts
+		}
+		total.HitRate = percent(total.Hits, total.Hits+total.Misses)
+		log.Printf("github-actions-done: cache summary across %d go invocations: %s", len(summaries), total.String())
+	}
+
+	if err := os.Remove(statsPath); err != nil && !os.IsNotExist(err) { //nolint:gosec // statsPath is derived from the configured cache dir.
+		log.Printf("github-actions-done: remove run stats file: %s", err.Error())
+	}
+
+	return nil
 }
 
 func waitForShimSocket(socket string, timeout time.Duration) error {

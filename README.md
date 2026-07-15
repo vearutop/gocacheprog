@@ -74,11 +74,21 @@ parameters — and:
 - canonicalizes repo timestamps (stable cache keys on fresh checkouts)
 - preloads the likely-needed cache working set in bulk
 - sets `GOCACHEPROG` (or `GOCACHE`, depending on mode — see [Modes](#modes) below) via
-  `$GITHUB_ENV` so the rest of the job just runs `go` normally
+  `$GITHUB_ENV` so the rest of the job just runs `go` normally, quietly: in `direct`/`shim` mode
+  the `GOCACHEPROG` helper instances that run under `go build`/`go test` pass `-quiet`, so only a
+  fatal error ever prints — routine cache logging doesn't clutter your test output
 
-`-github-actions-done` reverses whatever `-github-actions-init` set up: stops the daemon (shim
-mode), uploads freshly-built cache entries (gocache mode), or does nothing (direct mode). Run it
-in an `if: ${{ always() }}` step so it also finalizes on test failure.
+`-github-actions-done` reverses whatever `-github-actions-init` set up, then prints a final cache
+summary (hits/misses/puts, and — where a remote round trip is involved — bytes read/written and
+time spent on it):
+
+- `shim` mode: stops the daemon and reports its job-wide cumulative stats
+- `gocache` mode: uploads freshly-built cache entries and reports combined restore + save stats
+- `direct` mode: no daemon to stop, but each `-quiet` invocation appends its stats to a small file
+  next to the cache dir, so `-github-actions-done` still reports a summary (aggregated across
+  invocations, if the job ran `go` more than once)
+
+Run it in an `if: ${{ always() }}` step so it also finalizes on test failure.
 
 See [sample-workflow.yml](sample-workflow.yml) for a minimal example.
 

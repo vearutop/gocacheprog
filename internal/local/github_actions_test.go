@@ -3,6 +3,7 @@ package local
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,6 +145,52 @@ func TestTailFile(t *testing.T) {
 func TestWaitForShimSocket_TimesOutWhenNothingListens(t *testing.T) {
 	err := waitForShimSocket(filepath.Join(t.TempDir(), "nonexistent.sock"), 300*time.Millisecond)
 	require.Error(t, err)
+}
+
+func TestAppendQuietRunStats_NoopWithoutDir(t *testing.T) {
+	require.NoError(t, AppendQuietRunStats("", StatsSummary{Hits: 1}))
+}
+
+func TestAppendQuietRunStats_AppendsJSONLines(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 1, Misses: 2, Puts: 3}))
+	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 4, Misses: 5, Puts: 6}))
+
+	data, err := os.ReadFile(filepath.Join(dir, quietRunStatsFilename))
+	require.NoError(t, err)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	require.Len(t, lines, 2)
+}
+
+func TestDoneDirectMode_NoCacheDirRecorded(t *testing.T) {
+	t.Setenv(envGHACacheDir, "")
+	require.NoError(t, doneDirectMode())
+}
+
+func TestDoneDirectMode_NoStatsFile(t *testing.T) {
+	t.Setenv(envGHACacheDir, t.TempDir())
+	require.NoError(t, doneDirectMode())
+}
+
+func TestDoneDirectMode_SingleInvocation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envGHACacheDir, dir)
+	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 8, Misses: 2, Puts: 1, HitRate: "80.0%"}))
+
+	require.NoError(t, doneDirectMode())
+
+	_, err := os.Stat(filepath.Join(dir, quietRunStatsFilename))
+	require.ErrorIs(t, err, os.ErrNotExist, "stats file should be removed after being reported")
+}
+
+func TestDoneDirectMode_MultipleInvocationsAggregatesCounts(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envGHACacheDir, dir)
+	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 3, Misses: 1, Puts: 1}))
+	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 5, Misses: 1, Puts: 2}))
+
+	require.NoError(t, doneDirectMode())
 }
 
 func writeFile(t *testing.T, path, content string) {

@@ -24,7 +24,10 @@ import (
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err.Error())
+		// Bypasses the log package deliberately: -quiet redirects it to io.Discard, and a
+		// fatal exit must always be visible regardless of that.
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
 	}
 }
 
@@ -55,9 +58,14 @@ func run() error {
 	canonicalize := flag.String("canonicalize-timestamps", "", "canonicalize file and directory timestamps under this repo root and exit")
 	githubActionsInit := flag.String("github-actions-init", "", "set up caching for a GitHub Actions job from a single DSN; see internal/local/github_actions.go for the DSN format")
 	githubActionsDone := flag.Bool("github-actions-done", false, "finalize caching started by -github-actions-init in an always() step")
+	quiet := flag.Bool("quiet", false, "suppress informational logging, keeping only fatal errors; used for GOCACHEPROG helper instances started via -github-actions-init so they don't clutter go build/test output")
 	ver := flag.Bool("version", false, "print version and exit")
 
 	flag.Parse()
+
+	if *quiet {
+		log.SetOutput(io.Discard)
+	}
 
 	if *ver {
 		fmt.Println(version.Module("github.com/vearutop/gocacheprog").Version)
@@ -77,10 +85,11 @@ func run() error {
 	}
 
 	if *stop != "" {
-		lines, err := local.StopShimServer(*stop, *authToken)
-		for _, line := range lines {
+		resp, err := local.StopShimServer(*stop, *authToken)
+		for _, line := range resp.Lines {
 			log.Print(line)
 		}
+		log.Printf("cache summary: %s", resp.Stats.String())
 		return err
 	}
 
@@ -99,7 +108,7 @@ func run() error {
 	}
 
 	if isLocalRemoteURL(*remoteURL) && *httpListen == "" && !*preloadOnly {
-		return runShim(*remoteURL, *authToken, *dumpLogs)
+		return runShim(*remoteURL, *authToken, *dumpLogs, *quiet)
 	}
 
 	if *dir == "" {
@@ -138,7 +147,9 @@ func run() error {
 		return runDaemon(*httpListen, *dir, *remoteURL, *authToken, *maxDiskBytes, *params)
 	}
 
-	println("starting at dir", *dir)
+	if !*quiet {
+		println("starting at dir", *dir)
+	}
 
 	var (
 		logDump  io.Writer
@@ -217,7 +228,13 @@ func run() error {
 	}
 	close(resps)
 
-	dc.PrintStats()
+	if *quiet {
+		if err := local.AppendQuietRunStats(*dir, dc.StatsSummary()); err != nil {
+			log.Printf("append run stats: %s", err.Error())
+		}
+	} else {
+		dc.PrintStats()
+	}
 
 	return nil
 }
@@ -308,10 +325,12 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 	}
 
 	if restoreCache {
-		return local.RestoreNativeCache(cacheDir, client, req, startedAt)
+		_, err := local.RestoreNativeCache(cacheDir, client, req, startedAt)
+		return err
 	}
 
-	return local.SaveNativeCache(cacheDir, client, req, maxFileBytes)
+	_, err = local.SaveNativeCache(cacheDir, client, req, maxFileBytes)
+	return err
 }
 
 func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, params local.ProxyParams) error {
@@ -357,7 +376,7 @@ func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, par
 	closeErr := proxy.Close()
 	close(resps)
 	if stopRequested {
-		resp := local.ShimStopResponse{Lines: recentLogf.Lines()}
+		resp := local.ShimStopResponse{Lines: recentLogf.Lines(), Stats: proxy.StatsSummary()}
 		if err != nil {
 			resp.Err = err.Error()
 		} else if closeErr != nil {
@@ -416,8 +435,10 @@ func newUpstreamClient(remoteURL, authToken, cacheDir string, params local.Proxy
 	})
 }
 
-func runShim(remoteURL string, authToken string, dumpLogs string) error {
-	println("starting shim via", remoteURL)
+func runShim(remoteURL string, authToken string, dumpLogs string, quiet bool) error {
+	if !quiet {
+		println("starting shim via", remoteURL)
+	}
 
 	var logDump io.Writer
 	if dumpLogs != "" {

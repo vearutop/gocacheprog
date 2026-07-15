@@ -188,6 +188,58 @@ func TestProxyStats_HitBreakdown(t *testing.T) {
 	require.Equal(t, "50.0%", stats["miss_rate"])
 }
 
+func TestProxyStatsSummary_WithoutUpstream(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, nil, make(chan cacheprog.Response, 1), ProxyParams{})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	atomic.StoreInt64(&proxy.hits, 3)
+	atomic.StoreInt64(&proxy.misses, 1)
+	atomic.StoreInt64(&proxy.puts, 2)
+
+	summary := proxy.StatsSummary()
+	require.Equal(t, int64(3), summary.Hits)
+	require.Equal(t, int64(1), summary.Misses)
+	require.Equal(t, int64(2), summary.Puts)
+	require.Equal(t, "75.0%", summary.HitRate)
+	require.Empty(t, summary.BytesRead)
+	require.Equal(t, "hits=3 misses=1 puts=2 hit_rate=75.0%", summary.String())
+}
+
+func TestProxyStatsSummary_WithUpstream(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, statsUpstream{}, make(chan cacheprog.Response, 1), ProxyParams{})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	atomic.StoreInt64(&proxy.hits, 1)
+
+	summary := proxy.StatsSummary()
+	require.Equal(t, "1.2MB", summary.BytesRead)
+	require.Equal(t, "3.4KB", summary.BytesWritten)
+	require.Equal(t, "123ms", summary.GetTotalTime)
+	require.Contains(t, summary.String(), "bytes_read=1.2MB bytes_written=3.4KB round_trip_time=123ms")
+}
+
+type statsUpstream struct {
+	noopStore
+}
+
+func (statsUpstream) Stats() map[string]string {
+	return map[string]string{
+		"bytes_read":     "1.2MB",
+		"bytes_written":  "3.4KB",
+		"get_total_time": "123ms",
+		"get_cnt":        "5",
+		"preload_bytes":  "0B",
+	}
+}
+
 func TestProxyClose_SkipsRemotePutAboveMaxFileBytes(t *testing.T) {
 	upstream := &putRecorderStub{}
 

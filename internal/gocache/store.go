@@ -67,10 +67,10 @@ type StreamWriter struct {
 }
 
 type TransferStats struct {
-	Files             int
-	CompressedBytes   int64
-	UncompressedBytes int64
-	Duration          time.Duration
+	Files             int           `json:"files"`
+	CompressedBytes   int64         `json:"compressed_bytes"`
+	UncompressedBytes int64         `json:"uncompressed_bytes"`
+	Duration          time.Duration `json:"duration"`
 }
 
 type ClearStats struct {
