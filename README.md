@@ -79,14 +79,23 @@ parameters — and:
   fatal error ever prints — routine cache logging doesn't clutter your test output
 
 `-github-actions-done` reverses whatever `-github-actions-init` set up, then prints a final cache
-summary (hits/misses/puts, and — where a remote round trip is involved — bytes read/written and
-time spent on it):
+summary: hits/misses/puts, total wall-clock time since `-github-actions-init` started, and — where
+a remote round trip is involved — bytes read/written, how many round trips it took, and time spent
+on them. The round trip count is usually much lower than the miss count: misses are batched
+through a short barrier before each batch is resolved in a single round trip (see
+[ADVANCED.md](ADVANCED.md#remote-batch-resolution-concurrency)), and those batches themselves now
+run concurrently rather than one at a time — a real speedup for shim mode in particular, where one
+daemon fields batches from many `go` invocations over the life of a job.
 
-- `shim` mode: stops the daemon and reports its job-wide cumulative stats
+- `shim` mode: stops the daemon and reports its job-wide cumulative stats, including how many
+  separate `go` invocations shared that one daemon session
 - `gocache` mode: uploads freshly-built cache entries and reports combined restore + save stats
-- `direct` mode: no daemon to stop, but each `-quiet` invocation appends its stats to a small file
-  next to the cache dir, so `-github-actions-done` still reports a summary (aggregated across
-  invocations, if the job ran `go` more than once)
+- `direct` mode: no daemon to stop, but each `-quiet` invocation appends its stats (plus its
+  parent process's PID and, on Linux, command line) to a small file next to the cache dir, so
+  `-github-actions-done` still reports a summary aggregated across invocations if the job ran
+  `go` more than once — and, when it did, breaks the count down by parent command, so an
+  unexpectedly high invocation count (e.g. `go tool covdata` calls fanned out by `-coverprofile`)
+  is traceable straight from the job log
 
 Run it in an `if: ${{ always() }}` step so it also finalizes on test failure.
 

@@ -129,6 +129,8 @@ Usage of ./bin/gocacheprog:
         preload cache into -cache-dir and exit without running as helper or uploading cache-used
   -quiet
         suppress informational logging, keeping only fatal errors; used for GOCACHEPROG helper instances started via -github-actions-init so they don't clutter go build/test output
+  -remote-batch-concurrency int
+        maximum number of batched remote Get round trips in flight at once; 0 uses a sane default
   -remote-url string
         remote HTTP server cache source, e.g. https://example.com:8080
   -restore-cache
@@ -676,6 +678,26 @@ Do not jump straight to very high values without observing:
 - queue wait
 - preparation time
 - server I/O behavior
+
+### Remote batch resolution concurrency
+
+Cache misses are batched through a short barrier (up to `100` items or `20ms`, whichever comes
+first) before each batch is resolved against the remote server in a single round trip — see
+`batchBarrierTick`/`batchBarrierItems` in `internal/local/proxy.go`.
+
+Those batch round trips run concurrently with each other, bounded by `-remote-batch-concurrency`
+(default `8`). Without that bound, a batch's remote round trip would block the same goroutine that
+also drains new lookups and starts the next batch, serializing every remote round trip in a job
+onto one at a time regardless of how many are genuinely outstanding — this matters most for shim
+mode, where one daemon fields batches from many concurrent `go` invocations over the life of a job.
+
+Raise it if the daemon's final cache summary shows a high `round_trips` count relative to
+`round_trip_time` (many small, fast round trips rather than a few big ones) and CPU/network
+headroom allows more concurrency:
+
+```bash
+gocacheprog -http unix:///tmp/gocacheprog.sock -remote-batch-concurrency 16 ...
+```
 
 ### Why daemon mode exists
 

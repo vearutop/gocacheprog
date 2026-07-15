@@ -253,6 +253,37 @@ func TestSumStatsSummaries_AggregatesCountsRoundTripTimeAndBytes(t *testing.T) {
 	require.Equal(t, "hits=10 misses=2 puts=3 hit_rate=83.3% bytes_read=1.5MB bytes_written=3KB round_trip_time=308.513365ms", total.String())
 }
 
+func TestSumStatsSummaries_SumsRoundTrips(t *testing.T) {
+	total := sumStatsSummaries([]StatsSummary{
+		{Hits: 1, RoundTrips: 3},
+		{Hits: 1, RoundTrips: 5},
+	})
+
+	require.Equal(t, int64(8), total.RoundTrips)
+	require.Contains(t, total.String(), "round_trips=8")
+}
+
+func TestElapsedSinceInit_MissingEnvVar(t *testing.T) {
+	t.Setenv(envGHAInitTime, "")
+	_, ok := elapsedSinceInit()
+	require.False(t, ok)
+}
+
+func TestElapsedSinceInit_InvalidEnvVar(t *testing.T) {
+	t.Setenv(envGHAInitTime, "not-a-timestamp")
+	_, ok := elapsedSinceInit()
+	require.False(t, ok)
+}
+
+func TestElapsedSinceInit_ComputesElapsedDuration(t *testing.T) {
+	t.Setenv(envGHAInitTime, time.Now().Add(-5*time.Second).UTC().Format(time.RFC3339Nano))
+
+	elapsed, ok := elapsedSinceInit()
+	require.True(t, ok)
+	require.GreaterOrEqual(t, elapsed, 5*time.Second)
+	require.Less(t, elapsed, 15*time.Second)
+}
+
 func TestParseByteSize_RoundTripsWithFormatByteSize(t *testing.T) {
 	for _, tc := range []struct {
 		input string

@@ -84,6 +84,7 @@ const (
 	envGHABaseCommit   = "GOCACHEPROG_GHA_BASE_COMMIT"
 	envGHAMaxFileBytes = "GOCACHEPROG_GHA_MAX_FILE_BYTES"
 	envGHARestoreStats = "GOCACHEPROG_GHA_RESTORE_STATS"
+	envGHAInitTime     = "GOCACHEPROG_GHA_INIT_TIME"
 )
 
 type githubActionsConfig struct {
@@ -100,6 +101,8 @@ type githubActionsConfig struct {
 // GithubActionsInit sets up caching for a GitHub Actions job from a single DSN. See the
 // package doc comment above for the DSN format.
 func GithubActionsInit(dsn string) error {
+	initStartedAt := time.Now().UTC()
+
 	cfg, err := parseGithubActionsDSN(dsn)
 	if err != nil {
 		return fmt.Errorf("github-actions-init: %w", err)
@@ -130,11 +133,11 @@ func GithubActionsInit(dsn string) error {
 
 	switch cfg.mode {
 	case "direct":
-		return initDirectMode(self, cfg, commit, baseCommit, changesID)
+		return initDirectMode(self, cfg, commit, baseCommit, changesID, initStartedAt)
 	case "shim":
-		return initShimMode(self, cfg, commit, baseCommit, changesID)
+		return initShimMode(self, cfg, commit, baseCommit, changesID, initStartedAt)
 	case "gocache":
-		return initGocacheMode(cfg, commit, baseCommit, changesID)
+		return initGocacheMode(cfg, commit, baseCommit, changesID, initStartedAt)
 	default:
 		return fmt.Errorf("github-actions-init: unsupported mode %q (expected direct, shim, or gocache)", cfg.mode)
 	}
@@ -357,7 +360,7 @@ func runPreloadOnly(self, cacheDir string, cfg githubActionsConfig, commit, base
 	log.Printf("github-actions-init: preload finished in %s", time.Since(startedAt))
 }
 
-func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, changesID string) error {
+func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
 	cacheDir, err := resolveHelperCacheDir(cfg.cacheDir)
 	if err != nil {
 		return err
@@ -381,6 +384,7 @@ func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, ch
 		"GOCACHEPROG":  shellJoin(self, args),
 		envGHAMode:     "direct",
 		envGHACacheDir: cacheDir,
+		envGHAInitTime: initStartedAt.Format(time.RFC3339Nano),
 	}
 
 	log.Printf("github-actions-init: direct mode ready, GOCACHEPROG=%q", env["GOCACHEPROG"])
@@ -388,7 +392,7 @@ func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, ch
 	return setGitHubEnv(env)
 }
 
-func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, changesID string) error {
+func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
 	cacheDir, err := resolveHelperCacheDir(cfg.cacheDir)
 	if err != nil {
 		return err
@@ -450,12 +454,13 @@ func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, chan
 	}
 
 	env := map[string]string{
-		"GOCACHEPROG": shellJoin(self, clientArgs),
-		envGHAMode:    "shim",
-		envGHASocket:  socket,
-		envGHAAuth:    cfg.authToken,
-		envGHAPIDFile: pidFile,
-		envGHALogFile: logFile,
+		"GOCACHEPROG":  shellJoin(self, clientArgs),
+		envGHAMode:     "shim",
+		envGHASocket:   socket,
+		envGHAAuth:     cfg.authToken,
+		envGHAPIDFile:  pidFile,
+		envGHALogFile:  logFile,
+		envGHAInitTime: initStartedAt.Format(time.RFC3339Nano),
 	}
 
 	log.Printf("github-actions-init: shim mode ready, GOCACHEPROG=%q", env["GOCACHEPROG"])
@@ -463,7 +468,7 @@ func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, chan
 	return setGitHubEnv(env)
 }
 
-func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID string) error {
+func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
 	cacheDir, err := ResolveNativeCacheDir(cfg.cacheDir)
 	if err != nil {
 		return err
@@ -520,11 +525,30 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 		envGHABaseCommit:   baseCommit,
 		envGHAMaxFileBytes: strconv.FormatInt(cfg.maxFileBytes, 10),
 		envGHARestoreStats: string(restoreStatsJSON),
+		envGHAInitTime:     initStartedAt.Format(time.RFC3339Nano),
 	}
 
 	log.Printf("github-actions-init: gocache mode ready, GOCACHE=%q", cacheDir)
 
 	return setGitHubEnv(env)
+}
+
+// elapsedSinceInit returns wall-clock time since -github-actions-init started, read back from
+// envGHAInitTime. ok is false if that env var is missing or unparseable (e.g. -github-actions-done
+// run without a preceding -github-actions-init in this job).
+func elapsedSinceInit() (elapsed time.Duration, ok bool) {
+	raw := os.Getenv(envGHAInitTime)
+	if raw == "" {
+		return 0, false
+	}
+
+	initStartedAt, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		log.Printf("github-actions-done: parse %s: %s", envGHAInitTime, err.Error())
+		return 0, false
+	}
+
+	return time.Since(initStartedAt), true
 }
 
 func doneShimMode() error {
@@ -552,7 +576,12 @@ func doneShimMode() error {
 	}
 
 	log.Printf("github-actions-done: daemon stopped gracefully")
-	log.Printf("github-actions-done: cache summary: %s", resp.Stats.String())
+
+	stats := resp.Stats
+	if elapsed, ok := elapsedSinceInit(); ok {
+		stats.TotalTime = elapsed.String()
+	}
+	log.Printf("github-actions-done: cache summary: %s", stats.String())
 
 	return nil
 }
@@ -613,8 +642,8 @@ func doneGocacheMode() error {
 		}
 	}
 
-	log.Printf(
-		"github-actions-done: cache summary: restore(files=%d compressed=%s uncompressed=%s time=%s) save(files=%d compressed=%s uncompressed=%s time=%s)",
+	summary := fmt.Sprintf(
+		"restore(files=%d compressed=%s uncompressed=%s time=%s) save(files=%d compressed=%s uncompressed=%s time=%s)",
 		restoreStats.Files,
 		humanBytesBinary(restoreStats.CompressedBytes),
 		humanBytesBinary(restoreStats.UncompressedBytes),
@@ -624,6 +653,10 @@ func doneGocacheMode() error {
 		humanBytesBinary(saveStats.UncompressedBytes),
 		saveStats.Duration,
 	)
+	if elapsed, ok := elapsedSinceInit(); ok {
+		summary += " total_time=" + elapsed.String()
+	}
+	log.Printf("github-actions-done: cache summary: %s", summary)
 
 	return nil
 }
@@ -705,6 +738,7 @@ func sumStatsSummaries(summaries []StatsSummary) StatsSummary {
 		total.Hits += s.Hits
 		total.Misses += s.Misses
 		total.Puts += s.Puts
+		total.RoundTrips += s.RoundTrips
 
 		if s.GetTotalTime != "" {
 			if d, err := time.ParseDuration(s.GetTotalTime); err == nil {
@@ -826,17 +860,26 @@ func doneDirectMode() error {
 		records = append(records, record)
 	}
 
+	elapsed, haveElapsed := elapsedSinceInit()
+
 	switch len(records) {
 	case 0:
 		log.Printf("github-actions-done: no run stats recorded at %s", statsPath)
 	case 1:
-		log.Printf("github-actions-done: cache summary: %s", records[0].String())
+		stats := records[0].StatsSummary
+		if haveElapsed {
+			stats.TotalTime = elapsed.String()
+		}
+		log.Printf("github-actions-done: cache summary: %s", stats.String())
 	default:
 		summaries := make([]StatsSummary, len(records))
 		for i, r := range records {
 			summaries[i] = r.StatsSummary
 		}
 		total := sumStatsSummaries(summaries)
+		if haveElapsed {
+			total.TotalTime = elapsed.String()
+		}
 		log.Printf("github-actions-done: cache summary across %d go invocations: %s", len(records), total.String())
 		logParentCommandBreakdown(records)
 	}

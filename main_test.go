@@ -34,6 +34,7 @@ func TestParseProxyParams_FlagParseUpdatesReturnedStruct(t *testing.T) {
 		"-build-type", "lint",
 		"-base-commit", "base123",
 		"-parent-commit", "parent123",
+		"-remote-batch-concurrency", "4",
 	})
 	require.NoError(t, err)
 
@@ -44,6 +45,7 @@ func TestParseProxyParams_FlagParseUpdatesReturnedStruct(t *testing.T) {
 	require.Equal(t, "lint", params.BuildType)
 	require.Equal(t, "base123", params.BaseCommit)
 	require.Equal(t, "parent123", params.ParentCommit)
+	require.Equal(t, 4, params.RemoteBatchConcurrency)
 }
 
 func TestRunNativeGOCACHEMode_SendsSessionHeadersOnVersionProbe(t *testing.T) {

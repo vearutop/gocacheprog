@@ -258,6 +258,33 @@ func TestNewShimClient_UnixSocket(t *testing.T) {
 	require.NotEmpty(t, resp.DiskPath)
 }
 
+func TestShimServer_SessionsSeenCountsDistinctClientSessions(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	resps := make(chan cacheprog.Response, 100)
+	proxy := NewProxy(store, nil, resps, ProxyParams{})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+		close(resps)
+	})
+
+	server := NewShimServer(proxy, resps, "", nil, nil)
+	socket := startTestShimServer(t, server)
+	require.Equal(t, int64(0), server.SessionsSeen())
+
+	for i := 0; i < 3; i++ {
+		client, err := NewShimClient(socket, "", fmt.Sprintf("shim-%d", i))
+		require.NoError(t, err)
+		require.NoError(t, client.Send(cacheprog.Request{ID: 1, Command: cacheprog.CmdClose}, nil))
+		require.NoError(t, client.Close())
+	}
+
+	require.Eventually(t, func() bool {
+		return server.SessionsSeen() == 3
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestProcessShimSession_HangsOnCloseAfterDisconnectWithPendingRequest(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	t.Cleanup(func() {
