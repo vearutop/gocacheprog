@@ -1,7 +1,9 @@
 package local
 
 import (
+	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -158,6 +160,62 @@ func TestProxyLookup_SkipsRemoteGetAfterTimeBudget(t *testing.T) {
 	require.False(t, upstream.getCalled)
 }
 
+func TestNewProxy_BatchSemCapacityDefaultsWhenUnset(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, nil, make(chan cacheprog.Response, 1), ProxyParams{})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	require.Equal(t, defaultRemoteBatchConcurrency, cap(proxy.batchSem))
+}
+
+func TestNewProxy_BatchSemCapacityHonorsConfiguredValue(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, nil, make(chan cacheprog.Response, 1), ProxyParams{RemoteBatchConcurrency: 3})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	require.Equal(t, 3, cap(proxy.batchSem))
+}
+
+// TestProxyResolve_RunsBatchesConcurrently guards against resolveBatch's remote round trip
+// running synchronously inside resolve's own goroutine, which would serialize every batch onto
+// one remote round trip at a time no matter how many misses are actually outstanding.
+func TestProxyResolve_RunsBatchesConcurrently(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	upstream := &concurrencyTrackingStore{delay: 100 * time.Millisecond}
+	resps := make(chan cacheprog.Response, 1000)
+	proxy := NewProxy(store, upstream, resps, ProxyParams{})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	const batches = 4
+	const itemsPerBatch = batchBarrierItems
+
+	started := time.Now()
+	for b := 0; b < batches; b++ {
+		for i := 0; i < itemsPerBatch; i++ {
+			proxy.Lookup(cacheprog.Request{ID: int64(b*itemsPerBatch + i + 1), ActionID: fmt.Sprintf("action-%d-%d", b, i)})
+		}
+	}
+
+	for i := 0; i < batches*itemsPerBatch; i++ {
+		<-resps
+	}
+	elapsed := time.Since(started)
+
+	require.Greater(t, upstream.maxObserved(), 1, "batches should overlap, not serialize one at a time")
+	require.Less(t, elapsed, time.Duration(batches)*upstream.delay, "concurrent batches should finish faster than fully serialized ones would")
+	require.Equal(t, int64(batches), proxy.StatsSummary().RoundTrips, "each full batch should count as exactly one round trip")
+}
+
 func TestProxyStats_HitBreakdown(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
@@ -229,6 +287,16 @@ func TestProxyStatsSummary_WithUpstream(t *testing.T) {
 func TestStatsSummaryString_RoundTripTimeWithoutBytes(t *testing.T) {
 	summary := StatsSummary{Hits: 1, Misses: 0, Puts: 0, HitRate: "100.0%", GetTotalTime: "1.5s"}
 	require.Equal(t, "hits=1 misses=0 puts=0 hit_rate=100.0% round_trip_time=1.5s", summary.String())
+}
+
+func TestStatsSummaryString_Invocations(t *testing.T) {
+	summary := StatsSummary{Hits: 9893, Misses: 802, Puts: 909, HitRate: "92.5%", Invocations: 222}
+	require.Equal(t, "hits=9893 misses=802 puts=909 hit_rate=92.5% invocations=222", summary.String())
+}
+
+func TestStatsSummaryString_OmitsInvocationsWhenZero(t *testing.T) {
+	summary := StatsSummary{Hits: 1, HitRate: "100.0%"}
+	require.NotContains(t, summary.String(), "invocations")
 }
 
 type statsUpstream struct {
@@ -353,6 +421,45 @@ type remoteBudgetStub struct {
 func (r *remoteBudgetStub) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
 	r.getCalled = true
 	return nil
+}
+
+// concurrencyTrackingStore's Get sleeps for delay and records the highest number of Get calls
+// observed running at the same time, so a test can assert that batches actually overlap.
+type concurrencyTrackingStore struct {
+	noopStore
+	delay time.Duration
+
+	mu      sync.Mutex
+	current int
+	max     int
+}
+
+func (s *concurrencyTrackingStore) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
+	s.mu.Lock()
+	s.current++
+	if s.current > s.max {
+		s.max = s.current
+	}
+	s.mu.Unlock()
+
+	time.Sleep(s.delay)
+
+	for _, actionID := range req.ActionIDs {
+		cb(cache.ResponseItem{ActionID: actionID, Miss: true})
+	}
+
+	s.mu.Lock()
+	s.current--
+	s.mu.Unlock()
+
+	return nil
+}
+
+func (s *concurrencyTrackingStore) maxObserved() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.max
 }
 
 func (r *remoteBudgetStub) Put(values cache.Response) error {

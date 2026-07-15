@@ -30,6 +30,12 @@ type Proxy struct {
 	resps  chan cacheprog.Response
 	put    chan cacheprog.Request
 
+	// batchWG/batchSem let resolveBatch's remote round trips run concurrently (bounded by
+	// batchConcurrency in flight) instead of serializing one at a time inside resolve's own
+	// goroutine; see dispatchBatch.
+	batchWG  sync.WaitGroup
+	batchSem chan struct{}
+
 	batches     int64
 	lookups     int64
 	hits        int64
@@ -57,16 +63,17 @@ type Proxy struct {
 const defaultPreloadMaxSize int64 = 1_000_000
 
 type ProxyParams struct {
-	Commit           string
-	ChangesID        string
-	BuildType        string
-	BaseCommit       string
-	ParentCommit     string
-	Preload          bool
-	SkipPreload      bool
-	MaxRemoteGetTime time.Duration
-	MaxFileBytes     int64
-	DisableCacheUsed bool
+	Commit                 string
+	ChangesID              string
+	BuildType              string
+	BaseCommit             string
+	ParentCommit           string
+	Preload                bool
+	SkipPreload            bool
+	MaxRemoteGetTime       time.Duration
+	MaxFileBytes           int64
+	DisableCacheUsed       bool
+	RemoteBatchConcurrency int
 }
 
 func (p ProxyParams) SessionCommit() string {
@@ -89,7 +96,16 @@ func (p ProxyParams) SessionBaseCommit() string {
 	return p.BaseCommit
 }
 
+// defaultRemoteBatchConcurrency bounds how many resolveBatch remote round trips can run at
+// once when ProxyParams.RemoteBatchConcurrency isn't set.
+const defaultRemoteBatchConcurrency = 8
+
 func NewProxy(disk *Store, upstream cache.Store, resps chan cacheprog.Response, params ProxyParams) *Proxy {
+	batchConcurrency := params.RemoteBatchConcurrency
+	if batchConcurrency <= 0 {
+		batchConcurrency = defaultRemoteBatchConcurrency
+	}
+
 	c := &Proxy{
 		resps:              resps,
 		lookup:             make(chan cacheprog.Request, 1000),
@@ -99,6 +115,7 @@ func NewProxy(disk *Store, upstream cache.Store, resps chan cacheprog.Response, 
 		preloadedActionIDs: map[string]struct{}{},
 		usedPreloadedIDs:   map[string]struct{}{},
 		params:             params,
+		batchSem:           make(chan struct{}, batchConcurrency),
 	}
 
 	c.disk = disk
@@ -457,10 +474,14 @@ const (
 
 func (dc *Proxy) resolve() {
 	defer func() {
+		// Waits for any batches dispatchBatch spawned to finish sending their responses
+		// before this goroutine (and thus dc.wg) is done, so Close doesn't return - and
+		// dc.resps doesn't get closed - while one is still in flight.
+		dc.batchWG.Wait()
 		dc.wg.Done()
 	}()
 
-	batch := make([]cacheprog.Request, 0, 100)
+	batch := make([]cacheprog.Request, 0, batchBarrierItems)
 	t := time.NewTicker(batchBarrierTick)
 
 	for {
@@ -476,8 +497,8 @@ func (dc *Proxy) resolve() {
 			if resp.Miss {
 				batch = append(batch, req)
 				if len(batch) >= batchBarrierItems {
-					dc.resolveBatch(batch)
-					batch = batch[:0]
+					dc.dispatchBatch(batch)
+					batch = make([]cacheprog.Request, 0, batchBarrierItems)
 				}
 			} else {
 				atomic.AddInt64(&dc.hits, 1)
@@ -487,11 +508,30 @@ func (dc *Proxy) resolve() {
 
 		case <-t.C:
 			if len(batch) > 0 {
-				dc.resolveBatch(batch)
-				batch = batch[:0]
+				dc.dispatchBatch(batch)
+				batch = make([]cacheprog.Request, 0, batchBarrierItems)
 			}
 		}
 	}
+}
+
+// dispatchBatch resolves batch against the upstream on its own goroutine, bounded by
+// batchSem's capacity concurrent batches at a time. Without this, resolveBatch's remote HTTP
+// round trip would run synchronously inside resolve's own goroutine, so only one batch's worth
+// of misses could ever be in flight at once - serializing every remote round trip in the job
+// onto a single one-at-a-time queue regardless of how many are genuinely outstanding.
+func (dc *Proxy) dispatchBatch(batch []cacheprog.Request) {
+	dc.batchSem <- struct{}{}
+	dc.batchWG.Add(1)
+
+	go func() {
+		defer func() {
+			<-dc.batchSem
+			dc.batchWG.Done()
+		}()
+
+		dc.resolveBatch(batch)
+	}()
 }
 
 func (dc *Proxy) consumePut() {
@@ -736,20 +776,42 @@ type StatsSummary struct {
 	Puts    int64  `json:"puts"`
 	HitRate string `json:"hit_rate"`
 
+	// Invocations is the number of distinct GOCACHEPROG invocations these stats cover, when
+	// known: the shim daemon's session count, or (in direct mode) the number of run-stats
+	// records aggregated. Omitted when there's exactly one invocation, i.e. nothing to count.
+	Invocations int64 `json:"invocations,omitempty"`
+
+	// RoundTrips is the number of batched remote Get round trips actually made, as distinct
+	// from Misses: many misses are typically resolved by a single round trip once they're
+	// batched through resolveBatch's barrier (see batchBarrierTick/batchBarrierItems).
+	RoundTrips int64 `json:"round_trips,omitempty"`
+
 	BytesRead      string `json:"bytes_read,omitempty"`
 	BytesWritten   string `json:"bytes_written,omitempty"`
 	GetTotalTime   string `json:"get_total_time,omitempty"`
 	GetCount       string `json:"get_count,omitempty"`
 	PreloadedBytes string `json:"preloaded_bytes,omitempty"`
+
+	// TotalTime is the wall-clock time elapsed since -github-actions-init started, when known.
+	TotalTime string `json:"total_time,omitempty"`
 }
 
 func (s StatsSummary) String() string {
 	str := fmt.Sprintf("hits=%d misses=%d puts=%d hit_rate=%s", s.Hits, s.Misses, s.Puts, s.HitRate)
+	if s.Invocations > 0 {
+		str += fmt.Sprintf(" invocations=%d", s.Invocations)
+	}
 	if s.BytesRead != "" || s.BytesWritten != "" {
 		str += fmt.Sprintf(" bytes_read=%s bytes_written=%s", s.BytesRead, s.BytesWritten)
 	}
+	if s.RoundTrips > 0 {
+		str += fmt.Sprintf(" round_trips=%d", s.RoundTrips)
+	}
 	if s.GetTotalTime != "" {
 		str += " round_trip_time=" + s.GetTotalTime
+	}
+	if s.TotalTime != "" {
+		str += " total_time=" + s.TotalTime
 	}
 
 	return str
@@ -761,10 +823,11 @@ func (dc *Proxy) StatsSummary() StatsSummary {
 	misses := atomic.LoadInt64(&dc.misses)
 
 	summary := StatsSummary{
-		Hits:    hits,
-		Misses:  misses,
-		Puts:    atomic.LoadInt64(&dc.puts),
-		HitRate: percent(hits, hits+misses),
+		Hits:       hits,
+		Misses:     misses,
+		Puts:       atomic.LoadInt64(&dc.puts),
+		HitRate:    percent(hits, hits+misses),
+		RoundTrips: atomic.LoadInt64(&dc.batches),
 	}
 
 	if dc.upstream != nil {

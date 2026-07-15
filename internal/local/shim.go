@@ -223,6 +223,12 @@ func (s *ShimServer) startConn(conn net.Conn) {
 	go s.serveConn(conn)
 }
 
+// SessionsSeen returns the number of distinct shim client sessions (one per GOCACHEPROG
+// invocation) this daemon has served so far.
+func (s *ShimServer) SessionsSeen() int64 {
+	return atomic.LoadInt64(&s.sessionsSeen)
+}
+
 func (s *ShimServer) Stats() map[string]string {
 	firstGetsServed := atomic.LoadInt64(&s.firstGetsServed)
 	firstGetAvg := "0s"

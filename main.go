@@ -253,6 +253,7 @@ func parseProxyParams() *local.ProxyParams {
 	flag.StringVar(&params.BuildType, "build-type", "", "optional build type label to isolate cache manifests, e.g. unit or race")
 	flag.StringVar(&params.BaseCommit, "base-commit", "", "base commit SHA used to scope preload")
 	flag.StringVar(&params.ParentCommit, "parent-commit", "", "parent commit SHA used to scope preload")
+	flag.IntVar(&params.RemoteBatchConcurrency, "remote-batch-concurrency", 0, "maximum number of batched remote Get round trips in flight at once; 0 uses a sane default")
 	return params
 }
 
@@ -376,7 +377,9 @@ func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, par
 	closeErr := proxy.Close()
 	close(resps)
 	if stopRequested {
-		resp := local.ShimStopResponse{Lines: recentLogf.Lines(), Stats: proxy.StatsSummary()}
+		stats := proxy.StatsSummary()
+		stats.Invocations = server.SessionsSeen()
+		resp := local.ShimStopResponse{Lines: recentLogf.Lines(), Stats: stats}
 		if err != nil {
 			resp.Err = err.Error()
 		} else if closeErr != nil {
