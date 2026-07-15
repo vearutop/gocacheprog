@@ -36,6 +36,13 @@
 // it back from the daemon's stop response, gocache mode combines restore (persisted via
 // GOCACHEPROG_GHA_RESTORE_STATS) and save stats, and direct mode aggregates whatever each -quiet
 // invocation appended via AppendQuietRunStats to quietRunStatsFilename next to the cache dir.
+//
+// Direct mode's per-invocation records also carry best-effort parent process context (PID and,
+// on Linux, the parent's command line read from /proc) purely for diagnosing an unexpectedly
+// high invocation count: if a job reports far more invocations than the workflow YAML's own `go`
+// commands would suggest, -github-actions-done breaks them down by parent command so the actual
+// caller (a Makefile target, a test-splitting tool, a per-package loop, etc.) is visible directly
+// in the job log without any extra tracing steps.
 package local
 
 import (
@@ -49,6 +56,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -621,17 +629,33 @@ func doneGocacheMode() error {
 }
 
 // quietRunStatsFilename is where each -quiet direct-mode invocation appends its final
-// StatsSummary (one JSON line per invocation) so doneDirectMode can report a job-level summary.
+// directRunRecord (one JSON line per invocation) so doneDirectMode can report a job-level
+// summary, and trace an unexpectedly high invocation count back to whatever called it.
 const quietRunStatsFilename = ".gocacheprog-run-stats.jsonl"
 
-// AppendQuietRunStats appends one StatsSummary line to the per-cache-dir run stats file used
-// by direct mode's -github-actions-done to report a final cache summary. A no-op if dir is empty.
+// directRunRecord is one line of the run stats file: the cache StatsSummary plus best-effort
+// parent process context (Linux only, via /proc; empty elsewhere), so a job with far more
+// invocations than expected can be traced back to whatever actually spawned each one.
+type directRunRecord struct {
+	StatsSummary
+	ParentPID int    `json:"parent_pid,omitempty"`
+	ParentCmd string `json:"parent_cmd,omitempty"`
+}
+
+// AppendQuietRunStats appends one run record to the per-cache-dir run stats file used by
+// direct mode's -github-actions-done to report a final cache summary. A no-op if dir is empty.
 func AppendQuietRunStats(dir string, summary StatsSummary) error {
 	if dir == "" {
 		return nil
 	}
 
-	data, err := json.Marshal(summary)
+	record := directRunRecord{
+		StatsSummary: summary,
+		ParentPID:    os.Getppid(),
+		ParentCmd:    parentCommandLine(),
+	}
+
+	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("marshal run stats: %w", err)
 	}
@@ -651,6 +675,19 @@ func AppendQuietRunStats(dir string, summary StatsSummary) error {
 	}
 
 	return nil
+}
+
+// parentCommandLine best-effort reads this process's parent's command line from /proc (Linux
+// only); it returns "" on any error, including on platforms without /proc.
+func parentCommandLine() string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", os.Getppid()))
+	if err != nil {
+		return ""
+	}
+
+	args := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
+
+	return strings.Join(args, " ")
 }
 
 // sumStatsSummaries aggregates hits/misses/puts, round-trip time, and bytes read/written
@@ -776,27 +813,32 @@ func doneDirectMode() error {
 		return fmt.Errorf("read run stats: %w", err)
 	}
 
-	var summaries []StatsSummary
+	var records []directRunRecord
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		if line == "" {
 			continue
 		}
-		var summary StatsSummary
-		if err := json.Unmarshal([]byte(line), &summary); err != nil {
+		var record directRunRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
 			log.Printf("github-actions-done: parse run stats line: %s", err.Error())
 			continue
 		}
-		summaries = append(summaries, summary)
+		records = append(records, record)
 	}
 
-	switch len(summaries) {
+	switch len(records) {
 	case 0:
 		log.Printf("github-actions-done: no run stats recorded at %s", statsPath)
 	case 1:
-		log.Printf("github-actions-done: cache summary: %s", summaries[0].String())
+		log.Printf("github-actions-done: cache summary: %s", records[0].String())
 	default:
+		summaries := make([]StatsSummary, len(records))
+		for i, r := range records {
+			summaries[i] = r.StatsSummary
+		}
 		total := sumStatsSummaries(summaries)
-		log.Printf("github-actions-done: cache summary across %d go invocations: %s", len(summaries), total.String())
+		log.Printf("github-actions-done: cache summary across %d go invocations: %s", len(records), total.String())
+		logParentCommandBreakdown(records)
 	}
 
 	if err := os.Remove(statsPath); err != nil && !os.IsNotExist(err) { //nolint:gosec // statsPath is derived from the configured cache dir.
@@ -804,6 +846,42 @@ func doneDirectMode() error {
 	}
 
 	return nil
+}
+
+// logParentCommandBreakdown reports which parent command lines actually spawned each
+// direct-mode GOCACHEPROG invocation, most frequent first. This is the trace that answers "why
+// are there N invocations" when N is far higher than the number of `go` commands in the workflow
+// YAML itself — e.g. a Makefile target or test-splitting tool looping over packages.
+func logParentCommandBreakdown(records []directRunRecord) {
+	counts := map[string]int{}
+	for _, r := range records {
+		key := r.ParentCmd
+		if key == "" {
+			key = fmt.Sprintf("(unknown, parent_pid=%d)", r.ParentPID)
+		}
+		counts[key]++
+	}
+
+	type parentCount struct {
+		cmd   string
+		count int
+	}
+
+	entries := make([]parentCount, 0, len(counts))
+	for cmd, count := range counts {
+		entries = append(entries, parentCount{cmd, count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count != entries[j].count {
+			return entries[i].count > entries[j].count
+		}
+		return entries[i].cmd < entries[j].cmd
+	})
+
+	log.Printf("github-actions-done: %d distinct parent command(s) invoked GOCACHEPROG:", len(entries))
+	for _, e := range entries {
+		log.Printf("  [%dx] %s", e.count, e.cmd)
+	}
 }
 
 func waitForShimSocket(socket string, timeout time.Duration) error {

@@ -1,6 +1,9 @@
 package local
 
 import (
+	"bytes"
+	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -191,6 +194,46 @@ func TestDoneDirectMode_MultipleInvocationsAggregatesCounts(t *testing.T) {
 	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 5, Misses: 1, Puts: 2}))
 
 	require.NoError(t, doneDirectMode())
+}
+
+func TestAppendQuietRunStats_RecordsParentPID(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 1}))
+
+	data, err := os.ReadFile(filepath.Join(dir, quietRunStatsFilename))
+	require.NoError(t, err)
+
+	var record directRunRecord
+	require.NoError(t, json.Unmarshal(data, &record))
+	require.Equal(t, os.Getppid(), record.ParentPID)
+}
+
+func TestParentCommandLine_DoesNotPanic(t *testing.T) {
+	// ParentCmd is best-effort (Linux /proc only); this just guards against a panic or hang,
+	// not any particular content, since the value is environment-dependent.
+	require.NotPanics(t, func() { parentCommandLine() })
+}
+
+func TestLogParentCommandBreakdown_GroupsAndSortsByCount(t *testing.T) {
+	var buf bytes.Buffer
+	origOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOutput)
+
+	logParentCommandBreakdown([]directRunRecord{
+		{ParentCmd: "go test -parallel 20 -mod=vendor ./..."},
+		{ParentCmd: "go test -parallel 20 -mod=vendor ./..."},
+		{ParentCmd: "go build ./..."},
+		{ParentPID: 1234}, // no ParentCmd available
+	})
+
+	out := buf.String()
+	require.Contains(t, out, "3 distinct parent command(s)")
+
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	require.True(t, strings.Contains(lines[1], "[2x]"), "most frequent command should be listed first: %q", lines[1])
+	require.Contains(t, out, "[1x] go build ./...")
+	require.Contains(t, out, "[1x] (unknown, parent_pid=1234)")
 }
 
 func TestSumStatsSummaries_AggregatesCountsRoundTripTimeAndBytes(t *testing.T) {
