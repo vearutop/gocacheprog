@@ -735,6 +735,20 @@ Together these mean a remote server that's down, unreachable, or stuck can only 
 cache miss (and up to ~3s per affected batch) — never an indefinite hang of the `go` invocation
 waiting on a response that will never arrive.
 
+### A lost shim response is bounded by a close-wait timeout, not a hang
+
+When `cmd/go` sends `CmdClose`, the shim client waits for every request it already sent to get its
+response before exiting. If a response was ever lost by a bug that hasn't been found yet, that
+wait would otherwise hang the invocation — and the CI job — forever. `shimCloseWaitTimeout` (30s,
+in `internal/local/shim.go`) bounds that wait: past it, the client force-closes and the invocation
+fails on its own instead of blocking the job.
+
+Each shim client that hits this timeout records it to a marker file next to the shim socket.
+`-github-actions-done` rolls that up into the final cache summary's `forced_closes` count.
+Normally `0`; a nonzero value means the job still finished, but some response was late or lost and
+it's worth digging into why (check the daemon log via `GOCACHEPROG_GHA_LOG_FILE`, or the remote
+server's health during that window).
+
 ### GitHub Actions shallow checkout is not enough by itself
 
 Git-based mtime restoration with shallow history may be too inaccurate for stable test cache keys.

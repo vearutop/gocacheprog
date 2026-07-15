@@ -26,6 +26,79 @@ import (
 
 var ErrStopRequested = errors.New("shim stop requested")
 
+// shimCloseWaitTimeout bounds how long ProcessShimSession waits, once cmd/go sends CmdClose,
+// for every already-sent request to get its response. Normal round trips are well under this;
+// it exists to guarantee the process eventually exits even if a response is ever lost.
+// A var, not a const, so tests can shorten it rather than waiting out the real 30s.
+var shimCloseWaitTimeout = 30 * time.Second
+
+// ErrShimCloseTimeout marks the error ProcessShimSession returns when shimCloseWaitTimeout
+// fires, so callers (runShim) can distinguish "forced close after timeout" from every other
+// close-time failure and record it via RecordShimForcedClose.
+var ErrShimCloseTimeout = errors.New("shim close wait timed out")
+
+// shimForcedCloseSuffix names the sibling marker file (next to the shim socket) that a shim
+// client appends a line to when it force-closes after shimCloseWaitTimeout, so
+// -github-actions-done can report how often this safety net actually triggered.
+const shimForcedCloseSuffix = ".forced-closes"
+
+func shimForcedCloseMarkerPath(remoteURL string) (string, error) {
+	_, addr, err := shimNetworkAndAddr(remoteURL)
+	if err != nil {
+		return "", err
+	}
+
+	return addr + shimForcedCloseSuffix, nil
+}
+
+// RecordShimForcedClose appends one marker line for a shim client that force-closed after
+// shimCloseWaitTimeout. Best-effort and non-blocking: failures are only logged, since this is
+// diagnostic bookkeeping and must never itself risk hanging or failing the invocation.
+func RecordShimForcedClose(remoteURL string) {
+	path, err := shimForcedCloseMarkerPath(remoteURL)
+	if err != nil {
+		log.Printf("record shim forced close: %s", err.Error())
+		return
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644) //nolint:gosec // sibling of the shim socket path.
+	if err != nil {
+		log.Printf("record shim forced close: %s", err.Error())
+		return
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			log.Printf("record shim forced close: close marker file: %s", closeErr.Error())
+		}
+	}()
+
+	if _, err := f.WriteString("1\n"); err != nil {
+		log.Printf("record shim forced close: %s", err.Error())
+	}
+}
+
+// CountShimForcedCloses reports how many shim clients force-closed after shimCloseWaitTimeout,
+// then removes the marker file so a later job/run starts from zero again.
+func CountShimForcedCloses(remoteURL string) int64 {
+	path, err := shimForcedCloseMarkerPath(remoteURL)
+	if err != nil {
+		return 0
+	}
+
+	data, err := os.ReadFile(path) //nolint:gosec // sibling of the shim socket path.
+	if err != nil || len(data) == 0 {
+		return 0
+	}
+
+	defer func() {
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) { //nolint:gosec // path is the shim socket path plus a fixed suffix.
+			log.Printf("count shim forced closes: remove marker file: %s", rmErr.Error())
+		}
+	}()
+
+	return int64(len(strings.Split(strings.TrimSpace(string(data)), "\n")))
+}
+
 type shimHello struct {
 	SessionID         string `json:"session_id,omitempty"`
 	AuthToken         string `json:"auth_token,omitempty"`
@@ -762,6 +835,16 @@ func ProcessShimSession(in io.Reader, out io.Writer, logDump io.Writer, client *
 					return errors.Join(fmt.Errorf("wait for pending shim responses: %w", err), fmt.Errorf("close shim client: %w", closeErr))
 				}
 				return fmt.Errorf("wait for pending shim responses: %w", err)
+			case <-time.After(shimCloseWaitTimeout):
+				// Belt-and-suspenders: if some response was ever lost by a bug we haven't
+				// found yet, this bounds the damage to one failed invocation instead of
+				// hanging the process (and the CI job) forever.
+				n := inFlight.Load()
+				closeErr := client.Close()
+				if closeErr != nil {
+					return errors.Join(fmt.Errorf("close shim client after timing out waiting for %d pending response(s) after %s: %w", n, shimCloseWaitTimeout, closeErr), ErrShimCloseTimeout)
+				}
+				return fmt.Errorf("timed out waiting for %d pending shim response(s) after %s: %w", n, shimCloseWaitTimeout, ErrShimCloseTimeout)
 			}
 			if err := client.Close(); err != nil {
 				return fmt.Errorf("close shim client: %w", err)

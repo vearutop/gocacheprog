@@ -326,6 +326,65 @@ func TestProcessShimSession_HangsOnCloseAfterDisconnectWithPendingRequest(t *tes
 	}
 }
 
+func TestProcessShimSession_ForcesCloseAfterTimeoutWhenResponseNeverArrives(t *testing.T) {
+	orig := shimCloseWaitTimeout
+	shimCloseWaitTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { shimCloseWaitTimeout = orig })
+
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		closePipeConn(t, serverConn)
+		closePipeConn(t, clientConn)
+	})
+
+	go func() {
+		dec := json.NewDecoder(bufio.NewReader(serverConn))
+
+		var hello shimHello
+		require.NoError(t, dec.Decode(&hello))
+
+		var env shimEnvelope
+		//nolint:musttag // shimEnvelope is the streaming shim protocol payload.
+		require.NoError(t, dec.Decode(&env))
+		require.Equal(t, cacheprog.CmdGet, env.Request.Command)
+		// Deliberately never respond and never close: this reproduces a lost response,
+		// which is exactly what shimCloseWaitTimeout is meant to bound.
+	}()
+
+	client := newTestShimClient(clientConn)
+	require.NoError(t, client.enc.Encode(shimHello{SessionID: "shim-a"}))
+
+	var input bytes.Buffer
+	writeJSONLine(t, &input, cacheprog.Request{ID: 1, Command: cacheprog.CmdGet, ActionID: "actionId1"})
+	writeJSONLine(t, &input, cacheprog.Request{ID: 2, Command: cacheprog.CmdClose})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ProcessShimSession(&input, &bytes.Buffer{}, nil, client)
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrShimCloseTimeout)
+	case <-time.After(time.Second):
+		t.Fatal("ProcessShimSession did not honor shortened shimCloseWaitTimeout")
+	}
+}
+
+func TestRecordAndCountShimForcedCloses(t *testing.T) {
+	remoteURL := "unix://" + filepath.Join(t.TempDir(), "gocacheprog.sock")
+
+	require.EqualValues(t, 0, CountShimForcedCloses(remoteURL), "no marker file yet")
+
+	RecordShimForcedClose(remoteURL)
+	RecordShimForcedClose(remoteURL)
+	RecordShimForcedClose(remoteURL)
+
+	require.EqualValues(t, 3, CountShimForcedCloses(remoteURL))
+	require.EqualValues(t, 0, CountShimForcedCloses(remoteURL), "marker file is removed after being counted")
+}
+
 func TestShimServer_ClosedReadyProcessesRequestsEvenWhenPreloadFailed(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)

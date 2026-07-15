@@ -300,6 +300,16 @@ func TestStatsSummaryString_OmitsInvocationsWhenZero(t *testing.T) {
 	require.NotContains(t, summary.String(), "invocations")
 }
 
+func TestStatsSummaryString_ForcedCloses(t *testing.T) {
+	summary := StatsSummary{Hits: 1, HitRate: "100.0%", ForcedCloses: 2}
+	require.Equal(t, "hits=1 misses=0 puts=0 hit_rate=100.0% forced_closes=2", summary.String())
+}
+
+func TestStatsSummaryString_OmitsForcedClosesWhenZero(t *testing.T) {
+	summary := StatsSummary{Hits: 1, HitRate: "100.0%"}
+	require.NotContains(t, summary.String(), "forced_closes")
+}
+
 type statsUpstream struct {
 	noopStore
 }
@@ -520,6 +530,57 @@ func TestProxyResolveBatch_UpstreamErrorStillRespondsToEveryItem(t *testing.T) {
 				require.True(t, resp.Miss)
 			}
 		})
+	}
+}
+
+// respondOnceStore's Get calls back exactly once per unique ActionID in the request, matching
+// how the real upstream is invoked: resolveBatch deduplicates ActionIDs before ever building
+// the outgoing request.
+type respondOnceStore struct {
+	noopStore
+}
+
+func (respondOnceStore) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
+	for _, actionID := range req.ActionIDs {
+		cb(cache.ResponseItem{ActionID: actionID, Miss: true})
+	}
+
+	return nil
+}
+
+// TestProxyResolveBatch_DuplicateActionIDInBatchRespondsToEveryOriginalRequest guards against a
+// batch containing two different original requests (e.g. from two different concurrent
+// sessions) for the same ActionID silently losing the response for all but the last one: each
+// original request ID must get its own response even though the upstream is only asked once per
+// unique ActionID.
+func TestProxyResolveBatch_DuplicateActionIDInBatchRespondsToEveryOriginalRequest(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	resps := make(chan cacheprog.Response, 10)
+	proxy := NewProxy(store, respondOnceStore{}, resps, ProxyParams{})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	batch := []cacheprog.Request{
+		{ID: 1, ActionID: "shared-action"},
+		{ID: 2, ActionID: "shared-action"},
+		{ID: 3, ActionID: "other-action"},
+	}
+	proxy.resolveBatch(batch)
+
+	got := map[int64]cacheprog.Response{}
+	for i := 0; i < len(batch); i++ {
+		resp := <-resps
+		got[resp.ID] = resp
+	}
+
+	require.Len(t, got, len(batch), "every original request must get its own response, even when it shares an ActionID with another request in the batch")
+	for _, req := range batch {
+		resp, ok := got[req.ID]
+		require.True(t, ok, "missing response for request ID %d", req.ID)
+		require.True(t, resp.Miss)
 	}
 }
 
