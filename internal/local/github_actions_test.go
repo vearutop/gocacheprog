@@ -129,18 +129,6 @@ func TestCommonScopeArgs_OmitsEmptyFields(t *testing.T) {
 	require.Empty(t, commonScopeArgs(githubActionsConfig{}, "", "", ""))
 }
 
-func TestAddDefaultGOMAXPROCS(t *testing.T) {
-	t.Setenv("GOMAXPROCS", "")
-	env := map[string]string{}
-	addDefaultGOMAXPROCS(env)
-	require.Equal(t, "100", env["GOMAXPROCS"])
-
-	t.Setenv("GOMAXPROCS", "4")
-	env = map[string]string{}
-	addDefaultGOMAXPROCS(env)
-	require.NotContains(t, env, "GOMAXPROCS")
-}
-
 func TestShellJoin(t *testing.T) {
 	require.Equal(t, "/bin/gocacheprog -a b -c d", shellJoin("/bin/gocacheprog", []string{"-a", "b", "-c", "d"}))
 }

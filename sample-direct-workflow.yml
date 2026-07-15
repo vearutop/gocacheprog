@@ -46,7 +46,6 @@ jobs:
 
           {
             echo "GOCACHEPROG=/tmp/gocacheprog -auth-token ${AUTH_TOKEN} -cache-dir ./build-cache -remote-url ${REMOTE_URL} -preload -max-file-bytes 3000000 -commit ${COMMIT} -changes-id ${CHANGES_ID} -build-type ${BUILD_TYPE} -base-commit ${BASE_COMMIT}"
-            echo "GOMAXPROCS=100"
           } >> "$GITHUB_ENV"
 
       - name: Setup gocacheprog for main/master
@@ -59,7 +58,6 @@ jobs:
 
           {
             echo "GOCACHEPROG=/tmp/gocacheprog -auth-token ${AUTH_TOKEN} -cache-dir ./build-cache -remote-url ${REMOTE_URL} -preload -max-file-bytes 3000000 -commit ${COMMIT} -build-type ${BUILD_TYPE}"
-            echo "GOMAXPROCS=100"
           } >> "$GITHUB_ENV"
 
       # Direct mode starts a fresh gocacheprog helper for this one `go` invocation; it preloads,
