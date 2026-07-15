@@ -631,7 +631,7 @@ func StopShimServer(remoteURL string, authToken string) ([]string, error) {
 		return nil, err
 	}
 
-	conn, err := net.DialTimeout(network, addr, 2*time.Second)
+	conn, err := net.DialTimeout(network, addr, 2*time.Second) //nolint:gosec // addr is the operator-supplied -stop target, a local daemon address, not attacker-controlled remote input.
 	if err != nil {
 		return nil, err
 	}

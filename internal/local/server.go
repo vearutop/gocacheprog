@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	nethttp "net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -176,7 +177,15 @@ func warmAutocertCertificate(manager *autocert.Manager, httpsHost string) error 
 
 func autocertHTTPHandler(httpsHost string, manager *autocert.Manager) nethttp.Handler {
 	return manager.HTTPHandler(nethttp.HandlerFunc(func(rw nethttp.ResponseWriter, r *nethttp.Request) {
-		nethttp.Redirect(rw, r, "https://"+httpsHost+r.URL.RequestURI(), nethttp.StatusMovedPermanently)
+		// Built from struct fields, not string concatenation of the raw request URI, so
+		// request-controlled input can only ever populate Path/RawQuery, never Scheme/Host.
+		target := url.URL{
+			Scheme:   "https",
+			Host:     httpsHost,
+			Path:     r.URL.Path,
+			RawQuery: r.URL.RawQuery,
+		}
+		nethttp.Redirect(rw, r, target.String(), nethttp.StatusMovedPermanently)
 	}))
 }
 

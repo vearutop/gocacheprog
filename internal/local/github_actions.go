@@ -1,7 +1,7 @@
-// Package local's github_actions.go implements -github-actions-init and
-// -github-actions-done: a condensed, single-DSN wrapper around the existing
-// direct/shim/native-GOCACHE CLI modes, aimed at GitHub Actions jobs that
-// want sane defaults instead of hand-rolled bash plumbing.
+// Package local implements gocacheprog's local-side building blocks: the on-disk cache
+// store, the daemon/shim pair, and (this file) -github-actions-init/-github-actions-done,
+// a condensed, single-DSN wrapper around the existing direct/shim/native-GOCACHE CLI modes
+// aimed at GitHub Actions jobs that want sane defaults instead of hand-rolled bash plumbing.
 //
 // DSN format for -github-actions-init:
 //
