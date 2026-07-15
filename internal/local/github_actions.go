@@ -653,6 +653,110 @@ func AppendQuietRunStats(dir string, summary StatsSummary) error {
 	return nil
 }
 
+// sumStatsSummaries aggregates hits/misses/puts, round-trip time, and bytes read/written
+// across multiple direct-mode invocations. Bytes are recovered from their already-rounded,
+// human-readable form (e.g. "1.2MB", one decimal digit of precision) via parseByteSize, so the
+// summed total carries the same small rounding error as each individual reading.
+func sumStatsSummaries(summaries []StatsSummary) StatsSummary {
+	var total StatsSummary
+
+	var roundTripTime time.Duration
+	var bytesRead, bytesWritten int64
+	var haveBytes bool
+
+	for _, s := range summaries {
+		total.Hits += s.Hits
+		total.Misses += s.Misses
+		total.Puts += s.Puts
+
+		if s.GetTotalTime != "" {
+			if d, err := time.ParseDuration(s.GetTotalTime); err == nil {
+				roundTripTime += d
+			}
+		}
+
+		if s.BytesRead != "" {
+			if n, err := parseByteSize(s.BytesRead); err == nil {
+				bytesRead += n
+				haveBytes = true
+			}
+		}
+		if s.BytesWritten != "" {
+			if n, err := parseByteSize(s.BytesWritten); err == nil {
+				bytesWritten += n
+				haveBytes = true
+			}
+		}
+	}
+
+	total.HitRate = percent(total.Hits, total.Hits+total.Misses)
+	if roundTripTime > 0 {
+		total.GetTotalTime = roundTripTime.String()
+	}
+	if haveBytes {
+		total.BytesRead = formatByteSize(bytesRead)
+		total.BytesWritten = formatByteSize(bytesWritten)
+	}
+
+	return total
+}
+
+// byteSizeUnits mirrors internal/http.byteSize's thresholds/suffixes (largest first) so
+// parseByteSize/formatByteSize can invert and reproduce that same "1.2MB"-style formatting.
+var byteSizeUnits = []struct {
+	suffix string
+	factor int64
+}{
+	{"EB", 1 << 60},
+	{"PB", 1 << 50},
+	{"TB", 1 << 40},
+	{"GB", 1 << 30},
+	{"MB", 1 << 20},
+	{"KB", 1 << 10},
+}
+
+// parseByteSize inverts internal/http.byteSize's "1.2MB"-style formatting back to a byte
+// count, accurate to that format's one decimal digit of precision.
+func parseByteSize(s string) (int64, error) {
+	for _, u := range byteSizeUnits {
+		if numStr, ok := strings.CutSuffix(s, u.suffix); ok {
+			value, err := strconv.ParseFloat(numStr, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid byte size %q: %w", s, err)
+			}
+
+			return int64(value * float64(u.factor)), nil
+		}
+	}
+
+	numStr, ok := strings.CutSuffix(s, "B")
+	if !ok {
+		return 0, fmt.Errorf("invalid byte size %q: unrecognized unit", s)
+	}
+
+	value, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid byte size %q: %w", s, err)
+	}
+
+	return int64(value), nil
+}
+
+// formatByteSize matches internal/http.byteSize's formatting exactly, so a summed total reads
+// consistently with the per-invocation values it was derived from.
+func formatByteSize(bytes int64) string {
+	for _, u := range byteSizeUnits {
+		if bytes >= u.factor {
+			result := strconv.FormatFloat(float64(bytes)/float64(u.factor), 'f', 1, 64)
+			result = strings.TrimSuffix(result, ".0")
+
+			return result + u.suffix
+		}
+	}
+
+	return strconv.FormatInt(bytes, 10) + "B"
+}
+
 // doneDirectMode has no daemon or native GOCACHE state to finalize, so it just reports the
 // final cache summary accumulated by direct-mode invocation(s) recorded via AppendQuietRunStats.
 func doneDirectMode() error {
@@ -691,13 +795,7 @@ func doneDirectMode() error {
 	case 1:
 		log.Printf("github-actions-done: cache summary: %s", summaries[0].String())
 	default:
-		var total StatsSummary
-		for _, s := range summaries {
-			total.Hits += s.Hits
-			total.Misses += s.Misses
-			total.Puts += s.Puts
-		}
-		total.HitRate = percent(total.Hits, total.Hits+total.Misses)
+		total := sumStatsSummaries(summaries)
 		log.Printf("github-actions-done: cache summary across %d go invocations: %s", len(summaries), total.String())
 	}
 

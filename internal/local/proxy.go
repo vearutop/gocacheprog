@@ -746,7 +746,10 @@ type StatsSummary struct {
 func (s StatsSummary) String() string {
 	str := fmt.Sprintf("hits=%d misses=%d puts=%d hit_rate=%s", s.Hits, s.Misses, s.Puts, s.HitRate)
 	if s.BytesRead != "" || s.BytesWritten != "" {
-		str += fmt.Sprintf(" bytes_read=%s bytes_written=%s round_trip_time=%s", s.BytesRead, s.BytesWritten, s.GetTotalTime)
+		str += fmt.Sprintf(" bytes_read=%s bytes_written=%s", s.BytesRead, s.BytesWritten)
+	}
+	if s.GetTotalTime != "" {
+		str += " round_trip_time=" + s.GetTotalTime
 	}
 
 	return str

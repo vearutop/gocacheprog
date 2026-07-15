@@ -226,6 +226,11 @@ func TestProxyStatsSummary_WithUpstream(t *testing.T) {
 	require.Contains(t, summary.String(), "bytes_read=1.2MB bytes_written=3.4KB round_trip_time=123ms")
 }
 
+func TestStatsSummaryString_RoundTripTimeWithoutBytes(t *testing.T) {
+	summary := StatsSummary{Hits: 1, Misses: 0, Puts: 0, HitRate: "100.0%", GetTotalTime: "1.5s"}
+	require.Equal(t, "hits=1 misses=0 puts=0 hit_rate=100.0% round_trip_time=1.5s", summary.String())
+}
+
 type statsUpstream struct {
 	noopStore
 }

@@ -193,6 +193,57 @@ func TestDoneDirectMode_MultipleInvocationsAggregatesCounts(t *testing.T) {
 	require.NoError(t, doneDirectMode())
 }
 
+func TestSumStatsSummaries_AggregatesCountsRoundTripTimeAndBytes(t *testing.T) {
+	total := sumStatsSummaries([]StatsSummary{
+		{Hits: 3, Misses: 1, Puts: 1, GetTotalTime: "100ms", BytesRead: "500KB", BytesWritten: "1KB"},
+		{Hits: 5, Misses: 1, Puts: 2, GetTotalTime: "208.513365ms", BytesRead: "1MB", BytesWritten: "2KB"},
+		{Hits: 2, Misses: 0, Puts: 0}, // no upstream, no GetTotalTime/bytes
+	})
+
+	require.Equal(t, int64(10), total.Hits)
+	require.Equal(t, int64(2), total.Misses)
+	require.Equal(t, int64(3), total.Puts)
+	require.Equal(t, "83.3%", total.HitRate)
+	require.Equal(t, "308.513365ms", total.GetTotalTime)
+	require.Equal(t, "1.5MB", total.BytesRead)
+	require.Equal(t, "3KB", total.BytesWritten)
+	require.Equal(t, "hits=10 misses=2 puts=3 hit_rate=83.3% bytes_read=1.5MB bytes_written=3KB round_trip_time=308.513365ms", total.String())
+}
+
+func TestParseByteSize_RoundTripsWithFormatByteSize(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		bytes int64
+	}{
+		{"0B", 0},
+		{"512B", 512},
+		{"1KB", 1024},
+		{"1.5KB", 1536},
+		{"1MB", 1 << 20},
+		{"2.5GB", int64(2.5 * (1 << 30))},
+	} {
+		n, err := parseByteSize(tc.input)
+		require.NoError(t, err, tc.input)
+		require.Equal(t, tc.bytes, n, tc.input)
+		require.Equal(t, tc.input, formatByteSize(tc.bytes), tc.input)
+	}
+}
+
+func TestParseByteSize_InvalidInput(t *testing.T) {
+	_, err := parseByteSize("not-a-size")
+	require.Error(t, err)
+}
+
+func TestSumStatsSummaries_NoRoundTripTimeWhenNoneRecorded(t *testing.T) {
+	total := sumStatsSummaries([]StatsSummary{
+		{Hits: 1, Misses: 0, Puts: 0},
+		{Hits: 2, Misses: 0, Puts: 0},
+	})
+
+	require.Empty(t, total.GetTotalTime)
+	require.NotContains(t, total.String(), "round_trip_time")
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
