@@ -362,7 +362,6 @@ func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, ch
 		"GOCACHEPROG": shellJoin(self, args),
 		envGHAMode:    "direct",
 	}
-	addDefaultGOMAXPROCS(env)
 
 	log.Printf("github-actions-init: direct mode ready, GOCACHEPROG=%q", env["GOCACHEPROG"])
 
@@ -438,7 +437,6 @@ func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, chan
 		envGHAPIDFile: pidFile,
 		envGHALogFile: logFile,
 	}
-	addDefaultGOMAXPROCS(env)
 
 	log.Printf("github-actions-init: shim mode ready, GOCACHEPROG=%q", env["GOCACHEPROG"])
 
@@ -638,14 +636,6 @@ func tailFile(path string, maxBytes int64) string {
 
 func shellJoin(bin string, args []string) string {
 	return strings.Join(append([]string{bin}, args...), " ")
-}
-
-func addDefaultGOMAXPROCS(env map[string]string) {
-	if os.Getenv("GOMAXPROCS") != "" {
-		return
-	}
-
-	env["GOMAXPROCS"] = "100"
 }
 
 func setGitHubEnv(vars map[string]string) error {

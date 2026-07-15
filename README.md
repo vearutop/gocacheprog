@@ -75,11 +75,6 @@ parameters — and:
 - preloads the likely-needed cache working set in bulk
 - sets `GOCACHEPROG` (or `GOCACHE`, depending on mode — see [Modes](#modes) below) via
   `$GITHUB_ENV` so the rest of the job just runs `go` normally
-- in `direct`/`shim` mode, sets `GOMAXPROCS=100` if it isn't already set — `cmd/go` scales its own
-  build/test action concurrency off `GOMAXPROCS`, and most of each action's time is now spent
-  waiting on a `GOCACHEPROG` round trip rather than on CPU; a low CPU-count default would otherwise
-  cap how many of those round trips can be in flight at once. `gocache` mode skips this: it reads
-  the native `GOCACHE` straight off local disk, so there's no round trip to hide
 
 `-github-actions-done` reverses whatever `-github-actions-init` set up: stops the daemon (shim
 mode), uploads freshly-built cache entries (gocache mode), or does nothing (direct mode). Run it

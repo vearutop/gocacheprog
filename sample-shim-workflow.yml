@@ -61,7 +61,6 @@ jobs:
 
           {
             echo "GOCACHEPROG=/tmp/gocacheprog -auth-token ${AUTH_TOKEN} -remote-url ${DAEMON_SOCKET}"
-            echo "GOMAXPROCS=100"
             echo "GOCACHEPROG_DAEMON_PID_FILE=${DAEMON_PID_FILE}"
             echo "GOCACHEPROG_DAEMON_LOG=${DAEMON_LOG}"
             echo "GOCACHEPROG_AUTH_TOKEN=${AUTH_TOKEN}"
@@ -94,7 +93,6 @@ jobs:
 
           {
             echo "GOCACHEPROG=/tmp/gocacheprog -auth-token ${AUTH_TOKEN} -remote-url ${DAEMON_SOCKET}"
-            echo "GOMAXPROCS=100"
             echo "GOCACHEPROG_DAEMON_PID_FILE=${DAEMON_PID_FILE}"
             echo "GOCACHEPROG_DAEMON_LOG=${DAEMON_LOG}"
             echo "GOCACHEPROG_AUTH_TOKEN=${AUTH_TOKEN}"
