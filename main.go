@@ -53,6 +53,8 @@ func run() error {
 	saveCacheChunkBytes := flag.Int64("save-cache-chunk-bytes", http.DefaultSaveCacheChunkBytes, "maximum size in bytes for a single native -save-cache HTTP chunk request body")
 	jobStartUnix := flag.Int64("job-start-unix", 0, "job start Unix timestamp in nanoseconds for -save-cache; when empty, read the marker written by -restore-cache")
 	canonicalize := flag.String("canonicalize-timestamps", "", "canonicalize file and directory timestamps under this repo root and exit")
+	githubActionsInit := flag.String("github-actions-init", "", "set up caching for a GitHub Actions job from a single DSN; see internal/local/github_actions.go for the DSN format")
+	githubActionsDone := flag.Bool("github-actions-done", false, "finalize caching started by -github-actions-init in an always() step")
 	ver := flag.Bool("version", false, "print version and exit")
 
 	flag.Parse()
@@ -60,6 +62,14 @@ func run() error {
 	if *ver {
 		fmt.Println(version.Module("github.com/vearutop/gocacheprog").Version)
 		return nil
+	}
+
+	if *githubActionsInit != "" {
+		return local.GithubActionsInit(*githubActionsInit)
+	}
+
+	if *githubActionsDone {
+		return local.GithubActionsDone()
 	}
 
 	if *canonicalize != "" {
@@ -256,39 +266,6 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken string, m
 	return runServer(httpListen, httpsListen, httpsHost, filepath.Join(dir, "autocert"), store, nativeStore, authToken, preloadLimit)
 }
 
-func resolveNativeCacheDir(dir string) (string, error) {
-	if dir != "" {
-		return resolveAbsPath(dir)
-	}
-
-	if envDir := strings.TrimSpace(os.Getenv("GOCACHE")); envDir != "" {
-		return resolveAbsPath(envDir)
-	}
-
-	userCacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("user cache dir: %w", err)
-	}
-
-	return filepath.Join(userCacheDir, "go-build"), nil
-}
-
-func resolveAbsPath(path string) (string, error) {
-	if path == "~" || strings.HasPrefix(path, "~/") {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("user home dir: %w", err)
-		}
-		if path == "~" {
-			path = homeDir
-		} else {
-			path = filepath.Join(homeDir, path[2:])
-		}
-	}
-
-	return filepath.Abs(path)
-}
-
 func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, restoreLimitBytes, saveCacheChunkBytes int64, startedAt time.Time, params *local.ProxyParams) error {
 	if restoreCache && saveCache {
 		return errors.New("-restore-cache and -save-cache are mutually exclusive")
@@ -300,7 +277,7 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 		return errors.New("native GOCACHE batch mode requires -remote-url")
 	}
 
-	cacheDir, err := resolveNativeCacheDir(dir)
+	cacheDir, err := local.ResolveNativeCacheDir(dir)
 	if err != nil {
 		return err
 	}
@@ -331,83 +308,10 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 	}
 
 	if restoreCache {
-		return runRestoreCache(cacheDir, client, req, startedAt)
+		return local.RestoreNativeCache(cacheDir, client, req, startedAt)
 	}
 
-	return runSaveCache(cacheDir, client, req, maxFileBytes)
-}
-
-func runRestoreCache(cacheDir string, client *http.Client, req gocache.Request, startedAt time.Time) error {
-	restoredPaths := make([]string, 0)
-	stats, err := client.RestoreCache(req, func(item gocache.FileItem, body io.Reader) error {
-		restoredPaths = append(restoredPaths, item.Path)
-		return gocache.RestoreToDir(cacheDir, item, body)
-	})
-	if err != nil {
-		return err
-	}
-	restorePrepareTime, restoreTotalTime := client.LastRestoreTimings()
-	log.Printf(
-		"restore-cache completed: files=%d download_time=%s compressed=%s compressed_rate=%s uncompressed=%s uncompressed_rate=%s server_prepare_time=%q server_total_time=%q; commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q sources=%q",
-		stats.Files,
-		stats.Duration,
-		humanBytes(stats.CompressedBytes),
-		humanBytesPerSecond(stats.CompressedBytes, stats.Duration),
-		humanBytes(stats.UncompressedBytes),
-		humanBytesPerSecond(stats.UncompressedBytes, stats.Duration),
-		restorePrepareTime,
-		restoreTotalTime,
-		req.Commit,
-		req.ChangesID,
-		req.BuildType,
-		req.BaseCommit,
-		req.ParentCommit,
-		client.LastRestoreSources(),
-	)
-
-	if err := gocache.WriteRestoredPaths(cacheDir, restoredPaths); err != nil {
-		return err
-	}
-
-	return gocache.WriteJobStartMarker(cacheDir, startedAt)
-}
-
-func runSaveCache(cacheDir string, client *http.Client, req gocache.Request, maxFileBytes int64) error {
-	batch, err := gocache.CollectFreshFiles(cacheDir, maxFileBytes)
-	if err != nil {
-		return err
-	}
-	if len(batch.Items) == 0 {
-		log.Printf(
-			"save-cache completed: files=0 upload_time=0s compressed=0 B uncompressed=0 B; commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q",
-			req.Commit,
-			req.ChangesID,
-			req.BuildType,
-			req.BaseCommit,
-			req.ParentCommit,
-		)
-		return nil
-	}
-
-	stats, err := client.SaveCache(req, batch)
-	if err != nil {
-		return err
-	}
-	saveTotalTime := client.LastSaveTiming()
-	log.Printf(
-		"save-cache completed: files=%d upload_time=%s compressed=%s uncompressed=%s server_total_time=%q; commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q",
-		stats.Files,
-		stats.Duration,
-		humanBytes(stats.CompressedBytes),
-		humanBytes(stats.UncompressedBytes),
-		saveTotalTime,
-		req.Commit,
-		req.ChangesID,
-		req.BuildType,
-		req.BaseCommit,
-		req.ParentCommit,
-	)
-	return nil
+	return local.SaveNativeCache(cacheDir, client, req, maxFileBytes)
 }
 
 func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, params local.ProxyParams) error {
@@ -469,29 +373,6 @@ func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, par
 	}
 
 	return nil
-}
-
-func humanBytes(v int64) string {
-	const unit = 1024
-	if v < unit {
-		return fmt.Sprintf("%d B", v)
-	}
-
-	div, exp := int64(unit), 0
-	for n := v / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-
-	return fmt.Sprintf("%.1f %ciB", float64(v)/float64(div), "KMGTPE"[exp])
-}
-
-func humanBytesPerSecond(bytes int64, d time.Duration) string {
-	if bytes <= 0 || d <= 0 {
-		return "0 B/s"
-	}
-
-	return humanBytes(int64(float64(bytes)/d.Seconds())) + "/s"
 }
 
 type recentLogf struct {

@@ -231,13 +231,6 @@ func TestRunNativeGOCACHEMode_RestoreCacheSkipsOversizedFilesBeforeDownload(t *t
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
-func TestHumanBytesPerSecond(t *testing.T) {
-	require.Equal(t, "0 B/s", humanBytesPerSecond(0, time.Second))
-	require.Equal(t, "0 B/s", humanBytesPerSecond(1024, 0))
-	require.Equal(t, "1.0 KiB/s", humanBytesPerSecond(2048, 2*time.Second))
-	require.Equal(t, "1.5 KiB/s", humanBytesPerSecond(1536, time.Second))
-}
-
 func TestNormalizeServerFlags(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

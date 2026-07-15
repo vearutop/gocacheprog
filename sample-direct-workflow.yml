@@ -1,0 +1,71 @@
+name: test-unit-direct
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+env:
+  GO111MODULE: "on"
+jobs:
+  test:
+    strategy:
+      matrix:
+        go-version: [ stable ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download gocacheprog
+        run: |
+          wget -q -O /tmp/gocacheprog.tar.gz https://github.com/vearutop/gocacheprog/releases/latest/download/linux_amd64.tar.gz
+          tar xf /tmp/gocacheprog.tar.gz -C /tmp
+          rm /tmp/gocacheprog.tar.gz
+
+      # Go test cache includes file mtimes for some repo-local inputs.
+      # Canonicalize them so fresh CI checkouts get stable cache keys.
+      - name: Canonicalize Timestamps
+        run: |
+          /tmp/gocacheprog -canonicalize-timestamps .
+
+      - name: Setup gocacheprog for PR
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          BASE_COMMIT="${{ github.event.pull_request.base.sha }}"
+          COMMIT="${{ github.event.pull_request.head.sha }}"
+          CHANGES_ID="${{ github.repository }}#${{ github.event.pull_request.number }}"
+          BUILD_TYPE="${GITHUB_REPOSITORY//\//-}-unit"
+          AUTH_TOKEN="<key>"
+          REMOTE_URL="https://gocache.example.com"
+
+          {
+            echo "GOCACHEPROG=/tmp/gocacheprog -auth-token ${AUTH_TOKEN} -cache-dir ./build-cache -remote-url ${REMOTE_URL} -preload -max-file-bytes 3000000 -commit ${COMMIT} -changes-id ${CHANGES_ID} -build-type ${BUILD_TYPE} -base-commit ${BASE_COMMIT}"
+            echo "GOMAXPROCS=100"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup gocacheprog for main/master
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          COMMIT="${{ github.sha }}"
+          BUILD_TYPE="${GITHUB_REPOSITORY//\//-}-unit"
+          AUTH_TOKEN="<key>"
+          REMOTE_URL="https://gocache.example.com"
+
+          {
+            echo "GOCACHEPROG=/tmp/gocacheprog -auth-token ${AUTH_TOKEN} -cache-dir ./build-cache -remote-url ${REMOTE_URL} -preload -max-file-bytes 3000000 -commit ${COMMIT} -build-type ${BUILD_TYPE}"
+            echo "GOMAXPROCS=100"
+          } >> "$GITHUB_ENV"
+
+      # Direct mode starts a fresh gocacheprog helper for this one `go` invocation; it preloads,
+      # runs, and uploads its own cache-used manifest on exit. There is no daemon to stop and no
+      # native GOCACHE state to save, so there is no finalize step for this mode.
+      - name: Test
+        shell: bash
+        run: |
+          time go test -parallel 50 ./...
