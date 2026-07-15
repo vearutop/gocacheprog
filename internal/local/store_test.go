@@ -2,10 +2,12 @@ package local
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -193,6 +195,40 @@ func TestStorePut_WritesEntriesUnderPrefixedDir(t *testing.T) {
 
 	_, err = os.Stat(filepath.Join(dir, "entries", "ou", "output_one"))
 	require.NoError(t, err)
+}
+
+// TestStorePut_ConcurrentSameOutputIDDoesNotRace guards against a race where two Put calls
+// for different ActionIDs sharing an OutputID (identical build output content, e.g. one from
+// a direct cmd/go CmdPut and one from a concurrent upstream fetch) both write outputFile.tmp
+// and race on the rename, failing with "no such file or directory".
+func TestStorePut_ConcurrentSameOutputIDDoesNotRace(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	require.NoError(t, err)
+
+	now := time.Now()
+	const writers = 20
+
+	var wg sync.WaitGroup
+	errs := make([]error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = store.Put(cache.Response{Items: []cache.ResponseItem{
+				testItem(fmt.Sprintf("action-%d", i), "shared-output", "same-body", &now),
+			}})
+		}(i)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "entries", "sh", "shared-output"))
+	require.NoError(t, err)
+	require.Equal(t, "same-body", string(body))
 }
 
 func TestStoreMaxFileBytes_SkipsPutAndServe(t *testing.T) {

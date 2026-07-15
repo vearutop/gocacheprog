@@ -317,12 +317,20 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 	return nil
 }
 
+// writeAtomicSeq disambiguates concurrent writers' temp file names. Two Put calls for
+// different ActionIDs can legitimately share an OutputID (identical build output content)
+// and race to write the same outputFile; a shared ".tmp" suffix would let one writer's
+// rename consume the other's temp file, failing with ENOENT.
+var writeAtomicSeq atomic.Int64
+
 func writeAtomic(outputFile string, rd io.Reader) (err error) {
 	if err := os.MkdirAll(filepath.Dir(outputFile), 0o750); err != nil {
 		return fmt.Errorf("mkdir output dir: %w", err)
 	}
 
-	f, err := os.Create(outputFile + ".tmp") //nolint:gosec // outputFile is derived from the configured cache dir.
+	tmpFile := fmt.Sprintf("%s.tmp.%d.%d", outputFile, os.Getpid(), writeAtomicSeq.Add(1))
+
+	f, err := os.Create(tmpFile) //nolint:gosec // outputFile is derived from the configured cache dir.
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
@@ -333,25 +341,48 @@ func writeAtomic(outputFile string, rd io.Reader) (err error) {
 			if closeErr := f.Close(); closeErr != nil {
 				log.Printf("close temp file after copy failure: %s", closeErr.Error())
 			}
+			removeStaleTemp(tmpFile)
 			return fmt.Errorf("copy to file: %w", err)
 		}
 	}
 
 	if err := f.Close(); err != nil {
+		removeStaleTemp(tmpFile)
 		return fmt.Errorf("close file: %w", err)
 	}
 
-	return os.Rename(outputFile+".tmp", outputFile)
+	if err := os.Rename(tmpFile, outputFile); err != nil {
+		removeStaleTemp(tmpFile)
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+
+	return nil
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return fmt.Errorf("mkdir output dir: %w", err)
 	}
-	if err := os.WriteFile(path+".tmp", data, mode); err != nil {
+
+	tmpFile := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), writeAtomicSeq.Add(1))
+
+	if err := os.WriteFile(tmpFile, data, mode); err != nil {
+		removeStaleTemp(tmpFile)
 		return err
 	}
-	return os.Rename(path+".tmp", path)
+
+	if err := os.Rename(tmpFile, path); err != nil {
+		removeStaleTemp(tmpFile)
+		return err
+	}
+
+	return nil
+}
+
+func removeStaleTemp(path string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("remove stale temp file %s: %s", path, err.Error())
+	}
 }
 
 func (dc *Store) Close() error {

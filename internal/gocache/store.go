@@ -1349,12 +1349,20 @@ func lruTimeMicro(ie indexEntry) int64 {
 	return ie.ModTimeMicro
 }
 
+// writeAtomicSeq disambiguates concurrent writers' temp file names. Two writers can
+// legitimately target the same relative path (e.g. concurrent uploads of an identical
+// native cache file); a shared ".tmp" suffix would let one writer's rename consume the
+// other's temp file, failing with ENOENT.
+var writeAtomicSeq atomic.Int64
+
 func writeAtomic(outputFile string, rd io.Reader, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(outputFile), 0o750); err != nil {
 		return fmt.Errorf("mkdir output dir: %w", err)
 	}
 
-	f, err := os.OpenFile(outputFile+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode) //nolint:gosec // path is derived from configured storage dir.
+	tmpFile := fmt.Sprintf("%s.tmp.%d.%d", outputFile, os.Getpid(), writeAtomicSeq.Add(1))
+
+	f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode) //nolint:gosec // path is derived from configured storage dir.
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
@@ -1364,25 +1372,48 @@ func writeAtomic(outputFile string, rd io.Reader, mode os.FileMode) error {
 			if closeErr := f.Close(); closeErr != nil {
 				log.Printf("close temp file after copy failure: %s", closeErr.Error())
 			}
+			removeStaleTemp(tmpFile)
 			return fmt.Errorf("copy to file: %w", err)
 		}
 	}
 
 	if err := f.Close(); err != nil {
+		removeStaleTemp(tmpFile)
 		return fmt.Errorf("close file: %w", err)
 	}
 
-	return os.Rename(outputFile+".tmp", outputFile)
+	if err := os.Rename(tmpFile, outputFile); err != nil {
+		removeStaleTemp(tmpFile)
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+
+	return nil
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return fmt.Errorf("mkdir output dir: %w", err)
 	}
-	if err := os.WriteFile(path+".tmp", data, mode); err != nil {
+
+	tmpFile := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), writeAtomicSeq.Add(1))
+
+	if err := os.WriteFile(tmpFile, data, mode); err != nil {
+		removeStaleTemp(tmpFile)
 		return err
 	}
-	return os.Rename(path+".tmp", path)
+
+	if err := os.Rename(tmpFile, path); err != nil {
+		removeStaleTemp(tmpFile)
+		return err
+	}
+
+	return nil
+}
+
+func removeStaleTemp(path string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("remove stale temp file %s: %s", path, err.Error())
+	}
 }
 
 func cleanRelativePath(path string) (string, error) {
