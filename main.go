@@ -462,7 +462,12 @@ func runShim(remoteURL string, authToken string, dumpLogs string, quiet bool) er
 		return fmt.Errorf("daemon client: %w", err)
 	}
 
-	return local.ProcessShimSession(os.Stdin, os.Stdout, logDump, client)
+	err = local.ProcessShimSession(os.Stdin, os.Stdout, logDump, client)
+	if errors.Is(err, local.ErrShimCloseTimeout) {
+		local.RecordShimForcedClose(remoteURL)
+	}
+
+	return err
 }
 
 func isLocalRemoteURL(remoteURL string) bool {

@@ -88,7 +88,11 @@ run concurrently rather than one at a time — a real speedup for shim mode in p
 daemon fields batches from many `go` invocations over the life of a job.
 
 - `shim` mode: stops the daemon and reports its job-wide cumulative stats, including how many
-  separate `go` invocations shared that one daemon session
+  separate `go` invocations shared that one daemon session, and `forced_closes` — a count of shim
+  clients that hit their close-wait safety timeout instead of a clean shutdown (see
+  [ADVANCED.md](ADVANCED.md#a-lost-shim-response-is-bounded-by-a-close-wait-timeout-not-a-hang)).
+  Normally `0`; if it's not, the job still finished, but it's worth investigating why a response
+  was ever late or lost.
 - `gocache` mode: uploads freshly-built cache entries and reports combined restore + save stats
 - `direct` mode: no daemon to stop, but each `-quiet` invocation appends its stats (plus its
   parent process's PID and, on Linux, command line) to a small file next to the cache dir, so

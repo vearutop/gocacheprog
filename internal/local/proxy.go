@@ -645,35 +645,46 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 	atomic.AddInt64(&dc.batches, 1)
 
 	if dc.upstream != nil {
-		m := make(map[string]cacheprog.Response, len(batch))
-		r := cache.Request{ActionIDs: make([]string, 0, len(batch))}
-		reqs := map[string]cacheprog.Request{}
+		// Grouped by ActionID, not deduplicated to one request each: multiple concurrent
+		// sessions (or the same session) can legitimately look up the same ActionID close
+		// enough in time to land in the same batch, and every one of those original
+		// requests - each with its own ID - needs its own response. A plain map keyed by
+		// ActionID would silently keep only the last request for a repeated ActionID,
+		// permanently losing the response for every earlier one sharing it.
+		reqsByAction := make(map[string][]cacheprog.Request, len(batch))
+		actionIDs := make([]string, 0, len(batch))
 		answered := make(map[string]bool, len(batch))
 
 		for _, req := range batch {
-			m[req.ActionID] = cacheprog.Response{ID: req.ID, Miss: true}
-			r.ActionIDs = append(r.ActionIDs, req.ActionID)
-			reqs[req.ActionID] = req
+			if _, ok := reqsByAction[req.ActionID]; !ok {
+				actionIDs = append(actionIDs, req.ActionID)
+			}
+			reqsByAction[req.ActionID] = append(reqsByAction[req.ActionID], req)
+		}
+
+		r := cache.Request{ActionIDs: actionIDs}
+
+		respondAll := func(actionID string, rs cacheprog.Response) {
+			for _, req := range reqsByAction[actionID] {
+				out := rs
+				out.ID = req.ID
+				dc.resps <- out
+			}
 		}
 
 		err := dc.upstream.Get(r, func(resp cache.ResponseItem) {
 			answered[resp.ActionID] = true
-
-			rs := m[resp.ActionID]
-			defer func() {
-				dc.resps <- rs
-			}()
+			count := int64(len(reqsByAction[resp.ActionID]))
 
 			if resp.Miss {
-				rs.Miss = true
-
-				atomic.AddInt64(&dc.misses, 1)
+				atomic.AddInt64(&dc.misses, count)
+				respondAll(resp.ActionID, cacheprog.Response{Miss: true})
 				return
 			}
 
 			br, err := resp.UncompressedBodyReader()
 			if err != nil {
-				rs.Err = err.Error()
+				respondAll(resp.ActionID, cacheprog.Response{Err: err.Error()})
 				return
 			}
 
@@ -689,33 +700,35 @@ func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
 				if err != nil {
 					dc.logf("read item uncompressed body %v: %s", resp, err.Error())
 
-					rs.Err = err.Error()
+					respondAll(resp.ActionID, cacheprog.Response{Err: err.Error()})
 					return
 				}
 			}
 
-			atomic.AddInt64(&dc.hits, 1)
-			atomic.AddInt64(&dc.regularHits, 1)
+			atomic.AddInt64(&dc.hits, count)
+			atomic.AddInt64(&dc.regularHits, count)
 
-			req := reqs[resp.ActionID]
+			// One local write per ActionID regardless of how many original requests
+			// share it; respondAll then answers every one of them with that same result.
+			req := reqsByAction[resp.ActionID][0]
 			req.Command = cacheprog.CmdPut
 			req.OutputID = resp.OutputID
 			req.BodySize = resp.Size
 
-			rs = dc.putOne(req, b)
+			respondAll(resp.ActionID, dc.putOne(req, b))
 		})
 		if err != nil {
 			dc.logf("upstream get failed: %s", err.Error())
 		}
 
 		// If the upstream call errored before (or partway through) streaming results, some
-		// or all of this batch's items never reached the callback above and so never got a
-		// response. Without this, cmd/go would hang forever waiting on those specific
+		// or all of this batch's ActionIDs never reached the callback above and so never
+		// got a response. Without this, cmd/go would hang forever waiting on those specific
 		// request IDs instead of just seeing a (recoverable) cache miss.
-		for actionID, req := range reqs {
+		for actionID, reqs := range reqsByAction {
 			if !answered[actionID] {
-				atomic.AddInt64(&dc.misses, 1)
-				dc.resps <- cacheprog.Response{ID: req.ID, Miss: true}
+				atomic.AddInt64(&dc.misses, int64(len(reqs)))
+				respondAll(actionID, cacheprog.Response{Miss: true})
 			}
 		}
 
@@ -808,6 +821,11 @@ type StatsSummary struct {
 
 	// TotalTime is the wall-clock time elapsed since -github-actions-init started, when known.
 	TotalTime string `json:"total_time,omitempty"`
+
+	// ForcedCloses counts shim clients (shim mode only) that hit shimCloseWaitTimeout and closed
+	// without waiting for every pending response. Normally zero; a nonzero value means the
+	// safety net fired and is worth investigating even though it prevented a hang.
+	ForcedCloses int64 `json:"forced_closes,omitempty"`
 }
 
 func (s StatsSummary) String() string {
@@ -820,6 +838,9 @@ func (s StatsSummary) String() string {
 	}
 	if s.RoundTrips > 0 {
 		str += fmt.Sprintf(" round_trips=%d", s.RoundTrips)
+	}
+	if s.ForcedCloses > 0 {
+		str += fmt.Sprintf(" forced_closes=%d", s.ForcedCloses)
 	}
 	if s.GetTotalTime != "" {
 		str += " round_trip_time=" + s.GetTotalTime

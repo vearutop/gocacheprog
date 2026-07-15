@@ -578,6 +578,7 @@ func doneShimMode() error {
 	log.Printf("github-actions-done: daemon stopped gracefully")
 
 	stats := resp.Stats
+	stats.ForcedCloses = CountShimForcedCloses("unix://" + socket)
 	if elapsed, ok := elapsedSinceInit(); ok {
 		stats.TotalTime = elapsed.String()
 	}
