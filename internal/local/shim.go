@@ -39,8 +39,9 @@ type shimStopRequest struct {
 }
 
 type ShimStopResponse struct {
-	Lines []string `json:"lines,omitempty"`
-	Err   string   `json:"err,omitempty"`
+	Lines []string     `json:"lines,omitempty"`
+	Stats StatsSummary `json:"stats,omitempty"`
+	Err   string       `json:"err,omitempty"`
 }
 
 type shimEnvelope struct {
@@ -625,15 +626,15 @@ func (c *ShimClient) Close() error {
 	return c.conn.Close()
 }
 
-func StopShimServer(remoteURL string, authToken string) ([]string, error) {
+func StopShimServer(remoteURL string, authToken string) (ShimStopResponse, error) {
 	network, addr, err := shimNetworkAndAddr(remoteURL)
 	if err != nil {
-		return nil, err
+		return ShimStopResponse{}, err
 	}
 
 	conn, err := net.DialTimeout(network, addr, 2*time.Second) //nolint:gosec // addr is the operator-supplied -stop target, a local daemon address, not attacker-controlled remote input.
 	if err != nil {
-		return nil, err
+		return ShimStopResponse{}, err
 	}
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
@@ -644,23 +645,23 @@ func StopShimServer(remoteURL string, authToken string) ([]string, error) {
 	enc := json.NewEncoder(conn)
 	//nolint:gosec // local shim auth token is an expected protocol field.
 	if err := enc.Encode(shimHello{AuthToken: authToken, Stop: true}); err != nil {
-		return nil, err
+		return ShimStopResponse{}, err
 	}
 
 	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		return nil, err
+		return ShimStopResponse{}, err
 	}
 
 	var resp ShimStopResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
-		return nil, err
+		return ShimStopResponse{}, err
 	}
 
 	if resp.Err != "" {
-		return resp.Lines, errors.New(resp.Err)
+		return resp, errors.New(resp.Err)
 	}
 
-	return resp.Lines, nil
+	return resp, nil
 }
 
 func shimNetworkAndAddr(remoteURL string) (string, string, error) {

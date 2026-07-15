@@ -386,9 +386,9 @@ func TestStopShimServer_RequestsDaemonShutdown(t *testing.T) {
 		return err == nil
 	}, time.Second, 10*time.Millisecond)
 
-	lines, err := StopShimServer("unix://"+socketPath, "secret")
+	resp, err := StopShimServer("unix://"+socketPath, "secret")
 	require.NoError(t, err)
-	require.Equal(t, []string{"stopped"}, lines)
+	require.Equal(t, []string{"stopped"}, resp.Lines)
 
 	select {
 	case err := <-done:

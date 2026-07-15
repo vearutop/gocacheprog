@@ -50,14 +50,14 @@ func resolveAbsPath(path string) (string, error) {
 }
 
 // RestoreNativeCache restores native GOCACHE files from the remote server into cacheDir.
-func RestoreNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Request, startedAt time.Time) error {
+func RestoreNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Request, startedAt time.Time) (gocache.TransferStats, error) {
 	restoredPaths := make([]string, 0)
 	stats, err := client.RestoreCache(req, func(item gocache.FileItem, body io.Reader) error {
 		restoredPaths = append(restoredPaths, item.Path)
 		return gocache.RestoreToDir(cacheDir, item, body)
 	})
 	if err != nil {
-		return err
+		return gocache.TransferStats{}, err
 	}
 	restorePrepareTime, restoreTotalTime := client.LastRestoreTimings()
 	log.Printf(
@@ -79,17 +79,17 @@ func RestoreNativeCache(cacheDir string, client *cachehttp.Client, req gocache.R
 	)
 
 	if err := gocache.WriteRestoredPaths(cacheDir, restoredPaths); err != nil {
-		return err
+		return gocache.TransferStats{}, err
 	}
 
-	return gocache.WriteJobStartMarker(cacheDir, startedAt)
+	return stats, gocache.WriteJobStartMarker(cacheDir, startedAt)
 }
 
 // SaveNativeCache uploads freshly created native GOCACHE files from cacheDir to the remote server.
-func SaveNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Request, maxFileBytes int64) error {
+func SaveNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Request, maxFileBytes int64) (gocache.TransferStats, error) {
 	batch, err := gocache.CollectFreshFiles(cacheDir, maxFileBytes)
 	if err != nil {
-		return err
+		return gocache.TransferStats{}, err
 	}
 	if len(batch.Items) == 0 {
 		log.Printf(
@@ -100,12 +100,12 @@ func SaveNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Requ
 			req.BaseCommit,
 			req.ParentCommit,
 		)
-		return nil
+		return gocache.TransferStats{}, nil
 	}
 
 	stats, err := client.SaveCache(req, batch)
 	if err != nil {
-		return err
+		return gocache.TransferStats{}, err
 	}
 	saveTotalTime := client.LastSaveTiming()
 	log.Printf(
@@ -121,7 +121,7 @@ func SaveNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Requ
 		req.BaseCommit,
 		req.ParentCommit,
 	)
-	return nil
+	return stats, nil
 }
 
 func humanBytesBinary(v int64) string {
