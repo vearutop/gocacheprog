@@ -471,6 +471,123 @@ func (dc *Store) PreloadSources(req cache.PreloadRequest) ([]string, error) {
 	return sources, err
 }
 
+// IntegrityCheck walks every index entry, verifying that each stored object's actual bytes
+// match its recorded size (decompressing entries flagged as compressed), and reports every one
+// that doesn't. Verification runs against a point-in-time snapshot of the index, taken under a
+// brief lock, so the scan's disk I/O never blocks concurrent Get/Put serving. Unless dryRun is
+// set, broken entries are then evicted - but only if their index entry is still exactly what was
+// verified, so an entry a concurrent Put legitimately replaced while the scan was running is left
+// alone.
+func (dc *Store) IntegrityCheck(dryRun bool) cache.IntegrityReport {
+	dc.mu.Lock()
+	snapshot := make([]actionIndexEntry, 0, len(dc.index))
+	for k, v := range dc.index {
+		snapshot = append(snapshot, actionIndexEntry{actionID: k, entry: v})
+	}
+	dc.mu.Unlock()
+
+	// Verify each distinct OutputID once: many ActionIDs can legitimately share one OutputID
+	// (identical build output content), and re-reading and decompressing the same file once per
+	// referencing ActionID would be wasted, disk-bound work.
+	verified := make(map[string]error, len(snapshot))
+
+	report := cache.IntegrityReport{DryRun: dryRun}
+
+	for _, item := range snapshot {
+		report.Checked++
+
+		verifyErr, ok := verified[item.entry.OutputID]
+		if !ok {
+			verifyErr = dc.verifyOutput(item.entry)
+			verified[item.entry.OutputID] = verifyErr
+		}
+
+		if verifyErr == nil {
+			continue
+		}
+
+		entry := cache.IntegrityReportEntry{
+			ActionID: item.actionID,
+			OutputID: item.entry.OutputID,
+			Size:     item.entry.Size,
+			WireSize: item.entry.WireSize,
+			Error:    verifyErr.Error(),
+		}
+
+		if !dryRun {
+			entry.Removed = dc.removeIfUnchanged(item.actionID, item.entry)
+		}
+
+		report.Broken = append(report.Broken, entry)
+	}
+
+	return report
+}
+
+// verifyOutput reads and fully decompresses (if applicable) the object backing ie, confirming
+// its actual byte count matches its recorded Size - the same verification a real Get response
+// performs when preparing this entry's body, just without a client to hand it to.
+func (dc *Store) verifyOutput(ie indexEntry) error {
+	item := cache.ResponseItem{
+		OutputID:     ie.OutputID,
+		Size:         ie.Size,
+		DiskPath:     dc.outputPathForRead(ie.OutputID),
+		IsCompressed: ie.Compressed == 1,
+		WireSize:     ie.WireSize,
+	}
+
+	rd, err := item.UncompressedBodyReader()
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+
+	if rd == nil {
+		if ie.Size != 0 {
+			return fmt.Errorf("missing body for non-empty entry (size=%d)", ie.Size)
+		}
+
+		return nil
+	}
+	defer func() {
+		if closeErr := rd.Close(); closeErr != nil {
+			log.Printf("integrity check: close body reader for output %s: %s", ie.OutputID, closeErr.Error())
+		}
+	}()
+
+	n, err := io.Copy(io.Discard, rd)
+	if err != nil {
+		return fmt.Errorf("read/decompress: %w", err)
+	}
+
+	if n != ie.Size {
+		return fmt.Errorf("size mismatch: stored object decompresses to %d bytes, index says %d", n, ie.Size)
+	}
+
+	return nil
+}
+
+// removeIfUnchanged evicts actionID's index entry only if it's still exactly what integrity
+// verification saw. If a concurrent Put already replaced it with fresh content while the scan
+// was running, that new entry has nothing to do with the broken one found earlier and must be
+// left alone.
+func (dc *Store) removeIfUnchanged(actionID string, expected indexEntry) bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	current, ok := dc.index[actionID]
+	if !ok || current != expected {
+		return false
+	}
+
+	delete(dc.index, actionID)
+	dc.releaseOutputRefLocked(expected.OutputID)
+	dc.dirty = true
+
+	log.Printf("integrity check: removed broken cache entry action_id=%s output_id=%s size=%d", actionID, expected.OutputID, expected.Size)
+
+	return true
+}
+
 func (dc *Store) HasEntries() bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()

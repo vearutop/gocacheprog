@@ -91,6 +91,11 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == "/integrity-check" {
+		h.IntegrityCheck(rw, r)
+		return
+	}
+
 	if r.URL.Path == "/save-cache" {
 		h.SaveCache(rw, r)
 		return

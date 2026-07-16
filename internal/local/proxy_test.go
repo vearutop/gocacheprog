@@ -1,6 +1,7 @@
 package local
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -139,6 +140,35 @@ func TestProxyMaybePreload_UsesMaxFileBytesForPreload(t *testing.T) {
 	require.NoError(t, proxy.MaybePreload())
 	require.True(t, upstream.called)
 	require.Equal(t, int64(3_000_000), upstream.req.MaxSize)
+}
+
+// TestProxyMaybePreload_UpstreamFailureIsNonFatal guards against a real production incident:
+// preload is an optimization, so a failure in it - including cache.ErrShortRead, when a
+// server-side object doesn't match its own declared size - must never fail the build. It must
+// be reported (bypassing -quiet) and swallowed, not propagated as an error that would abort the
+// GOCACHEPROG helper process (and, with it, the whole go build/test invocation).
+func TestProxyMaybePreload_UpstreamFailureIsNonFatal(t *testing.T) {
+	upstream := &preloaderStub{preloadErr: fmt.Errorf("item %+v: %w: got 4 bytes, want 10", cache.ResponseItem{ActionID: "a1", OutputID: "o1"}, cache.ErrShortRead)}
+
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	proxy := NewProxy(store, upstream, make(chan cacheprog.Response, 1), ProxyParams{
+		Preload: true,
+		Commit:  "commit123",
+	})
+	t.Cleanup(func() {
+		require.NoError(t, proxy.Close())
+	})
+
+	var warnOut bytes.Buffer
+	origOut := preloadWarnOutput
+	preloadWarnOutput = &warnOut
+	t.Cleanup(func() { preloadWarnOutput = origOut })
+
+	require.NoError(t, proxy.MaybePreload(), "a preload failure must never fail the build")
+	require.True(t, upstream.called)
+	require.Contains(t, warnOut.String(), "commit123")
+	require.Contains(t, warnOut.String(), "short read")
 }
 
 func TestProxyLookup_SkipsRemoteGetAfterTimeBudget(t *testing.T) {
@@ -406,8 +436,9 @@ func (p *putRecorderStub) PostCacheUsed(commit string, changesID string, buildTy
 }
 
 type preloaderStub struct {
-	called bool
-	req    cache.PreloadRequest
+	called     bool
+	req        cache.PreloadRequest
+	preloadErr error
 }
 
 func (p *preloaderStub) Get(req cache.Request, cb func(resp cache.ResponseItem)) error {
@@ -421,7 +452,7 @@ func (p *preloaderStub) Put(values cache.Response) error {
 func (p *preloaderStub) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseItem)) error {
 	p.called = true
 	p.req = req
-	return nil
+	return p.preloadErr
 }
 
 type remoteBudgetStub struct {

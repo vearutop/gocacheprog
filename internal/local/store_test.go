@@ -325,6 +325,109 @@ func TestStoreManifestKeyLengthLimit(t *testing.T) {
 	require.EqualError(t, err, "build-type too long: 101 > 100")
 }
 
+func TestStoreIntegrityCheck_ReportsNothingWhenEntriesAreHealthy(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "body-1", &now),
+	}}))
+
+	report := store.IntegrityCheck(false)
+	require.EqualValues(t, 1, report.Checked)
+	require.Empty(t, report.Broken)
+	require.False(t, report.DryRun)
+}
+
+func TestStoreIntegrityCheck_DetectsAndRemovesCorruptedEntry(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "hello-world", &now),
+	}}))
+
+	// Corrupt the stored object directly, as if the file no longer matches the index's
+	// recorded size - the same condition that produced cache.ErrShortRead on the client.
+	require.NoError(t, os.WriteFile(store.OutputFilename("outputId1"), []byte("short"), 0o600))
+
+	report := store.IntegrityCheck(false)
+	require.EqualValues(t, 1, report.Checked)
+	require.Len(t, report.Broken, 1)
+	require.Equal(t, "actionId1", report.Broken[0].ActionID)
+	require.Equal(t, "outputId1", report.Broken[0].OutputID)
+	require.True(t, report.Broken[0].Removed)
+	require.Contains(t, report.Broken[0].Error, "size mismatch")
+
+	got := store.getOne("actionId1")
+	require.True(t, got.Miss, "broken entry must have been evicted")
+}
+
+func TestStoreIntegrityCheck_DryRunReportsWithoutRemoving(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "hello-world", &now),
+	}}))
+	require.NoError(t, os.WriteFile(store.OutputFilename("outputId1"), []byte("short"), 0o600))
+
+	report := store.IntegrityCheck(true)
+	require.Len(t, report.Broken, 1)
+	require.False(t, report.Broken[0].Removed)
+	require.True(t, report.DryRun)
+
+	require.Contains(t, store.index, "actionId1", "dry-run must not evict anything")
+}
+
+func TestStoreIntegrityCheck_ChecksSharedOutputIDOnceButReportsEveryActionID(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	now := time.Now()
+	item1 := testItem("actionId1", "sharedOutput", "hello-world", &now)
+	item2 := testItem("actionId2", "sharedOutput", "hello-world", &now)
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{item1, item2}}))
+	require.NoError(t, os.WriteFile(store.OutputFilename("sharedOutput"), []byte("short"), 0o600))
+
+	report := store.IntegrityCheck(false)
+	require.EqualValues(t, 2, report.Checked)
+	require.Len(t, report.Broken, 2, "each ActionID referencing the broken OutputID must be reported")
+
+	require.True(t, store.getOne("actionId1").Miss)
+	require.True(t, store.getOne("actionId2").Miss)
+}
+
+// TestStoreRemoveIfUnchanged_SkipsEntryReplacedSinceItWasVerified guards against evicting an
+// entry that a concurrent Put legitimately replaced while an IntegrityCheck scan was still
+// running: eviction must only apply to the exact entry that was verified as broken.
+func TestStoreRemoveIfUnchanged_SkipsEntryReplacedSinceItWasVerified(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "hello-world", &now),
+	}}))
+
+	staleSnapshot := store.index["actionId1"]
+
+	// Simulate a concurrent Put replacing the entry after the scan snapshotted it.
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId2", "a different body", &now),
+	}}))
+
+	removed := store.removeIfUnchanged("actionId1", staleSnapshot)
+	require.False(t, removed, "must not evict an entry that no longer matches what was verified")
+
+	current, ok := store.index["actionId1"]
+	require.True(t, ok)
+	require.Equal(t, "outputId2", current.OutputID, "the replacing entry must be untouched")
+}
+
 func testItem(actionID, outputID, body string, now *time.Time) cache.ResponseItem {
 	item := cache.ResponseItem{
 		ActionID: actionID,

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -637,8 +638,26 @@ func (dc *Proxy) Preload(req cache.PreloadRequest) error {
 	dc.lastPreloadSize = uncompressedBytes
 	dc.preloadBytesMu.Unlock()
 
-	return err
+	if err != nil {
+		// Preload is an optimization, never a correctness requirement: a failure here - a
+		// stalled connection, or (see cache.ErrShortRead) a response that desynced mid-stream
+		// because a server-side object didn't match its own declared size - must never fail the
+		// build. Report it and degrade instead: whatever didn't get preloaded is simply resolved
+		// as a normal cache miss later. Printed directly, bypassing whatever -quiet did to the
+		// log package, because this is exactly the kind of anomaly worth investigating even
+		// though it's being handled gracefully.
+		_, _ = fmt.Fprintf(preloadWarnOutput, //nolint:errcheck // best-effort diagnostic; a write failure here must not itself fail the build.
+			"gocacheprog: preload failed, continuing without it (commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q): %s\n",
+			req.Commit, req.ChangesID, req.BuildType, req.BaseCommit, req.ParentCommit, err.Error(),
+		)
+	}
+
+	return nil
 }
+
+// preloadWarnOutput is where Proxy.Preload reports a non-fatal preload failure. Overridable in
+// tests; defaults to stderr so the warning survives -quiet's log redirection.
+var preloadWarnOutput io.Writer = os.Stderr
 
 //nolint:nestif // batching remote lookups is inherently branchy and clearer inline.
 func (dc *Proxy) resolveBatch(batch []cacheprog.Request) {
