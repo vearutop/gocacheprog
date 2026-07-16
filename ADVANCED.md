@@ -389,6 +389,7 @@ Preload source resolution order is:
 2. `parent`
 3. `changes`
 4. `base`
+5. `newest` (only when none of the above matched anything)
 
 Interpretation:
 
@@ -400,6 +401,16 @@ Interpretation:
   - stable rolling label such as `owner/repo#123`
 - `base`
   - fallback relevance from target branch state
+- `newest`
+  - last resort: whichever manifest for this `build-type` was written most recently, from *any*
+    commit or PR. Covers a cold start where `commit`/`parent`/`changes`/`base` all come up empty -
+    a long pause with nothing relevant built on the target branch since, or the very first build
+    of a new `build-type` - so every PR isn't forced to start fully cold. In practice, cache
+    entries are usually still largely relevant across unrelated PRs of the same `build-type`, so
+    this beats an empty preload while waiting for the target branch to catch up. Scoped strictly
+    to the requested `build-type` - it never reaches across build types, which typically have
+    different dependency footprints. Never overrides a real match: it only fires when the other
+    four sources found nothing at all.
 
 ### `-changes-id`
 
@@ -564,6 +575,23 @@ If auth is wrong or missing, client startup reports:
 authentication failed: -auth-token <value> is missing or incorrect
 ```
 
+Querying any endpoint directly (`curl`, a browser, a monitoring script) needs the same token, as
+an `Authorization: Bearer <token>` header — there's no query-param or basic-auth alternative:
+
+```bash
+curl -H "Authorization: Bearer secret-token" https://cache.example.com/status
+```
+
+Without it (or with the wrong token), every endpoint responds `401 unauthorized`:
+
+```bash
+$ curl -i https://cache.example.com/status
+HTTP/1.1 401 Unauthorized
+Www-Authenticate: Bearer realm="gocacheprogd"
+
+unauthorized
+```
+
 ## Observability
 
 ### `/status`
@@ -631,6 +659,20 @@ specific entry.
 /integrity-check           # reports and removes broken entries
 /integrity-check?dry_run=1 # reports only, evicts nothing
 ```
+
+If the server was started with `-auth-token` (see [Authentication](#authentication)), every
+request needs a matching `Authorization: Bearer <token>` header — a plain `curl` without it gets
+`401 unauthorized`:
+
+```bash
+# Report only, no eviction - safe to run against a live server at any time.
+curl -H "Authorization: Bearer secret-token" "https://cache.example.com/integrity-check?dry_run=1"
+
+# Report and remove broken entries.
+curl -H "Authorization: Bearer secret-token" "https://cache.example.com/integrity-check"
+```
+
+Pipe through `jq` to see just the broken entries, e.g. `... | jq '.broken'`.
 
 The scan snapshots the index under a brief lock and does its (disk-bound, potentially slow) work
 outside it, so it never blocks concurrent `Get`/`Put` serving. An entry found broken is only

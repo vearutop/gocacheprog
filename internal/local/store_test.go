@@ -54,6 +54,124 @@ func TestStorePreload_MissingManifestIsIgnored(t *testing.T) {
 	require.Empty(t, got)
 }
 
+// TestStorePreload_FallsBackToNewestManifestWhenNoSourceMatches covers a cold-start scenario:
+// after a long pause with nothing relevant built on master, or on a brand new build type, none
+// of commit/parent/changes/base has a manifest yet. Rather than every PR starting fully cold,
+// preload falls back to whatever manifest for this build type was written most recently, from
+// any unrelated commit or PR - in practice still largely relevant cache.
+func TestStorePreload_FallsBackToNewestManifestWhenNoSourceMatches(t *testing.T) {
+	store, err := NewStore(t.TempDir(), WithCompression())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "body-1", &now),
+		testItem("actionId2", "outputId2", "body-2", &now),
+	}}))
+	// Manifest from a totally unrelated commit - not the requested commit/parent/base, and not
+	// the requested changes-id either.
+	require.NoError(t, store.PostCacheUsed("unrelated-commit", "", "", []string{"actionId1"}, false))
+
+	var got []string
+	err = store.Preload(cache.PreloadRequest{
+		MaxSize:      1024,
+		ParentCommit: "missing-parent",
+		BaseCommit:   "missing-base",
+		ChangesID:    "repo/pr-999",
+	}, func(resp cache.ResponseItem) {
+		got = append(got, resp.ActionID)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"actionId1"}, got)
+
+	sources, err := store.PreloadSources(cache.PreloadRequest{
+		ParentCommit: "missing-parent",
+		BaseCommit:   "missing-base",
+		ChangesID:    "repo/pr-999",
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"newest"}, sources)
+}
+
+// TestStorePreload_NewestFallbackDoesNotOverrideARealMatch guards against the fallback firing
+// even when a normal source already matched - it must only ever apply when nothing else did.
+func TestStorePreload_NewestFallbackDoesNotOverrideARealMatch(t *testing.T) {
+	store, err := NewStore(t.TempDir(), WithCompression())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "body-1", &now),
+		testItem("actionId2", "outputId2", "body-2", &now),
+	}}))
+	require.NoError(t, store.PostCacheUsed("unrelated-commit", "", "", []string{"actionId1"}, false))
+	require.NoError(t, store.PostCacheUsed("base123", "", "", []string{"actionId2"}, false))
+
+	sources, err := store.PreloadSources(cache.PreloadRequest{BaseCommit: "base123"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"base"}, sources)
+}
+
+// TestStorePreload_NewestFallbackIsScopedToBuildType guards against leaking cache relevance
+// across unrelated build types (e.g. lint vs unit vs race), which typically have different
+// dependency footprints.
+func TestStorePreload_NewestFallbackIsScopedToBuildType(t *testing.T) {
+	store, err := NewStore(t.TempDir(), WithCompression())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "body-1", &now),
+	}}))
+	require.NoError(t, store.PostCacheUsed("unrelated-commit", "", "other-build-type", []string{"actionId1"}, false))
+
+	var got []string
+	err = store.Preload(cache.PreloadRequest{
+		MaxSize:      1024,
+		ParentCommit: "missing-parent",
+		BuildType:    "this-build-type",
+	}, func(resp cache.ResponseItem) {
+		got = append(got, resp.ActionID)
+	})
+	require.NoError(t, err)
+	require.Empty(t, got, "a manifest from a different build type must not be used as a fallback")
+}
+
+// TestStorePreload_NewestFallbackPicksMostRecentlyWrittenManifest guards against picking an
+// arbitrary (rather than the most recently written) unrelated manifest when several exist.
+func TestStorePreload_NewestFallbackPicksMostRecentlyWrittenManifest(t *testing.T) {
+	store, err := NewStore(t.TempDir(), WithCompression())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "body-1", &now),
+		testItem("actionId2", "outputId2", "body-2", &now),
+	}}))
+	require.NoError(t, store.PostCacheUsed("older-commit", "", "", []string{"actionId1"}, false))
+	require.NoError(t, store.PostCacheUsed("newer-commit", "", "", []string{"actionId2"}, false))
+
+	olderPath, err := store.commitManifestPath("older-commit", "")
+	require.NoError(t, err)
+	newerPath, err := store.commitManifestPath("newer-commit", "")
+	require.NoError(t, err)
+
+	older := time.Now().Add(-time.Hour)
+	newer := time.Now()
+	require.NoError(t, os.Chtimes(olderPath, older, older))
+	require.NoError(t, os.Chtimes(newerPath, newer, newer))
+
+	var got []string
+	err = store.Preload(cache.PreloadRequest{
+		MaxSize:      1024,
+		ParentCommit: "missing-parent",
+	}, func(resp cache.ResponseItem) {
+		got = append(got, resp.ActionID)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"actionId2"}, got)
+}
+
 func TestStorePreload_CurrentCommitManifestUsedForSameCommitRestart(t *testing.T) {
 	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
