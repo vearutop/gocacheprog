@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"maps"
 	"net/url"
@@ -667,10 +668,77 @@ func (dc *Store) preloadFilterActionIDs(req cache.PreloadRequest) (map[string]st
 	}
 
 	if len(sources) == 0 {
-		sources = []string{"none"}
+		actionIDs, err := dc.loadNewestManifest(req.BuildType)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if len(actionIDs) > 0 {
+			sources = []string{"newest"}
+			for _, actionID := range actionIDs {
+				res[actionID] = struct{}{}
+			}
+		} else {
+			sources = []string{"none"}
+		}
 	}
 
 	return res, sources, nil
+}
+
+// loadNewestManifest is the last-resort preload source: when no commit/parent/changes/base
+// manifest matched - a long pause with nothing relevant built on master since, or the very
+// first build of a new build type - it falls back to whichever manifest for this build type was
+// written most recently, from any commit or PR. In practice, cache entries are usually still
+// largely relevant across unrelated PRs of the same build type, so this beats every PR starting
+// completely cold until master catches up.
+func (dc *Store) loadNewestManifest(buildType string) ([]string, error) {
+	scopeDir, err := dc.manifestScopeDir(buildType)
+	if err != nil {
+		return nil, err
+	}
+
+	scopeRoot := filepath.Join(dc.dir, "manifests", scopeDir)
+
+	var (
+		newestPath string
+		newestTime time.Time
+	)
+
+	err = filepath.WalkDir(scopeRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+
+			return walkErr
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		if info.ModTime().After(newestTime) {
+			newestTime = info.ModTime()
+			newestPath = path
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan manifest dir %s: %w", scopeRoot, err)
+	}
+
+	if newestPath == "" {
+		return nil, nil
+	}
+
+	return dc.loadManifest(newestPath, filepath.Base(newestPath))
 }
 
 func (dc *Store) loadCommitManifest(commit string, buildType string) ([]string, error) {

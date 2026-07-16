@@ -5,11 +5,47 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 )
+
+// TestResponseItem_UncompressedBodyReader_SurvivesReadAfterReturnForLargeFile guards against a
+// real production incident: for compressed items backed by a real *os.File (WireSize >= 1e6,
+// see PrepareBodyReader), UncompressedBodyReader used to close that file via its own defer
+// before returning, even though the zstd decoder it hands back still needs to keep pulling
+// bytes from it. Reads happening after the call returns - exactly what a caller like
+// Store.verifyOutput does - failed with "file already closed". Files under the 1e6 threshold
+// never hit this, since PrepareBodyReader reads those fully into memory up front, which is why
+// this went unnoticed until a caller decompressed a genuinely large stored object.
+func TestResponseItem_UncompressedBodyReader_SurvivesReadAfterReturnForLargeFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "object")
+
+	original := []byte(strings.Repeat("hello-world-integrity-check ", 100))
+	compressed := zstd.EncodeTo(nil, original)
+	require.NoError(t, os.WriteFile(path, compressed, 0o600))
+
+	item := ResponseItem{
+		Size:         int64(len(original)),
+		WireSize:     1_000_001, // forces PrepareBodyReader's real *os.File path, not its in-memory ReadFile shortcut.
+		IsCompressed: true,
+		DiskPath:     path,
+	}
+
+	rd, err := item.UncompressedBodyReader()
+	require.NoError(t, err)
+	require.NotNil(t, rd)
+
+	got, err := io.ReadAll(rd)
+	require.NoError(t, err)
+	require.Equal(t, original, got)
+	require.NoError(t, rd.Close())
+}
 
 func makeRawItem(actionID, outputID, body string) ResponseItem {
 	item := ResponseItem{ActionID: actionID, OutputID: outputID, Size: int64(len(body)), WireSize: int64(len(body))}

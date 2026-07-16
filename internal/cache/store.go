@@ -135,21 +135,45 @@ func (ri *ResponseItem) UncompressedBodyReader() (io.ReadCloser, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer func() {
-			if closeErr := rd.Close(); closeErr != nil {
-				log.Printf("close compressed body reader: %s", closeErr.Error())
-			}
-		}()
 
 		zrd, err := zstd.NewReader(rd)
 		if err != nil {
+			if closeErr := rd.Close(); closeErr != nil {
+				log.Printf("close compressed body reader after zstd init failure: %s", closeErr.Error())
+			}
+
 			return nil, err
 		}
 
-		return zrd.IOReadCloser(), nil
+		// rd must stay open for as long as the returned reader is read from - the zstd
+		// decoder pulls compressed bytes from it lazily, not all at once - so closing it
+		// here (rather than deferring to whoever closes the returned reader) would race
+		// with, and eventually break, any read past whatever happened to already be
+		// buffered. This bit small/in-memory bodies (see PrepareBodyReader's ReadFile path)
+		// but broke any real *os.File-backed body once reads outlived this function's own
+		// scope, surfacing as "file already closed".
+		return &zstdReadCloser{ReadCloser: zrd.IOReadCloser(), inner: rd}, nil
 	}
 
 	return ri.bodyReader()
+}
+
+// zstdReadCloser closes both the zstd decoder and the underlying compressed-body reader it
+// pulls from, so callers only need to close the one reader they were handed.
+type zstdReadCloser struct {
+	io.ReadCloser
+	inner io.Closer
+}
+
+func (z *zstdReadCloser) Close() error {
+	err1 := z.ReadCloser.Close()
+	err2 := z.inner.Close()
+
+	if err1 != nil {
+		return err1
+	}
+
+	return err2
 }
 
 // CompressedBodyReader updates item with compression.
