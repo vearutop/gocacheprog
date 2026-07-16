@@ -51,6 +51,103 @@ func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 	require.Equal(t, "", string(manifestBody))
 }
 
+func saveItemForTest(t *testing.T, store *Store, req Request, path, body string) {
+	t.Helper()
+
+	item := FileItem{Path: path, Size: int64(len(body)), WireSize: int64(len(body))}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader([]byte(body))), nil
+	})
+
+	require.NoError(t, store.Save(req, Batch{Items: []FileItem{item}}))
+}
+
+// TestStoreRestore_FallsBackToNewestManifestWhenNoSourceMatches covers a cold-start scenario:
+// after a long pause with nothing relevant built on the target branch, or on a brand new build
+// type, none of commit/parent/changes/base has a manifest yet. Restore falls back to whatever
+// manifest for this build type was written most recently, from any unrelated commit or PR.
+func TestStoreRestore_FallsBackToNewestManifestWhenNoSourceMatches(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "unrelated-commit"}, "ab/cache-entry-a", "payload")
+
+	var restored []string
+	sources, err := store.Restore(Request{ParentCommit: "missing-parent", BaseCommit: "missing-base"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"newest"}, sources)
+	require.Equal(t, []string{"ab/cache-entry-a"}, restored)
+}
+
+// TestStoreRestore_NewestFallbackDoesNotOverrideARealMatch guards against the fallback firing
+// even when a normal source already matched - it must only ever apply when nothing else did.
+func TestStoreRestore_NewestFallbackDoesNotOverrideARealMatch(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "unrelated-commit"}, "ab/unrelated", "payload-1")
+	saveItemForTest(t, store, Request{Commit: "base123"}, "cd/relevant", "payload-2")
+
+	sources, err := store.RestoreSources(Request{BaseCommit: "base123"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"base"}, sources)
+}
+
+// TestStoreRestore_NewestFallbackIsScopedToBuildType guards against leaking cache relevance
+// across unrelated build types, which typically have different dependency footprints.
+func TestStoreRestore_NewestFallbackIsScopedToBuildType(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "unrelated-commit", BuildType: "other-build-type"}, "ab/entry", "payload")
+
+	var restored []string
+	sources, err := store.Restore(Request{ParentCommit: "missing-parent", BuildType: "this-build-type"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"none"}, sources)
+	require.Empty(t, restored, "a manifest from a different build type must not be used as a fallback")
+}
+
+// TestStoreRestore_NewestFallbackPicksMostRecentlyWrittenManifest guards against picking an
+// arbitrary (rather than the most recently written) unrelated manifest when several exist.
+func TestStoreRestore_NewestFallbackPicksMostRecentlyWrittenManifest(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "older-commit"}, "ab/older", "payload-1")
+	saveItemForTest(t, store, Request{Commit: "newer-commit"}, "cd/newer", "payload-2")
+
+	olderPath, err := store.commitManifestPath("older-commit", "")
+	require.NoError(t, err)
+	newerPath, err := store.commitManifestPath("newer-commit", "")
+	require.NoError(t, err)
+
+	older := time.Now().Add(-time.Hour)
+	newer := time.Now()
+	require.NoError(t, os.Chtimes(olderPath, older, older))
+	require.NoError(t, os.Chtimes(newerPath, newer, newer))
+
+	var restored []string
+	sources, err := store.Restore(Request{ParentCommit: "missing-parent"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"newest"}, sources)
+	require.Equal(t, []string{"cd/newer"}, restored)
+}
+
 func TestCollectFilesToSave_SkipsRestoredPaths(t *testing.T) {
 	dir := t.TempDir()
 
