@@ -1183,10 +1183,108 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 	}
 
 	if len(sources) == 0 {
+		newest, err := s.newestFallbackPaths(req.BuildType, seen)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if len(newest) > 0 {
+			sources = []string{"newest"}
+			result = append(result, newest...)
+		}
+	}
+
+	if len(sources) == 0 {
 		sources = []string{"none"}
 	}
 
 	return result, sources, nil
+}
+
+// newestFallbackPaths is restorePaths' last-resort source: when no commit/parent/changes/base
+// manifest matched anything, it loads whichever manifest for this build type was written most
+// recently (see loadNewestManifest), self-heals it if needed, and returns whatever of its paths
+// aren't already in seen. Returns (nil, nil) - not an error - when no manifest exists at all yet.
+func (s *Store) newestFallbackPaths(buildType string, seen map[string]struct{}) ([]string, error) {
+	paths, changed, manifestPath, err := s.loadNewestManifest(buildType)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	if changed {
+		body := strings.Join(paths, "\n")
+		if body != "" {
+			body += "\n"
+		}
+
+		if err := s.writeManifest(manifestPath, body); err != nil {
+			return nil, err
+		}
+	}
+
+	result := make([]string, 0, len(paths))
+	for _, relPath := range paths {
+		if _, ok := seen[relPath]; ok {
+			continue
+		}
+
+		seen[relPath] = struct{}{}
+		result = append(result, relPath)
+	}
+
+	return result, nil
+}
+
+// loadNewestManifest is the last-resort restore source: when no commit/parent/changes/base
+// manifest matched - a long pause with nothing relevant built on the target branch since, or the
+// very first build of a new build type - it falls back to whichever manifest for this build type
+// was written most recently, from any commit or PR. In practice, cache entries are usually still
+// largely relevant across unrelated PRs of the same build type, so this beats every PR starting
+// completely cold until the target branch catches up. Returns os.ErrNotExist if no manifest
+// exists yet for this build type at all.
+func (s *Store) loadNewestManifest(buildType string) ([]string, bool, string, error) {
+	scopeDir, err := manifestScopeDir(buildType)
+	if err != nil {
+		return nil, false, "", err
+	}
+
+	files, err := listManifestFiles(filepath.Join(s.dir, "manifests", scopeDir))
+	if err != nil {
+		return nil, false, "", err
+	}
+
+	var (
+		newestPath string
+		newestTime time.Time
+	)
+
+	for _, path := range files {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+
+			return nil, false, "", statErr
+		}
+
+		if info.ModTime().After(newestTime) {
+			newestTime = info.ModTime()
+			newestPath = path
+		}
+	}
+
+	if newestPath == "" {
+		return nil, false, "", os.ErrNotExist
+	}
+
+	paths, changed, err := s.loadManifest(newestPath)
+
+	return paths, changed, newestPath, err
 }
 
 func (s *Store) loadCommitManifest(commit string, buildType string) ([]string, bool, string, error) {

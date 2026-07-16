@@ -714,7 +714,7 @@ func (dc *Store) loadNewestManifest(buildType string) ([]string, error) {
 			return walkErr
 		}
 
-		if d.IsDir() {
+		if d.IsDir() || strings.HasSuffix(d.Name(), ".tmp") {
 			return nil
 		}
 
