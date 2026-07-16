@@ -34,6 +34,29 @@ type PreloadSourceProvider interface {
 	PreloadSources(req PreloadRequest) ([]string, error)
 }
 
+// IntegrityChecker is implemented by stores that can walk their entries verifying stored bytes
+// against declared metadata, reporting (and, unless dryRun, removing) any that don't match.
+type IntegrityChecker interface {
+	IntegrityCheck(dryRun bool) IntegrityReport
+}
+
+// IntegrityReportEntry describes one entry whose stored bytes didn't match its declared size.
+type IntegrityReportEntry struct {
+	ActionID string `json:"action_id"`
+	OutputID string `json:"output_id"`
+	Size     int64  `json:"size"`
+	WireSize int64  `json:"wire_size,omitempty"`
+	Error    string `json:"error"`
+	Removed  bool   `json:"removed"`
+}
+
+// IntegrityReport is the result of an IntegrityCheck run.
+type IntegrityReport struct {
+	Checked int64                  `json:"checked"`
+	Broken  []IntegrityReportEntry `json:"broken,omitempty"`
+	DryRun  bool                   `json:"dry_run"`
+}
+
 type ResponseItem struct {
 	ActionID     string     `json:",omitempty"`
 	Miss         bool       `json:",omitempty"` // cache miss
@@ -413,22 +436,67 @@ func (r *Response) ReaderFrom(rd io.Reader, read func(item ResponseItem, body io
 
 	// Read the body of each ResponseItem if necessary
 	for _, item := range r.Items {
-		if item.WireSize > 0 {
-			bodyReader := io.LimitReader(rd, item.WireSize)
-
-			if err := read(item, bodyReader); err != nil {
-				return totalBytesRead, err
-			}
-
-			totalBytesRead += item.WireSize
-		} else {
+		if item.WireSize == 0 {
 			if err := read(item, nil); err != nil {
 				return totalBytesRead, err
 			}
+
+			continue
+		}
+
+		consumed, err := readItemBody(rd, item.WireSize, func(cr io.Reader) error { return read(item, cr) })
+		totalBytesRead += consumed
+
+		if err != nil {
+			return totalBytesRead, fmt.Errorf("item %+v: %w", item, err)
 		}
 	}
 
 	return totalBytesRead, nil
+}
+
+// ErrShortRead marks a ReaderFrom item whose actual bytes on the wire fell short of its
+// declared WireSize - most likely a server-side index entry that doesn't match the object it
+// actually streamed. Callers can check for this via errors.Is to tell "this response desynced
+// mid-stream" apart from other failures (network errors, a decode error inside read itself),
+// and to treat it as a data-integrity anomaly worth surfacing rather than a fatal failure.
+var ErrShortRead = errors.New("short read")
+
+// readItemBody hands read a wireSize-bounded view of rd, then drains any part of it read left
+// unconsumed, so the caller's stream offset stays aligned to this item's declared boundary
+// regardless of what read did with the body. It returns an error if the actual byte count on
+// the wire fell short of wireSize (e.g. the server's index entry didn't match the object it
+// actually streamed): failing loudly here, instead of silently continuing, matters because past
+// a short item every later item in the same stream would be read from the wrong offset,
+// corrupting each of them in turn rather than just this one.
+func readItemBody(rd io.Reader, wireSize int64, read func(io.Reader) error) (int64, error) {
+	cr := &countingReader{r: io.LimitReader(rd, wireSize)}
+
+	if err := read(cr); err != nil {
+		return 0, err
+	}
+
+	if _, err := io.Copy(io.Discard, cr); err != nil {
+		return cr.n, fmt.Errorf("drain remaining body: %w", err)
+	}
+
+	if cr.n != wireSize {
+		return cr.n, fmt.Errorf("%w: got %d bytes, want %d", ErrShortRead, cr.n, wireSize)
+	}
+
+	return cr.n, nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+
+	return n, err
 }
 
 func (r *Response) ContentLength() (int64, error) {

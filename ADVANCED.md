@@ -617,6 +617,51 @@ Examples:
 
 `/clear` removes matching manifests and deletes native cache objects only when they are no longer referenced by any remaining manifest.
 
+### Integrity check endpoint
+
+`/integrity-check` walks every entry in the wire-format store (the one behind `/get`/`/put`/
+`/preload` — see [A short item in a multi-item response aborts cleanly instead of corrupting the
+rest](#a-short-item-in-a-multi-item-response-aborts-cleanly-instead-of-corrupting-the-rest)),
+reading and decompressing each stored object to confirm its actual bytes match its recorded size.
+This is the same verification a real `Get` response performs when preparing an item's body — run
+proactively, across the whole store, rather than only when a client happens to request that
+specific entry.
+
+```text
+/integrity-check           # reports and removes broken entries
+/integrity-check?dry_run=1 # reports only, evicts nothing
+```
+
+The scan snapshots the index under a brief lock and does its (disk-bound, potentially slow) work
+outside it, so it never blocks concurrent `Get`/`Put` serving. An entry found broken is only
+evicted if it's still exactly what integrity verification saw — if a concurrent `Put` already
+replaced it with fresh content while the scan was running, that new entry is left alone. Entries
+sharing an `OutputID` (identical build output content, a common case) are verified once but
+reported/evicted individually per `ActionID`.
+
+Response JSON:
+
+```json
+{
+  "checked": 48213,
+  "dry_run": false,
+  "broken": [
+    {
+      "action_id": "…",
+      "output_id": "…",
+      "size": 3884324,
+      "wire_size": 939263,
+      "error": "size mismatch: stored object decompresses to 122 bytes, index says 3884324",
+      "removed": true
+    }
+  ]
+}
+```
+
+`broken` is omitted entirely when nothing is broken. The same `ActionID`/`OutputID` reappearing
+across separate runs (rather than a one-off) points at a specific, reproducibly bad object on the
+server, not a transient client-side network issue.
+
 ### Native restore/save summaries
 
 Native batch mode logs completion summaries that include:
@@ -734,6 +779,36 @@ that never reached a response fall back to a miss instead of being silently drop
 Together these mean a remote server that's down, unreachable, or stuck can only ever cost you a
 cache miss (and up to ~3s per affected batch) — never an indefinite hang of the `go` invocation
 waiting on a response that will never arrive.
+
+### A short item in a multi-item response aborts cleanly instead of corrupting the rest
+
+Preload, batch `Get`, and native restore/save responses stream several items back-to-back over
+one connection, each framed by a declared `WireSize` the reader trusts to know where the next
+item's header starts. If any one item's actual bytes on the wire ever fall short of that
+declared size — e.g. a server-side index entry that doesn't match the object it actually
+streamed — the shared stream position would desync, and every item read afterward in that same
+response would be misinterpreted: sometimes a corrupt compressed-body header
+(`invalid input: magic number mismatch`), sometimes a body cut off mid-read (`unexpected EOF`).
+
+`cache.Response.ReaderFrom`, `gocache.Batch.ReaderFrom`, and `gocache.ReadStream` (in
+`internal/cache/store.go` and `internal/gocache/store.go`) all track exactly how many bytes were
+actually consumed for each item — draining anything the caller's own processing left unread — and
+fail immediately with a `cache.ErrShortRead`/`gocache.ErrShortRead` error the moment one item comes
+up short, rather than letting the desync silently cascade into every item that follows. Nothing
+from before the short item is affected; nothing corrupted ever reaches disk (the earlier partial
+writes to a temp file are cleaned up), and the one clear error tells you which item (`ActionID`,
+`OutputID`, declared vs. actual bytes) and how many bytes were missing, instead of a scattering of
+unrelated-looking decompression errors for whatever items happened to come after it.
+
+Preload is where this is most likely to surface, since it streams the most items per response. A
+short item there is never fatal: `Proxy.Preload` (`internal/local/proxy.go`) always returns `nil`
+regardless of what the upstream preload call did, printing any failure — including
+`ErrShortRead` — straight to stderr (bypassing `-quiet`'s log redirection) together with the
+preload request's commit/changes_id/build_type context, then degrading: whatever didn't get
+preloaded is simply resolved as a normal cache miss later. A short item repeating on every retry
+for the same commit points at a specific object on the server (named in the error by `OutputID`)
+rather than a transient network blip — worth checking directly against the server's own index and
+storage for that object.
 
 ### A lost shim response is bounded by a close-wait timeout, not a hang
 

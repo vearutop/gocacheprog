@@ -553,21 +553,66 @@ func (b *Batch) ReaderFrom(rd io.Reader, read func(item FileItem, body io.Reader
 	}
 
 	for _, item := range b.Items {
-		if item.WireSize > 0 {
-			bodyReader := io.LimitReader(rd, item.WireSize)
-			if err := read(item, bodyReader); err != nil {
+		if item.WireSize == 0 {
+			if err := read(item, nil); err != nil {
 				return total, err
 			}
-			total += item.WireSize
+
 			continue
 		}
 
-		if err := read(item, nil); err != nil {
-			return total, err
+		consumed, err := readItemBody(rd, item.WireSize, func(cr io.Reader) error { return read(item, cr) })
+		total += consumed
+
+		if err != nil {
+			return total, fmt.Errorf("item %+v: %w", item, err)
 		}
 	}
 
 	return total, nil
+}
+
+// ErrShortRead marks a ReaderFrom/ReadStream item whose actual bytes on the wire fell short of
+// its declared WireSize - most likely a server-side index entry that doesn't match the object it
+// actually streamed. Callers can check for this via errors.Is to tell "this stream desynced
+// mid-transfer" apart from other failures, and to treat it as a data-integrity anomaly worth
+// surfacing rather than a fatal failure.
+var ErrShortRead = errors.New("short read")
+
+// readItemBody hands read a wireSize-bounded view of rd, then drains any part of it read left
+// unconsumed, so the caller's stream offset stays aligned to this item's declared boundary
+// regardless of what read did with the body. It returns an error if the actual byte count on
+// the wire fell short of wireSize: failing loudly here, instead of silently continuing, matters
+// because past a short item every later item in the same stream would be read from the wrong
+// offset, corrupting each of them in turn rather than just this one.
+func readItemBody(rd io.Reader, wireSize int64, read func(io.Reader) error) (int64, error) {
+	cr := &countingReader{r: io.LimitReader(rd, wireSize)}
+
+	if err := read(cr); err != nil {
+		return 0, err
+	}
+
+	if _, err := io.Copy(io.Discard, cr); err != nil {
+		return cr.n, fmt.Errorf("drain remaining body: %w", err)
+	}
+
+	if cr.n != wireSize {
+		return cr.n, fmt.Errorf("%w: got %d bytes, want %d", ErrShortRead, cr.n, wireSize)
+	}
+
+	return cr.n, nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+
+	return n, err
 }
 
 func (b *Batch) ContentLength() (int64, error) {
@@ -624,7 +669,7 @@ func (sw *StreamWriter) Close() error {
 	return binary.Write(sw.w, binary.BigEndian, int32(0))
 }
 
-func ReadStream(rd io.Reader, read func(item FileItem, body io.Reader) error) (int64, error) {
+func ReadStream(rd io.Reader, read func(item FileItem, body io.Reader) error) (int64, error) { //nolint:unparam // total is used by callers (e.g. save_cache.go) to annotate error messages.
 	var total int64
 
 	for {
@@ -662,17 +707,12 @@ func ReadStream(rd io.Reader, read func(item FileItem, body io.Reader) error) (i
 		}
 
 		if wireSize > 0 {
-			bodyReader := io.LimitReader(rd, wireSize)
-			readErr := read(item, bodyReader)
-			// Drain whatever the callback left unread so the stream stays framed
-			// correctly for the next item, regardless of what read() did with the body.
-			if _, discardErr := io.Copy(io.Discard, bodyReader); discardErr != nil && readErr == nil {
-				readErr = fmt.Errorf("drain item body: %w", discardErr)
+			consumed, err := readItemBody(rd, wireSize, func(cr io.Reader) error { return read(item, cr) })
+			total += consumed
+
+			if err != nil {
+				return total, fmt.Errorf("item %+v: %w", item, err)
 			}
-			if readErr != nil {
-				return total, readErr
-			}
-			total += wireSize
 			continue
 		}
 

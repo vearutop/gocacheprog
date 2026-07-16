@@ -2,6 +2,8 @@ package gocache
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -344,6 +346,38 @@ func TestReadStream_DrainsSkippedItemBody(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"small"}, paths)
 	require.Equal(t, []string{"abcd"}, bodies)
+}
+
+// TestReadStream_AbortsOnShortItemInsteadOfCorruptingLaterItems guards against silent stream
+// desync: if an item's actual body on the wire falls short of its declared WireSize (e.g. a
+// stale index entry vs. the real object), ReadStream must fail loudly on that item rather than
+// silently continuing to read every later item from the wrong offset.
+func TestReadStream_AbortsOnShortItemInsteadOfCorruptingLaterItems(t *testing.T) {
+	var buf bytes.Buffer
+
+	writeRawItem := func(item FileItem, body string) {
+		jsonData, err := json.Marshal(item)
+		require.NoError(t, err)
+		require.NoError(t, binary.Write(&buf, binary.BigEndian, int32(len(jsonData))))
+		buf.Write(jsonData)
+		buf.WriteString(body)
+	}
+
+	writeRawItem(FileItem{Path: "first", Size: 5, WireSize: 5}, "hello")
+	// second declares 10 bytes but the stream only actually has 4 - as if the index entry
+	// overstated the real object size - then ends entirely.
+	writeRawItem(FileItem{Path: "second", Size: 10, WireSize: 10}, "shrt")
+
+	var seen []string
+	_, err := ReadStream(&buf, func(item FileItem, body io.Reader) error {
+		seen = append(seen, item.Path)
+		_, _ = io.ReadAll(body) //nolint:errcheck // best-effort, like a real decompressing consumer; only ReadStream's own error matters here.
+		return nil
+	})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrShortRead)
+	require.Equal(t, []string{"first", "second"}, seen)
 }
 
 func TestMergeSavedPaths_ChangesIDMerges(t *testing.T) {
