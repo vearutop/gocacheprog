@@ -5,19 +5,22 @@
 //
 // DSN format for -github-actions-init:
 //
-//	<remote-url>?auth=<token>&cache_dir=<dir>&preload_size=<bytes>&build_type=<type>&mode=direct|shim|gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>
+//	<remote-url>?auth=<token>&cache_dir=<dir>&preload_size=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>
 //
 // Only the remote URL is required; every query parameter is optional:
 //
 //   - auth: bearer token for the remote server and (in shim mode) the local daemon socket
-//   - cache_dir: local cache/GOCACHE directory; empty picks gocacheprog's own default
+//   - cache_dir: local cache/GOCACHE directory; empty picks gocacheprog's own default; a
+//     leading "~/" is resolved against the user's home directory
 //   - preload_size: maps to -max-file-bytes (default 3,000,000)
 //   - build_type: maps to -build-type, e.g. "unit" or "race"; always prefixed with
 //     $GITHUB_REPOSITORY (e.g. "owner-repo-unit") so manifests and the /inspect and /clear
 //     admin endpoints stay isolated per repository when multiple repos share one server
 //   - mode: "direct" (no daemon, one gocacheprog per go invocation), "shim" (background
-//     daemon + GOCACHEPROG pointed at its local socket, default), or "gocache" (native
-//     GOCACHE restore-cache/save-cache, no GOCACHEPROG involved)
+//     daemon + GOCACHEPROG pointed at its local socket, default), "gocache" (native
+//     GOCACHE restore-cache/save-cache, no GOCACHEPROG involved), or "local-gocache" (native
+//     GOCACHE pointed straight at cache_dir, no remote involved at all; for self-hosted
+//     runners with a persistent home directory across jobs)
 //   - canonicalize_timestamps: repo root to canonicalize before anything else; defaults to
 //     "." (the checkout root) since fresh CI checkouts almost always need it for stable
 //     cache keys; set skip_canonicalize_timestamps=true to opt out entirely
@@ -36,6 +39,8 @@
 // it back from the daemon's stop response, gocache mode combines restore (persisted via
 // GOCACHEPROG_GHA_RESTORE_STATS) and save stats, and direct mode aggregates whatever each -quiet
 // invocation appended via AppendQuietRunStats to quietRunStatsFilename next to the cache dir.
+// local-gocache mode never talks to a remote at all (init just points GOCACHE at cache_dir, done
+// is a no-op besides logging), so both ends only report the cache dir's file count/size.
 //
 // Direct mode's per-invocation records also carry best-effort parent process context (PID and,
 // on Linux, the parent's command line read from /proc) purely for diagnosing an unexpectedly
@@ -138,8 +143,10 @@ func GithubActionsInit(dsn string) error {
 		return initShimMode(self, cfg, commit, baseCommit, changesID, initStartedAt)
 	case "gocache":
 		return initGocacheMode(cfg, commit, baseCommit, changesID, initStartedAt)
+	case "local-gocache":
+		return initLocalGocacheMode(cfg, initStartedAt)
 	default:
-		return fmt.Errorf("github-actions-init: unsupported mode %q (expected direct, shim, or gocache)", cfg.mode)
+		return fmt.Errorf("github-actions-init: unsupported mode %q (expected direct, shim, gocache, or local-gocache)", cfg.mode)
 	}
 }
 
@@ -158,6 +165,8 @@ func GithubActionsDone() error {
 		return doneShimMode()
 	case "gocache":
 		return doneGocacheMode()
+	case "local-gocache":
+		return doneLocalGocacheMode()
 	case "":
 		return fmt.Errorf("github-actions-done: %s is not set; did -github-actions-init run earlier in this job?", envGHAMode)
 	default:
@@ -533,6 +542,46 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 	return setGitHubEnv(env)
 }
 
+// initLocalGocacheMode points GOCACHE straight at cache_dir with no remote server involved at
+// all: no restore, no preload, nothing to authenticate. It's a fallback to classic local GOCACHE
+// reuse for self-hosted runners with a persistent home directory across jobs, where the best
+// possible cache hit rate comes from just letting `go` read/write its own on-disk cache in place
+// rather than paying for a remote round trip.
+func initLocalGocacheMode(cfg githubActionsConfig, initStartedAt time.Time) error {
+	cacheDir, err := ResolveNativeCacheDir(cfg.cacheDir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(cacheDir, 0o750); err != nil {
+		return fmt.Errorf("ensure native cache dir: %w", err)
+	}
+
+	logCacheDirStats("github-actions-init", cacheDir)
+
+	env := map[string]string{
+		"GOCACHE":      cacheDir,
+		envGHAMode:     "local-gocache",
+		envGHACacheDir: cacheDir,
+		envGHAInitTime: initStartedAt.Format(time.RFC3339Nano),
+	}
+
+	log.Printf("github-actions-init: local-gocache mode ready, GOCACHE=%q", cacheDir)
+
+	return setGitHubEnv(env)
+}
+
+// logCacheDirStats logs cacheDir's current file count/size, best-effort: a stat failure is
+// logged and swallowed rather than failing the caller, since it's purely informational.
+func logCacheDirStats(prefix, cacheDir string) {
+	files, size, err := DirStats(cacheDir)
+	if err != nil {
+		log.Printf("%s: stat cache dir %s: %s", prefix, cacheDir, err.Error())
+		return
+	}
+
+	log.Printf("%s: cache dir %s currently has %d file(s), %s", prefix, cacheDir, files, humanBytesBinary(size))
+}
+
 // elapsedSinceInit returns wall-clock time since -github-actions-init started, read back from
 // envGHAInitTime. ok is false if that env var is missing or unparseable (e.g. -github-actions-done
 // run without a preceding -github-actions-init in this job).
@@ -658,6 +707,26 @@ func doneGocacheMode() error {
 		summary += " total_time=" + elapsed.String()
 	}
 	log.Printf("github-actions-done: cache summary: %s", summary)
+
+	return nil
+}
+
+// doneLocalGocacheMode has no remote state to finalize and, unlike doneGocacheMode, uploads
+// nothing back to a remote: local-gocache mode's whole point is letting the persistent cache
+// dir accumulate across jobs on the runner's own disk. It just reports the cache dir's final
+// file count/size so the effect of a job is visible in the log.
+func doneLocalGocacheMode() error {
+	cacheDir := os.Getenv(envGHACacheDir)
+	if cacheDir == "" {
+		log.Printf("github-actions-done: local-gocache mode recorded no cache dir, nothing to summarize")
+		return nil
+	}
+
+	logCacheDirStats("github-actions-done", cacheDir)
+
+	if elapsed, ok := elapsedSinceInit(); ok {
+		log.Printf("github-actions-done: total_time=%s", elapsed)
+	}
 
 	return nil
 }

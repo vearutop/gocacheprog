@@ -70,6 +70,51 @@ func TestParseGithubActionsDSN_InvalidPreloadSize(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestParseGithubActionsDSN_LocalGocacheMode(t *testing.T) {
+	cfg, err := parseGithubActionsDSN("?mode=local-gocache&cache_dir=~/foo")
+	require.NoError(t, err)
+	require.Equal(t, "local-gocache", cfg.mode)
+	require.Equal(t, "~/foo", cfg.cacheDir)
+	require.Empty(t, cfg.remoteURL)
+}
+
+func TestInitLocalGocacheMode_SetsGocacheAndModeEnv(t *testing.T) {
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	githubEnv := filepath.Join(t.TempDir(), "github_env")
+	t.Setenv("GITHUB_ENV", githubEnv)
+
+	cfg := githubActionsConfig{cacheDir: cacheDir}
+	require.NoError(t, initLocalGocacheMode(cfg, time.Now()))
+
+	_, err := os.Stat(cacheDir)
+	require.NoError(t, err, "cache dir should be created")
+
+	data, err := os.ReadFile(githubEnv)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "GOCACHE="+cacheDir)
+	require.Contains(t, string(data), envGHAMode+"=local-gocache")
+	require.Contains(t, string(data), envGHACacheDir+"="+cacheDir)
+}
+
+func TestDoneLocalGocacheMode_NoCacheDirRecorded(t *testing.T) {
+	t.Setenv(envGHACacheDir, "")
+	require.NoError(t, doneLocalGocacheMode())
+}
+
+func TestDoneLocalGocacheMode_LogsCacheDirStats(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "f"), []byte("hello"), 0o600))
+	t.Setenv(envGHACacheDir, dir)
+
+	var buf bytes.Buffer
+	origOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOutput)
+
+	require.NoError(t, doneLocalGocacheMode())
+	require.Contains(t, buf.String(), "1 file(s)")
+}
+
 func TestRepoScopedBuildType(t *testing.T) {
 	t.Setenv("GITHUB_REPOSITORY", "owner/repo")
 	require.Equal(t, "owner-repo-unit", repoScopedBuildType("unit"))

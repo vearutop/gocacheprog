@@ -33,6 +33,35 @@ func ResolveNativeCacheDir(dir string) (string, error) {
 	return filepath.Join(userCacheDir, "go-build"), nil
 }
 
+// DirStats reports the number of regular files and their combined size under dir. A missing
+// dir is reported as zero files/bytes rather than an error, since callers use it right after
+// creating the dir (or before it's ever been populated).
+func DirStats(dir string) (files int, size int64, err error) {
+	err = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error { //nolint:gosec
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		files++
+		size += info.Size()
+
+		return nil
+	})
+
+	return files, size, err
+}
+
 func resolveAbsPath(path string) (string, error) {
 	if path == "~" || strings.HasPrefix(path, "~/") {
 		homeDir, err := os.UserHomeDir()
