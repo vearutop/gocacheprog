@@ -112,8 +112,8 @@ Only the base URL is required; everything else has a default.
 | Parameter                 | Default            | Meaning                                                                 |
 |---------------------------|--------------------|--------------------------------------------------------------------------|
 | `auth`                     | (none)             | bearer token for the remote server (and the local daemon socket in shim mode) |
-| `mode`                     | `shim`             | `direct`, `shim`, or `gocache` — see [Modes](#modes)                     |
-| `cache_dir`                | automatic          | local cache / native `GOCACHE` directory                                 |
+| `mode`                     | `shim`             | `direct`, `shim`, `gocache`, or `local-gocache` — see [Modes](#modes)    |
+| `cache_dir`                | automatic          | local cache / native `GOCACHE` directory; `~/foo` resolves against `$HOME` |
 | `preload_size`             | `3000000`          | maps to `-max-file-bytes`: max size of a single preloaded/cached file    |
 | `build_type`               | (none)             | maps to `-build-type`, e.g. `unit`, `race`, `lint` — always prefixed with the repository name (see below) |
 | `canonicalize_timestamps`  | `.`                | repo root to canonicalize before anything else                          |
@@ -131,8 +131,9 @@ their manifests — and the `/inspect`/`/clear` admin endpoints — isolated per
 
 ## Modes
 
-`-github-actions-init`'s `mode=` parameter picks one of three underlying strategies. Pick based on
-how many `go` invocations your job runs and how large the cache working set is:
+`-github-actions-init`'s `mode=` parameter picks one of four underlying strategies. Pick based on
+how many `go` invocations your job runs, how large the cache working set is, and whether the
+runner has a remote server to talk to at all:
 
 ### `mode=direct`
 
@@ -175,6 +176,24 @@ restores/saves whole native cache files rather than individual `ActionID` result
 
 ```yaml
 - run: gocacheprog -github-actions-init "https://gocache.example.com?auth=${{ secrets.GOCACHE_AUTH }}&mode=gocache"
+- run: go test ./...
+- run: gocacheprog -github-actions-done
+  if: ${{ always() }}
+```
+
+### `mode=local-gocache`
+
+Points `GOCACHE` straight at `cache_dir` — no remote server involved at all, no restore, no
+preload, no upload on `-github-actions-done`. The remote URL in the DSN is ignored in this mode.
+
+Use this on self-hosted runners with a persistent home directory across jobs, where the cache dir
+itself survives between runs on disk: this is the fastest possible option there's no round trip to
+pay for, remote or local. `-github-actions-init` logs the cache dir's current file count/size on
+the way in, and `-github-actions-done` logs it again on the way out, so growth is visible in the
+job log.
+
+```yaml
+- run: gocacheprog -github-actions-init "?mode=local-gocache&cache_dir=~/.cache/gocacheprog"
 - run: go test ./...
 - run: gocacheprog -github-actions-done
   if: ${{ always() }}
