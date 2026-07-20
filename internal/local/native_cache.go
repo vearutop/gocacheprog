@@ -37,7 +37,7 @@ func ResolveNativeCacheDir(dir string) (string, error) {
 // dir is reported as zero files/bytes rather than an error, since callers use it right after
 // creating the dir (or before it's ever been populated).
 func DirStats(dir string) (files int, size int64, err error) {
-	err = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+	err = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error { //nolint:gosec
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
