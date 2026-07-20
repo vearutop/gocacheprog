@@ -33,11 +33,21 @@ func ResolveNativeCacheDir(dir string) (string, error) {
 	return filepath.Join(userCacheDir, "go-build"), nil
 }
 
-// DirStats reports the number of regular files and their combined size under dir. A missing
-// dir is reported as zero files/bytes rather than an error, since callers use it right after
-// creating the dir (or before it's ever been populated).
-func DirStats(dir string) (files int, size int64, err error) {
-	err = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error { //nolint:gosec
+// cacheFileEntry is one regular file found by scanCacheDir.
+type cacheFileEntry struct {
+	path    string
+	size    int64
+	modTime time.Time
+}
+
+// scanCacheDir walks dir once, returning every regular file's path/size/mtime. A missing dir is
+// reported as no entries rather than an error, since callers use it right after creating the dir
+// (or before it's ever been populated). Shared by DirStats and local-gocache mode's eviction, so
+// a single -github-actions-done run only ever walks the cache dir once.
+func scanCacheDir(dir string) ([]cacheFileEntry, error) {
+	var entries []cacheFileEntry
+
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error { //nolint:gosec
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -53,13 +63,27 @@ func DirStats(dir string) (files int, size int64, err error) {
 			return err
 		}
 
-		files++
-		size += info.Size()
+		entries = append(entries, cacheFileEntry{path, info.Size(), info.ModTime()})
 
 		return nil
 	})
 
-	return files, size, err
+	return entries, err
+}
+
+// DirStats reports the number of regular files and their combined size under dir.
+func DirStats(dir string) (files int, size int64, err error) {
+	entries, err := scanCacheDir(dir)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	for _, e := range entries {
+		files++
+		size += e.size
+	}
+
+	return files, size, nil
 }
 
 func resolveAbsPath(path string) (string, error) {

@@ -119,6 +119,7 @@ Only the base URL is required; everything else has a default.
 | `canonicalize_timestamps`  | `.`                | repo root to canonicalize before anything else                          |
 | `skip_canonicalize_timestamps` | `false`        | skip timestamp canonicalization entirely                                |
 | `skip_preload`             | `false`            | skip the explicit preload pass entirely (direct/shim only)               |
+| `max_cache_bytes`          | `0` (unlimited)    | `local-gocache` mode only; total cache dir size limit, enforced by evicting the oldest files on `-github-actions-done` |
 
 Timestamp canonicalization runs against the repo root by default, since fresh CI checkouts almost
 always need it for stable cache keys (see [ADVANCED.md](ADVANCED.md#timestamp-canonicalization)
@@ -193,11 +194,28 @@ the way in, and `-github-actions-done` logs it again on the way out, so growth i
 job log.
 
 ```yaml
-- run: gocacheprog -github-actions-init "?mode=local-gocache&cache_dir=~/.cache/gocacheprog"
+- run: gocacheprog -github-actions-init "?mode=local-gocache&cache_dir=~/.cache/gocacheprog&max_cache_bytes=5000000000"
 - run: go test ./...
 - run: gocacheprog -github-actions-done
   if: ${{ always() }}
 ```
+
+Since the same persistent cache dir can end up shared across several repos/build types on one
+self-hosted runner, `local-gocache` mode also keeps a small `gocacheprog.json` right in `cache_dir`:
+a per-`build_type` count/first-used/last-used, so you can tell what's actually been using that
+runner's disk. Both `-github-actions-init` and `-github-actions-done` print it in full; `-done` is
+also what updates it (it re-reads the file immediately before writing, to keep the race window
+small when several jobs finish around the same time on the same runner).
+
+Set `max_cache_bytes` to cap the cache dir's total size. It's checked only on
+`-github-actions-done` (a single scan of `cache_dir` covers both the size log and eviction, so
+setting it doesn't add a second directory walk): once the dir exceeds the limit, the oldest files
+(by mtime, wherever they sit in `cache_dir`) are deleted first until the total drops strictly below
+90% of the limit — e.g. `max_cache_bytes=10000000000` (10GB) trims down to just under 9GB, not
+exactly 9GB and not exactly 10GB. Trimming to that margin rather than to the limit itself avoids
+evicting again on almost every subsequent job once the cache settles near the cap. Deleting
+individual files out of a native `GOCACHE` is always
+safe: it's content-addressed, so a missing file just costs a cache miss, never a corruption.
 
 ## Further Reading
 

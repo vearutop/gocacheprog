@@ -112,7 +112,8 @@ func TestDoneLocalGocacheMode_LogsCacheDirStats(t *testing.T) {
 	defer log.SetOutput(origOutput)
 
 	require.NoError(t, doneLocalGocacheMode())
-	require.Contains(t, buf.String(), "1 file(s)")
+	require.Contains(t, buf.String(), "2 file(s)") // "f" plus the gocacheprog.json usage-stats file written by doneLocalGocacheMode itself
+	require.Contains(t, buf.String(), "(default): count=1")
 }
 
 func TestRepoScopedBuildType(t *testing.T) {
