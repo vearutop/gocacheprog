@@ -217,6 +217,26 @@ evicting again on almost every subsequent job once the cache settles near the ca
 individual files out of a native `GOCACHE` is always
 safe: it's content-addressed, so a missing file just costs a cache miss, never a corruption.
 
+## Embedding
+
+The entire CLI lives in the importable [`cli`](cli/cli.go) package; `main.go` at the repo root is
+just:
+
+```go
+func main() {
+	if err := cli.Main(); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+}
+```
+
+A third-party binary can call `cli.Main()` directly from its own `main` to embed gocacheprog
+as-is, or vendor/soft-fork the `cli` package to change behavior without forking the rest of the
+module — `internal/...` stays off-limits to external importers either way, but `cli.Main()` is the
+whole CLI surface. `cli.Main(options ...func(o *cli.Options))` takes functional options; currently
+`Options.VersionLabel` lets an embedding binary append its own identifier to the `-version` output.
+
 ## Further Reading
 
 [ADVANCED.md](ADVANCED.md) covers everything below `-github-actions-init`/`-done`:
