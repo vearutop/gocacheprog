@@ -5,7 +5,7 @@
 //
 // DSN format for -github-actions-init:
 //
-//	<remote-url>?auth=<token>&cache_dir=<dir>&preload_size=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>
+//	<remote-url>?auth=<token>&cache_dir=<dir>&preload_size=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>&max_cache_bytes=<bytes>
 //
 // Only the remote URL is required; every query parameter is optional:
 //
@@ -26,6 +26,9 @@
 //     cache keys; set skip_canonicalize_timestamps=true to opt out entirely
 //   - skip_canonicalize_timestamps: when true, skips timestamp canonicalization entirely
 //   - skip_preload: when true, skips the explicit preload pass entirely (direct/shim only)
+//   - max_cache_bytes: local-gocache mode only; total cache_dir size limit in bytes, checked
+//     and enforced on -github-actions-done by evicting the oldest files first; 0 (default)
+//     disables eviction entirely
 //
 // Commit, changes-id, and base-commit are derived automatically from GitHub Actions'
 // own environment instead of being passed in: pull_request(_target) events use
@@ -39,8 +42,9 @@
 // it back from the daemon's stop response, gocache mode combines restore (persisted via
 // GOCACHEPROG_GHA_RESTORE_STATS) and save stats, and direct mode aggregates whatever each -quiet
 // invocation appended via AppendQuietRunStats to quietRunStatsFilename next to the cache dir.
-// local-gocache mode never talks to a remote at all (init just points GOCACHE at cache_dir, done
-// is a no-op besides logging), so both ends only report the cache dir's file count/size.
+// local-gocache mode never talks to a remote at all (init just points GOCACHE at cache_dir), so
+// both init and done report the cache dir's file count/size plus its per-build-type usage stats
+// (see localGocacheStats), and done additionally enforces max_cache_bytes by eviction if set.
 //
 // Direct mode's per-invocation records also carry best-effort parent process context (PID and,
 // on Linux, the parent's command line read from /proc) purely for diagnosing an unexpectedly
@@ -76,31 +80,33 @@ const (
 	githubActionsShimSocketWait           = 10 * time.Second
 	githubActionsLogTailBytes       int64 = 8_000
 
-	envGHAMode         = "GOCACHEPROG_GHA_MODE"
-	envGHASocket       = "GOCACHEPROG_GHA_SOCKET"
-	envGHAAuth         = "GOCACHEPROG_GHA_AUTH"
-	envGHAPIDFile      = "GOCACHEPROG_GHA_PID_FILE"
-	envGHALogFile      = "GOCACHEPROG_GHA_LOG_FILE"
-	envGHACacheDir     = "GOCACHEPROG_GHA_CACHE_DIR"
-	envGHARemoteURL    = "GOCACHEPROG_GHA_REMOTE_URL"
-	envGHACommit       = "GOCACHEPROG_GHA_COMMIT"
-	envGHAChangesID    = "GOCACHEPROG_GHA_CHANGES_ID"
-	envGHABuildType    = "GOCACHEPROG_GHA_BUILD_TYPE"
-	envGHABaseCommit   = "GOCACHEPROG_GHA_BASE_COMMIT"
-	envGHAMaxFileBytes = "GOCACHEPROG_GHA_MAX_FILE_BYTES"
-	envGHARestoreStats = "GOCACHEPROG_GHA_RESTORE_STATS"
-	envGHAInitTime     = "GOCACHEPROG_GHA_INIT_TIME"
+	envGHAMode          = "GOCACHEPROG_GHA_MODE"
+	envGHASocket        = "GOCACHEPROG_GHA_SOCKET"
+	envGHAAuth          = "GOCACHEPROG_GHA_AUTH"
+	envGHAPIDFile       = "GOCACHEPROG_GHA_PID_FILE"
+	envGHALogFile       = "GOCACHEPROG_GHA_LOG_FILE"
+	envGHACacheDir      = "GOCACHEPROG_GHA_CACHE_DIR"
+	envGHARemoteURL     = "GOCACHEPROG_GHA_REMOTE_URL"
+	envGHACommit        = "GOCACHEPROG_GHA_COMMIT"
+	envGHAChangesID     = "GOCACHEPROG_GHA_CHANGES_ID"
+	envGHABuildType     = "GOCACHEPROG_GHA_BUILD_TYPE"
+	envGHABaseCommit    = "GOCACHEPROG_GHA_BASE_COMMIT"
+	envGHAMaxFileBytes  = "GOCACHEPROG_GHA_MAX_FILE_BYTES"
+	envGHARestoreStats  = "GOCACHEPROG_GHA_RESTORE_STATS"
+	envGHAInitTime      = "GOCACHEPROG_GHA_INIT_TIME"
+	envGHAMaxCacheBytes = "GOCACHEPROG_GHA_MAX_CACHE_BYTES"
 )
 
 type githubActionsConfig struct {
-	remoteURL    string
-	authToken    string
-	cacheDir     string
-	buildType    string
-	mode         string
-	canonicalize string
-	maxFileBytes int64
-	skipPreload  bool
+	remoteURL     string
+	authToken     string
+	cacheDir      string
+	buildType     string
+	mode          string
+	canonicalize  string
+	maxFileBytes  int64
+	maxCacheBytes int64
+	skipPreload   bool
 }
 
 // GithubActionsInit sets up caching for a GitHub Actions job from a single DSN. See the
@@ -115,8 +121,8 @@ func GithubActionsInit(dsn string) error {
 
 	cfg.buildType = repoScopedBuildType(cfg.buildType)
 
-	log.Printf("github-actions-init: mode=%q remote_url=%q cache_dir=%q build_type=%q preload_size=%d skip_preload=%t",
-		cfg.mode, cfg.remoteURL, cfg.cacheDir, cfg.buildType, cfg.maxFileBytes, cfg.skipPreload)
+	log.Printf("github-actions-init: mode=%q remote_url=%q cache_dir=%q build_type=%q preload_size=%d skip_preload=%t max_cache_bytes=%d",
+		cfg.mode, cfg.remoteURL, cfg.cacheDir, cfg.buildType, cfg.maxFileBytes, cfg.skipPreload, cfg.maxCacheBytes)
 
 	if cfg.canonicalize != "" {
 		log.Printf("github-actions-init: canonicalizing timestamps under %q", cfg.canonicalize)
@@ -201,6 +207,14 @@ func parseGithubActionsDSN(dsn string) (githubActionsConfig, error) {
 			return githubActionsConfig{}, fmt.Errorf("invalid preload_size %q: %w", v, err)
 		}
 		cfg.maxFileBytes = n
+	}
+
+	if v := q.Get("max_cache_bytes"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return githubActionsConfig{}, fmt.Errorf("invalid max_cache_bytes %q: %w", v, err)
+		}
+		cfg.maxCacheBytes = n
 	}
 
 	if v := q.Get("skip_preload"); v != "" {
@@ -558,11 +572,21 @@ func initLocalGocacheMode(cfg githubActionsConfig, initStartedAt time.Time) erro
 
 	logCacheDirStats("github-actions-init", cacheDir)
 
+	if stats, err := loadLocalGocacheStats(cacheDir); err != nil {
+		log.Printf("github-actions-init: load %s: %s", localGocacheStatsFilename, err.Error())
+	} else {
+		logLocalGocacheStats("github-actions-init", stats)
+	}
+
 	env := map[string]string{
-		"GOCACHE":      cacheDir,
-		envGHAMode:     "local-gocache",
-		envGHACacheDir: cacheDir,
-		envGHAInitTime: initStartedAt.Format(time.RFC3339Nano),
+		"GOCACHE":       cacheDir,
+		envGHAMode:      "local-gocache",
+		envGHACacheDir:  cacheDir,
+		envGHABuildType: cfg.buildType,
+		envGHAInitTime:  initStartedAt.Format(time.RFC3339Nano),
+	}
+	if cfg.maxCacheBytes > 0 {
+		env[envGHAMaxCacheBytes] = strconv.FormatInt(cfg.maxCacheBytes, 10)
 	}
 
 	log.Printf("github-actions-init: local-gocache mode ready, GOCACHE=%q", cacheDir)
@@ -722,7 +746,29 @@ func doneLocalGocacheMode() error {
 		return nil
 	}
 
-	logCacheDirStats("github-actions-done", cacheDir)
+	buildType := os.Getenv(envGHABuildType)
+	if stats, err := recordLocalGocacheUsage(cacheDir, buildType, time.Now().UTC()); err != nil {
+		log.Printf("github-actions-done: update %s: %s", localGocacheStatsFilename, err.Error())
+	} else {
+		logLocalGocacheStats("github-actions-done", stats)
+	}
+
+	// Scanned once here and reused for both the size log below and eviction, rather than
+	// scanning cache_dir a second time regardless of whether max_cache_bytes is even set.
+	entries, err := scanCacheDir(cacheDir)
+	if err != nil {
+		log.Printf("github-actions-done: stat cache dir %s: %s", cacheDir, err.Error())
+	} else {
+		var size int64
+		for _, e := range entries {
+			size += e.size
+		}
+		log.Printf("github-actions-done: cache dir %s currently has %d file(s), %s", cacheDir, len(entries), humanBytesBinary(size))
+
+		if maxCacheBytes, err := strconv.ParseInt(os.Getenv(envGHAMaxCacheBytes), 10, 64); err == nil && maxCacheBytes > 0 {
+			evictOldestUntilFits(cacheDir, entries, maxCacheBytes)
+		}
+	}
 
 	if elapsed, ok := elapsedSinceInit(); ok {
 		log.Printf("github-actions-done: total_time=%s", elapsed)
