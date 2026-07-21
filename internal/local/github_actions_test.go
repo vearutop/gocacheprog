@@ -76,6 +76,18 @@ func TestParseGithubActionsDSN_LocalGocacheMode(t *testing.T) {
 	require.Equal(t, "local-gocache", cfg.mode)
 	require.Equal(t, "~/foo", cfg.cacheDir)
 	require.Empty(t, cfg.remoteURL)
+	require.False(t, cfg.fallbackRemote)
+}
+
+func TestParseGithubActionsDSN_FallbackRemote(t *testing.T) {
+	cfg, err := parseGithubActionsDSN("https://gocache.example.com?mode=local-gocache&fallback_remote=true")
+	require.NoError(t, err)
+	require.True(t, cfg.fallbackRemote)
+}
+
+func TestParseGithubActionsDSN_InvalidFallbackRemote(t *testing.T) {
+	_, err := parseGithubActionsDSN("https://gocache.example.com?fallback_remote=not-a-bool")
+	require.Error(t, err)
 }
 
 func TestInitLocalGocacheMode_SetsGocacheAndModeEnv(t *testing.T) {
@@ -84,7 +96,7 @@ func TestInitLocalGocacheMode_SetsGocacheAndModeEnv(t *testing.T) {
 	t.Setenv("GITHUB_ENV", githubEnv)
 
 	cfg := githubActionsConfig{cacheDir: cacheDir}
-	require.NoError(t, initLocalGocacheMode(cfg, time.Now()))
+	require.NoError(t, initLocalGocacheMode(cfg, "", "", "", time.Now()))
 
 	_, err := os.Stat(cacheDir)
 	require.NoError(t, err, "cache dir should be created")

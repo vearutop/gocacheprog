@@ -120,6 +120,7 @@ Only the base URL is required; everything else has a default.
 | `skip_canonicalize_timestamps` | `false`        | skip timestamp canonicalization entirely                                |
 | `skip_preload`             | `false`            | skip the explicit preload pass entirely (direct/shim only)               |
 | `max_cache_bytes`          | `0` (unlimited)    | `local-gocache` mode only; total cache dir size limit, enforced by evicting the oldest files on `-github-actions-done` |
+| `fallback_remote`          | `false`            | `local-gocache` mode only; fall back to the remote when this build type's local cache is cold — see [`mode=local-gocache`](#modelocal-gocache) |
 
 Timestamp canonicalization runs against the repo root by default, since fresh CI checkouts almost
 always need it for stable cache keys (see [ADVANCED.md](ADVANCED.md#timestamp-canonicalization)
@@ -184,8 +185,9 @@ restores/saves whole native cache files rather than individual `ActionID` result
 
 ### `mode=local-gocache`
 
-Points `GOCACHE` straight at `cache_dir` — no remote server involved at all, no restore, no
-preload, no upload on `-github-actions-done`. The remote URL in the DSN is ignored in this mode.
+Points `GOCACHE` straight at `cache_dir` — by default, no remote server involved at all, no
+restore, no preload, no upload on `-github-actions-done`; the remote URL in the DSN is only used if
+`fallback_remote` is also set (see below).
 
 Use this on self-hosted runners with a persistent home directory across jobs, where the cache dir
 itself survives between runs on disk: this is the fastest possible option there's no round trip to
@@ -216,6 +218,34 @@ exactly 9GB and not exactly 10GB. Trimming to that margin rather than to the lim
 evicting again on almost every subsequent job once the cache settles near the cap. Deleting
 individual files out of a native `GOCACHE` is always
 safe: it's content-addressed, so a missing file just costs a cache miss, never a corruption.
+
+#### `fallback_remote`: recovering from a rotated/cold self-hosted runner
+
+Self-hosted runners aren't always as persistent as you'd like — a host can get rotated,
+reprovisioned, or simply lose its disk, and the next job to land on it finds `cache_dir` empty (or
+warm for every build type except the one that just landed there). `fallback_remote=1` (or `true`)
+lets `local-gocache` mode fall back to the remote you'd otherwise skip entirely in exactly that
+situation, so a cold host doesn't run at full-miss speed until it happens to warm back up on its
+own:
+
+```yaml
+- run: gocacheprog -github-actions-init "https://gocache.example.com?auth=${{ secrets.GOCACHE_AUTH }}&mode=local-gocache&cache_dir=~/.cache/gocacheprog&fallback_remote=1"
+- run: go test ./...
+- run: gocacheprog -github-actions-done
+  if: ${{ always() }}
+```
+
+On `-github-actions-init`, if `gocacheprog.json` has no recorded usage at all for the current
+`build_type` — the same check `-github-actions-init` already prints on every run — it restores
+from the remote into `cache_dir` before the build starts, exactly like `mode=gocache` does. If
+`build_type` already has recorded usage, nothing remote happens; this is a no-op layered on top of
+plain `local-gocache` mode, not a permanent switch to talking to a remote every job.
+
+Having paid for that restore, `-github-actions-done` then uploads back only the files this job
+itself produced — anything under `cache_dir` modified at or after `-github-actions-init` ran,
+excluding what the restore itself just wrote. It does not upload the rest of `cache_dir`: that's a
+large, persistent, cross-build-type cache dir this job merely shares the disk with, not this job's
+cache to claim credit for re-uploading.
 
 ## Embedding
 

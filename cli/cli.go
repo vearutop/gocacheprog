@@ -109,8 +109,7 @@ func Main(options ...func(o *Options)) error {
 		if *maxFileBytes == 0 && *saveCacheMaxFileBytes != 0 {
 			*maxFileBytes = *saveCacheMaxFileBytes
 		}
-		_ = *jobStartUnix
-		return runNativeGOCACHEMode(*dir, *httpListen, *remoteURL, *authToken, *restoreCache, *saveCache, *maxFileBytes, *restoreLimitBytes, *saveCacheChunkBytes, startedAt, params)
+		return runNativeGOCACHEMode(*dir, *httpListen, *remoteURL, *authToken, *restoreCache, *saveCache, *maxFileBytes, *restoreLimitBytes, *saveCacheChunkBytes, *jobStartUnix, startedAt, params)
 	}
 
 	params.MaxFileBytes = *maxFileBytes
@@ -296,7 +295,7 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken string, m
 	return runServer(httpListen, httpsListen, httpsHost, filepath.Join(dir, "autocert"), store, nativeStore, authToken, preloadLimit)
 }
 
-func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, restoreLimitBytes, saveCacheChunkBytes int64, startedAt time.Time, params *local.ProxyParams) error {
+func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, restoreLimitBytes, saveCacheChunkBytes, jobStartUnixNanos int64, startedAt time.Time, params *local.ProxyParams) error {
 	if restoreCache && saveCache {
 		return errors.New("-restore-cache and -save-cache are mutually exclusive")
 	}
@@ -342,7 +341,19 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 		return err
 	}
 
-	_, err = local.SaveNativeCache(cacheDir, client, req, maxFileBytes)
+	// -save-cache is typically a later, separate CLI invocation than the -restore-cache that
+	// preceded it, so "since" doesn't come from this process's own startedAt: it's either passed
+	// explicitly (-job-start-unix) or read back from the marker -restore-cache left in cacheDir.
+	// Neither present just means upload everything not already accounted for by a restore, as
+	// before this flag existed.
+	since := time.Time{}
+	if jobStartUnixNanos != 0 {
+		since = time.Unix(0, jobStartUnixNanos).UTC()
+	} else if marker, err := gocache.ReadJobStartMarker(cacheDir); err == nil {
+		since = marker
+	}
+
+	_, err = local.SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
 	return err
 }
 

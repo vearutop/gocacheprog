@@ -29,6 +29,13 @@
 //   - max_cache_bytes: local-gocache mode only; total cache_dir size limit in bytes, checked
 //     and enforced on -github-actions-done by evicting the oldest files first; 0 (default)
 //     disables eviction entirely
+//   - fallback_remote: local-gocache mode only; when true, if gocacheprog.json (see
+//     localGocacheStats) has no recorded usage for the current build_type — meaning this host's
+//     persistent cache dir is cold for it, e.g. after a self-hosted runner rotation — restores
+//     from the remote at DSN's remote-url into cache_dir on -github-actions-init, and, having
+//     done so, uploads back on -github-actions-done only the files created since init (not the
+//     rest of cache_dir, which may hold unrelated build types); false (default) never touches a
+//     remote in local-gocache mode
 //
 // Commit, changes-id, and base-commit are derived automatically from GitHub Actions'
 // own environment instead of being passed in: pull_request(_target) events use
@@ -42,9 +49,10 @@
 // it back from the daemon's stop response, gocache mode combines restore (persisted via
 // GOCACHEPROG_GHA_RESTORE_STATS) and save stats, and direct mode aggregates whatever each -quiet
 // invocation appended via AppendQuietRunStats to quietRunStatsFilename next to the cache dir.
-// local-gocache mode never talks to a remote at all (init just points GOCACHE at cache_dir), so
-// both init and done report the cache dir's file count/size plus its per-build-type usage stats
-// (see localGocacheStats), and done additionally enforces max_cache_bytes by eviction if set.
+// local-gocache mode talks to a remote only if fallback_remote is set and this build_type's local
+// cache is cold; otherwise init just points GOCACHE at cache_dir. Either way, both init and done
+// report the cache dir's file count/size plus its per-build-type usage stats (see
+// localGocacheStats), and done additionally enforces max_cache_bytes by eviction if set.
 //
 // Direct mode's per-invocation records also carry best-effort parent process context (PID and,
 // on Linux, the parent's command line read from /proc) purely for diagnosing an unexpectedly
@@ -95,18 +103,20 @@ const (
 	envGHARestoreStats  = "GOCACHEPROG_GHA_RESTORE_STATS"
 	envGHAInitTime      = "GOCACHEPROG_GHA_INIT_TIME"
 	envGHAMaxCacheBytes = "GOCACHEPROG_GHA_MAX_CACHE_BYTES"
+	envGHALocalFallback = "GOCACHEPROG_GHA_LOCAL_FALLBACK"
 )
 
 type githubActionsConfig struct {
-	remoteURL     string
-	authToken     string
-	cacheDir      string
-	buildType     string
-	mode          string
-	canonicalize  string
-	maxFileBytes  int64
-	maxCacheBytes int64
-	skipPreload   bool
+	remoteURL      string
+	authToken      string
+	cacheDir       string
+	buildType      string
+	mode           string
+	canonicalize   string
+	maxFileBytes   int64
+	maxCacheBytes  int64
+	skipPreload    bool
+	fallbackRemote bool
 }
 
 // GithubActionsInit sets up caching for a GitHub Actions job from a single DSN. See the
@@ -121,8 +131,8 @@ func GithubActionsInit(dsn string) error {
 
 	cfg.buildType = repoScopedBuildType(cfg.buildType)
 
-	log.Printf("github-actions-init: mode=%q remote_url=%q cache_dir=%q build_type=%q preload_size=%d skip_preload=%t max_cache_bytes=%d",
-		cfg.mode, cfg.remoteURL, cfg.cacheDir, cfg.buildType, cfg.maxFileBytes, cfg.skipPreload, cfg.maxCacheBytes)
+	log.Printf("github-actions-init: mode=%q remote_url=%q cache_dir=%q build_type=%q preload_size=%d skip_preload=%t max_cache_bytes=%d fallback_remote=%t",
+		cfg.mode, cfg.remoteURL, cfg.cacheDir, cfg.buildType, cfg.maxFileBytes, cfg.skipPreload, cfg.maxCacheBytes, cfg.fallbackRemote)
 
 	if cfg.canonicalize != "" {
 		log.Printf("github-actions-init: canonicalizing timestamps under %q", cfg.canonicalize)
@@ -150,7 +160,7 @@ func GithubActionsInit(dsn string) error {
 	case "gocache":
 		return initGocacheMode(cfg, commit, baseCommit, changesID, initStartedAt)
 	case "local-gocache":
-		return initLocalGocacheMode(cfg, initStartedAt)
+		return initLocalGocacheMode(cfg, commit, baseCommit, changesID, initStartedAt)
 	default:
 		return fmt.Errorf("github-actions-init: unsupported mode %q (expected direct, shim, gocache, or local-gocache)", cfg.mode)
 	}
@@ -223,6 +233,14 @@ func parseGithubActionsDSN(dsn string) (githubActionsConfig, error) {
 			return githubActionsConfig{}, fmt.Errorf("invalid skip_preload %q: %w", v, err)
 		}
 		cfg.skipPreload = b
+	}
+
+	if v := q.Get("fallback_remote"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return githubActionsConfig{}, fmt.Errorf("invalid fallback_remote %q: %w", v, err)
+		}
+		cfg.fallbackRemote = b
 	}
 
 	if q.Has("canonicalize_timestamps") {
@@ -556,12 +574,18 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 	return setGitHubEnv(env)
 }
 
-// initLocalGocacheMode points GOCACHE straight at cache_dir with no remote server involved at
-// all: no restore, no preload, nothing to authenticate. It's a fallback to classic local GOCACHE
-// reuse for self-hosted runners with a persistent home directory across jobs, where the best
-// possible cache hit rate comes from just letting `go` read/write its own on-disk cache in place
-// rather than paying for a remote round trip.
-func initLocalGocacheMode(cfg githubActionsConfig, initStartedAt time.Time) error {
+// initLocalGocacheMode points GOCACHE straight at cache_dir with no remote server involved by
+// default: no restore, no preload, nothing to authenticate. It's a fallback to classic local
+// GOCACHE reuse for self-hosted runners with a persistent home directory across jobs, where the
+// best possible cache hit rate comes from just letting `go` read/write its own on-disk cache in
+// place rather than paying for a remote round trip.
+//
+// If cfg.fallbackRemote is set and gocacheprog.json has no recorded usage for cfg.buildType —
+// meaning this host's persistent cache dir is cold for it, e.g. right after a self-hosted runner
+// got rotated out and back in with an empty disk — it restores from the remote once here, and
+// leaves a marker in $GITHUB_ENV so -github-actions-done knows to upload back only what this job
+// actually produced (see doneLocalGocacheFallbackUpload).
+func initLocalGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
 	cacheDir, err := ResolveNativeCacheDir(cfg.cacheDir)
 	if err != nil {
 		return err
@@ -572,8 +596,10 @@ func initLocalGocacheMode(cfg githubActionsConfig, initStartedAt time.Time) erro
 
 	logCacheDirStats("github-actions-init", cacheDir)
 
-	if stats, err := loadLocalGocacheStats(cacheDir); err != nil {
+	stats, err := loadLocalGocacheStats(cacheDir)
+	if err != nil {
 		log.Printf("github-actions-init: load %s: %s", localGocacheStatsFilename, err.Error())
+		stats = localGocacheStats{BuildTypes: map[string]localGocacheBuildTypeStats{}}
 	} else {
 		logLocalGocacheStats("github-actions-init", stats)
 	}
@@ -589,9 +615,70 @@ func initLocalGocacheMode(cfg githubActionsConfig, initStartedAt time.Time) erro
 		env[envGHAMaxCacheBytes] = strconv.FormatInt(cfg.maxCacheBytes, 10)
 	}
 
+	if cfg.fallbackRemote {
+		if err := initLocalGocacheFallbackRestore(cfg, commit, baseCommit, changesID, cacheDir, stats, initStartedAt, env); err != nil {
+			return err
+		}
+	}
+
 	log.Printf("github-actions-init: local-gocache mode ready, GOCACHE=%q", cacheDir)
 
 	return setGitHubEnv(env)
+}
+
+// initLocalGocacheFallbackRestore is fallback_remote's cold-start path, split out of
+// initLocalGocacheMode to keep that function flat: if build_type already has recorded usage, it's
+// a no-op; otherwise it restores from the remote into cacheDir and fills env with everything
+// doneLocalGocacheFallbackUpload will need later to upload back what this job produces.
+func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit, changesID, cacheDir string, stats localGocacheStats, initStartedAt time.Time, env map[string]string) error {
+	if _, warm := stats.BuildTypes[localGocacheStatsBuildTypeKey(cfg.buildType)]; warm {
+		log.Printf("github-actions-init: fallback_remote is set but build_type=%q already has recorded usage, skipping remote restore", cfg.buildType)
+		return nil
+	}
+
+	if cfg.remoteURL == "" {
+		return errors.New("github-actions-init: fallback_remote requires a remote URL in the DSN")
+	}
+
+	log.Printf("github-actions-init: fallback_remote is set and build_type=%q has no recorded usage, restoring from %s into %s", cfg.buildType, cfg.remoteURL, cacheDir)
+
+	client, err := cachehttp.NewClientWithSession(cfg.remoteURL, cfg.authToken, &cachehttp.SessionInfo{
+		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), initStartedAt.UnixNano()),
+		StartedAt: initStartedAt,
+		PID:       os.Getpid(),
+		CacheDir:  cacheDir,
+		Params: ProxyParams{
+			Commit:     commit,
+			ChangesID:  changesID,
+			BuildType:  cfg.buildType,
+			BaseCommit: baseCommit,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("fallback_remote client: %w", err)
+	}
+
+	req := gocache.Request{
+		Commit:       commit,
+		ChangesID:    changesID,
+		BuildType:    cfg.buildType,
+		BaseCommit:   baseCommit,
+		MaxFileBytes: cfg.maxFileBytes,
+	}
+
+	if _, err := RestoreNativeCache(cacheDir, client, req, initStartedAt); err != nil {
+		return fmt.Errorf("fallback_remote restore: %w", err)
+	}
+
+	env[envGHALocalFallback] = "1"
+	env[envGHARemoteURL] = cfg.remoteURL
+	env[envGHAAuth] = cfg.authToken
+	env[envGHACommit] = commit
+	env[envGHAChangesID] = changesID
+	env[envGHABaseCommit] = baseCommit
+	env[envGHAMaxFileBytes] = strconv.FormatInt(cfg.maxFileBytes, 10)
+
+	return nil
 }
 
 // logCacheDirStats logs cacheDir's current file count/size, best-effort: a stat failure is
@@ -703,8 +790,15 @@ func doneGocacheMode() error {
 		MaxFileBytes: maxFileBytes,
 	}
 
+	var since time.Time
+	if raw := os.Getenv(envGHAInitTime); raw != "" {
+		if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			since = t
+		}
+	}
+
 	log.Printf("github-actions-done: saving native GOCACHE from %s to %s", cacheDir, remoteURL)
-	saveStats, err := SaveNativeCache(cacheDir, client, req, maxFileBytes)
+	saveStats, err := SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
 	if err != nil {
 		return err
 	}
@@ -735,10 +829,12 @@ func doneGocacheMode() error {
 	return nil
 }
 
-// doneLocalGocacheMode has no remote state to finalize and, unlike doneGocacheMode, uploads
-// nothing back to a remote: local-gocache mode's whole point is letting the persistent cache
-// dir accumulate across jobs on the runner's own disk. It just reports the cache dir's final
-// file count/size so the effect of a job is visible in the log.
+// doneLocalGocacheMode has no remote state to finalize in the common case: local-gocache mode's
+// whole point is letting the persistent cache dir accumulate across jobs on the runner's own
+// disk, so by default it just reports the cache dir's final file count/size so the effect of a
+// job is visible in the log. The one exception is fallback_remote: if -github-actions-init had to
+// restore from a remote because this build_type's local cache was cold (see envGHALocalFallback),
+// this uploads back only what this job produced since init (doneLocalGocacheFallbackUpload).
 func doneLocalGocacheMode() error {
 	cacheDir := os.Getenv(envGHACacheDir)
 	if cacheDir == "" {
@@ -751,6 +847,10 @@ func doneLocalGocacheMode() error {
 		log.Printf("github-actions-done: update %s: %s", localGocacheStatsFilename, err.Error())
 	} else {
 		logLocalGocacheStats("github-actions-done", stats)
+	}
+
+	if os.Getenv(envGHALocalFallback) == "1" {
+		doneLocalGocacheFallbackUpload(cacheDir, buildType)
 	}
 
 	// Scanned once here and reused for both the size log below and eviction, rather than
@@ -775,6 +875,70 @@ func doneLocalGocacheMode() error {
 	}
 
 	return nil
+}
+
+// doneLocalGocacheFallbackUpload uploads the files fallback_remote's -github-actions-init created
+// since it restored into cacheDir (i.e. everything with an mtime at or after envGHAInitTime, minus
+// whatever that restore itself wrote and local-gocache mode's own lock/stats bookkeeping files) back
+// to the same remote. It deliberately does not upload the rest of cacheDir: that's a persistent,
+// potentially large cache dir this build_type merely shares with unrelated build types/repos on the
+// same self-hosted runner, and re-uploading all of it on every cold-start would be both wasteful and
+// wrong (it isn't this job's cache to claim credit for). Errors are logged and swallowed: a failed
+// upload just means the next cold start pays for another remote restore, not a broken job.
+func doneLocalGocacheFallbackUpload(cacheDir, buildType string) {
+	remoteURL := os.Getenv(envGHARemoteURL)
+	if remoteURL == "" {
+		log.Printf("github-actions-done: %s is set but %s is not; skipping fallback_remote upload", envGHALocalFallback, envGHARemoteURL)
+		return
+	}
+
+	since, err := time.Parse(time.RFC3339Nano, os.Getenv(envGHAInitTime))
+	if err != nil {
+		log.Printf("github-actions-done: parse %s for fallback_remote upload: %s", envGHAInitTime, err.Error())
+		return
+	}
+
+	auth := os.Getenv(envGHAAuth)
+	commit := os.Getenv(envGHACommit)
+	changesID := os.Getenv(envGHAChangesID)
+	baseCommit := os.Getenv(envGHABaseCommit)
+
+	maxFileBytes, err := strconv.ParseInt(os.Getenv(envGHAMaxFileBytes), 10, 64)
+	if err != nil {
+		maxFileBytes = 0
+	}
+
+	startedAt := time.Now().UTC()
+	client, err := cachehttp.NewClientWithSession(remoteURL, auth, &cachehttp.SessionInfo{
+		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano()),
+		StartedAt: startedAt,
+		PID:       os.Getpid(),
+		CacheDir:  cacheDir,
+		Params: ProxyParams{
+			Commit:     commit,
+			ChangesID:  changesID,
+			BuildType:  buildType,
+			BaseCommit: baseCommit,
+		},
+	})
+	if err != nil {
+		log.Printf("github-actions-done: fallback_remote client: %s", err.Error())
+		return
+	}
+
+	req := gocache.Request{
+		Commit:       commit,
+		ChangesID:    changesID,
+		BuildType:    buildType,
+		BaseCommit:   baseCommit,
+		MaxFileBytes: maxFileBytes,
+	}
+
+	log.Printf("github-actions-done: fallback_remote was used at init, uploading %s files created since %s to %s", cacheDir, since.Format(time.RFC3339), remoteURL)
+
+	if _, err := SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, isLocalGocacheProtectedFile); err != nil {
+		log.Printf("github-actions-done: fallback_remote upload: %s", err.Error())
+	}
 }
 
 // quietRunStatsFilename is where each -quiet direct-mode invocation appends its final
