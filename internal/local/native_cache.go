@@ -138,12 +138,38 @@ func RestoreNativeCache(cacheDir string, client *cachehttp.Client, req gocache.R
 	return stats, gocache.WriteJobStartMarker(cacheDir, startedAt)
 }
 
-// SaveNativeCache uploads freshly created native GOCACHE files from cacheDir to the remote server.
-func SaveNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Request, maxFileBytes int64) (gocache.TransferStats, error) {
-	batch, err := gocache.CollectFreshFiles(cacheDir, maxFileBytes)
+// SaveFreshNativeCache uploads regular files under cacheDir that are not already accounted for by
+// a prior restore into the same dir (gocache.WriteRestoredPaths) and not matched by exclude. A
+// zero since uploads all such files — the classic gocache-mode assumption of a fresh, starts-empty
+// cache dir, where "wasn't just restored" already means "new" — matching cmd/go's own semantics.
+// A non-zero since additionally requires the file's mtime to be at or after it, which is what
+// local-gocache mode's fallback_remote needs: there, cacheDir is a large, persistent,
+// cross-build-type dir that didn't start empty, so restoredPaths exclusion alone would sweep up
+// everything else ever written to it; exclude is also how that mode keeps its own lock/stats
+// bookkeeping files out of the upload.
+func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Request, maxFileBytes int64, since time.Time, exclude func(name string) bool) (gocache.TransferStats, error) {
+	restoredPaths, err := gocache.ReadRestoredPaths(cacheDir)
+	if err != nil && !os.IsNotExist(err) {
+		return gocache.TransferStats{}, err
+	}
+
+	batch, err := gocache.CollectFilesToSave(cacheDir, restoredPaths, maxFileBytes)
 	if err != nil {
 		return gocache.TransferStats{}, err
 	}
+
+	fresh := batch.Items[:0]
+	for _, item := range batch.Items {
+		if exclude != nil && exclude(filepath.Base(item.DiskPath)) {
+			continue
+		}
+		if !since.IsZero() && (item.ModTime == nil || item.ModTime.Before(since)) {
+			continue
+		}
+		fresh = append(fresh, item)
+	}
+	batch.Items = fresh
+
 	if len(batch.Items) == 0 {
 		log.Printf(
 			"save-cache completed: files=0 upload_time=0s compressed=0 B uncompressed=0 B; commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q",

@@ -315,7 +315,7 @@ How it works:
 - save walks the local `GOCACHE` tree, skips files that were already restored in this job, skips helper bookkeeping files, compresses payloads client-side, and streams them to the server
 - the server stores compressed file objects and merges uploaded file paths into the relevant manifests; when the server also runs with `-max-file-bytes`, oversized objects are silently skipped on save and treated as misses on restore
 - large `-save-cache` uploads are split into outer HTTP chunks, so the mode can work behind restrictive reverse proxies such as default nginx `client_max_body_size=1m`
-- `-job-start-unix` is currently accepted by the CLI but is not used by the current native save selection logic
+- since `-restore-cache` and `-save-cache` are typically two separate CLI invocations (a step apart in the job), `-save-cache` additionally only uploads files modified at or after the job's start time: explicitly via `-job-start-unix`, or by reading back the marker `-restore-cache` left in `-cache-dir`; if neither is available (e.g. `-save-cache` ran without a preceding `-restore-cache` in the same dir), it falls back to uploading everything not already accounted for by a restore, as before this check existed
 
 In `GOCACHEPROG` mode, `-max-file-bytes` also skips remote `Put` uploads for oversized cache entries while still keeping them in the local cache. When the server is started with the same flag, oversized entries are also not stored in or served from the remote cache.
 

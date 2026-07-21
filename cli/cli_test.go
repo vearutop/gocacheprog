@@ -86,7 +86,7 @@ func TestRunNativeGOCACHEMode_SendsSessionHeadersOnVersionProbe(t *testing.T) {
 		ParentCommit: "parent123",
 	}
 
-	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 0, 0, 1024, startedAt, params)
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 0, 0, 1024, 0, startedAt, params)
 	require.NoError(t, err)
 	require.NotEmpty(t, gotHeaders["session_id"])
 	require.Equal(t, startedAt.Format(time.RFC3339Nano), gotHeaders["started_at"])
@@ -124,7 +124,7 @@ func TestRunNativeGOCACHEMode_RestoreCachePassesMaxFileBytes(t *testing.T) {
 	cacheDir := t.TempDir()
 	startedAt := time.Date(2026, time.June, 2, 9, 12, 26, 0, time.UTC)
 
-	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 1234, 4321, 1024, startedAt, &local.ProxyParams{})
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 1234, 4321, 1024, 0, startedAt, &local.ProxyParams{})
 	require.NoError(t, err)
 	require.Equal(t, "1234", gotReq.maxFileBytes)
 	require.Equal(t, "4321", gotReq.restoreLimitBytes)
@@ -168,9 +168,105 @@ func TestRunNativeGOCACHEMode_SaveCacheSkipsOversizedFilesBeforeUpload(t *testin
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "large"), []byte("123456"), 0o600))
 
 	startedAt := time.Date(2026, time.June, 2, 9, 12, 26, 0, time.UTC)
-	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", false, true, 4, 0, 1<<20, startedAt, &local.ProxyParams{})
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", false, true, 4, 0, 1<<20, 0, startedAt, &local.ProxyParams{})
 	require.NoError(t, err)
 	require.Equal(t, []string{"ab/small"}, uploadedPaths)
+}
+
+func newSaveCacheUploadPathsServer(t *testing.T) (*httptest.Server, *[]string) {
+	t.Helper()
+
+	var uploadedPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/version":
+			_, err := rw.Write([]byte("gocacheprog test"))
+			require.NoError(t, err)
+		case "/save-cache-start":
+			rw.WriteHeader(http.StatusNoContent)
+		case "/save-cache-chunk":
+			_, err := gocache.ReadStream(r.Body, func(item gocache.FileItem, body io.Reader) error {
+				uploadedPaths = append(uploadedPaths, item.Path)
+				if body != nil {
+					_, err := io.Copy(io.Discard, body)
+					require.NoError(t, err)
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			rw.WriteHeader(http.StatusNoContent)
+		case "/save-cache-finalize":
+			rw.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv, &uploadedPaths
+}
+
+func TestRunNativeGOCACHEMode_SaveCacheUsesJobStartUnixToExcludeOlderFiles(t *testing.T) {
+	srv, uploadedPaths := newSaveCacheUploadPathsServer(t)
+
+	cacheDir := t.TempDir()
+	older := time.Date(2026, time.June, 2, 9, 0, 0, 0, time.UTC)
+	jobStart := time.Date(2026, time.June, 2, 9, 30, 0, 0, time.UTC)
+	newer := time.Date(2026, time.June, 2, 10, 0, 0, 0, time.UTC)
+
+	oldPath := filepath.Join(cacheDir, "ab", "old")
+	require.NoError(t, os.MkdirAll(filepath.Dir(oldPath), 0o750))
+	require.NoError(t, os.WriteFile(oldPath, []byte("stale"), 0o600))
+	require.NoError(t, os.Chtimes(oldPath, older, older))
+
+	newPath := filepath.Join(cacheDir, "ab", "new")
+	require.NoError(t, os.WriteFile(newPath, []byte("fresh"), 0o600))
+	require.NoError(t, os.Chtimes(newPath, newer, newer))
+
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", false, true, 0, 0, 1<<20, jobStart.UnixNano(), time.Now(), &local.ProxyParams{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"ab/new"}, *uploadedPaths)
+}
+
+func TestRunNativeGOCACHEMode_SaveCacheUsesRestoreMarkerWhenJobStartUnixNotGiven(t *testing.T) {
+	restoreSrv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/version":
+			_, err := rw.Write([]byte("gocacheprog test"))
+			require.NoError(t, err)
+		case "/restore-cache":
+			rw.WriteHeader(http.StatusOK)
+			require.NoError(t, binary.Write(rw, binary.BigEndian, int32(0)))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	t.Cleanup(restoreSrv.Close)
+
+	cacheDir := t.TempDir()
+	jobStart := time.Date(2026, time.June, 2, 9, 30, 0, 0, time.UTC)
+
+	// An empty -restore-cache still writes the job-start marker save-cache reads back.
+	err := runNativeGOCACHEMode(cacheDir, "", restoreSrv.URL, "", true, false, 0, 0, 1024, 0, jobStart, &local.ProxyParams{})
+	require.NoError(t, err)
+
+	older := jobStart.Add(-time.Hour)
+	newer := jobStart.Add(time.Hour)
+
+	oldPath := filepath.Join(cacheDir, "ab", "old")
+	require.NoError(t, os.MkdirAll(filepath.Dir(oldPath), 0o750))
+	require.NoError(t, os.WriteFile(oldPath, []byte("stale"), 0o600))
+	require.NoError(t, os.Chtimes(oldPath, older, older))
+
+	newPath := filepath.Join(cacheDir, "ab", "new")
+	require.NoError(t, os.WriteFile(newPath, []byte("fresh"), 0o600))
+	require.NoError(t, os.Chtimes(newPath, newer, newer))
+
+	saveSrv, uploadedPaths := newSaveCacheUploadPathsServer(t)
+
+	err = runNativeGOCACHEMode(cacheDir, "", saveSrv.URL, "", false, true, 0, 0, 1<<20, 0, time.Now(), &local.ProxyParams{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"ab/new"}, *uploadedPaths)
 }
 
 func TestRunNativeGOCACHEMode_RestoreCacheSkipsOversizedFilesBeforeDownload(t *testing.T) {
@@ -222,7 +318,7 @@ func TestRunNativeGOCACHEMode_RestoreCacheSkipsOversizedFilesBeforeDownload(t *t
 	t.Cleanup(srv.Close)
 
 	startedAt := time.Date(2026, time.June, 2, 9, 12, 26, 0, time.UTC)
-	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 4, 0, 1024, startedAt, &local.ProxyParams{})
+	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 4, 0, 1024, 0, startedAt, &local.ProxyParams{})
 	require.NoError(t, err)
 
 	body, err := os.ReadFile(filepath.Join(cacheDir, "ab", "small"))
