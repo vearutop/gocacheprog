@@ -22,8 +22,8 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-func RunServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *Store, nativeStore *gocache.Store, authToken string, preloadLimit int) error {
-	h := cachehttp.NewHandlerWithPreloadLimit(store, nativeStore, authToken, preloadLimit)
+func RunServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *Store, nativeStore *gocache.Store, authToken, fallbackAuthToken string, preloadLimit int) error {
+	h := cachehttp.NewHandlerWithPreloadLimit(store, nativeStore, authToken, fallbackAuthToken, preloadLimit)
 	if httpsHost == "" {
 		return serveHTTP(httpListen, h, store.PrintStats)
 	}

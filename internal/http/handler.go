@@ -16,32 +16,34 @@ import (
 )
 
 type Handler struct {
-	store            cache.Store
-	gocacheStore     *gocache.Store
-	authToken        string
-	preloadSem       chan struct{}
-	saveSessionsMu   sync.Mutex
-	saveSessions     map[string]*saveCacheSession
-	preloadInFlight  int64
-	preloadStarted   int64
-	preloadCompleted int64
+	store             cache.Store
+	gocacheStore      *gocache.Store
+	authToken         string
+	fallbackAuthToken string
+	preloadSem        chan struct{}
+	saveSessionsMu    sync.Mutex
+	saveSessions      map[string]*saveCacheSession
+	preloadInFlight   int64
+	preloadStarted    int64
+	preloadCompleted  int64
 }
 
 func NewHandler(store cache.Store, authToken string) *Handler {
-	return NewHandlerWithPreloadLimit(store, nil, authToken, 2)
+	return NewHandlerWithPreloadLimit(store, nil, authToken, "", 2)
 }
 
-func NewHandlerWithPreloadLimit(store cache.Store, gocacheStore *gocache.Store, authToken string, preloadLimit int) *Handler {
+func NewHandlerWithPreloadLimit(store cache.Store, gocacheStore *gocache.Store, authToken, fallbackAuthToken string, preloadLimit int) *Handler {
 	if preloadLimit < 1 {
 		preloadLimit = 1
 	}
 
 	return &Handler{
-		store:        store,
-		gocacheStore: gocacheStore,
-		authToken:    authToken,
-		preloadSem:   make(chan struct{}, preloadLimit),
-		saveSessions: make(map[string]*saveCacheSession),
+		store:             store,
+		gocacheStore:      gocacheStore,
+		authToken:         authToken,
+		fallbackAuthToken: fallbackAuthToken,
+		preloadSem:        make(chan struct{}, preloadLimit),
+		saveSessions:      make(map[string]*saveCacheSession),
 	}
 }
 
@@ -159,7 +161,17 @@ func (h *Handler) authorized(r *http.Request) bool {
 		return false
 	}
 
-	return strings.TrimSpace(strings.TrimPrefix(auth, prefix)) == h.authToken
+	token := strings.TrimSpace(strings.TrimPrefix(auth, prefix))
+	if token == h.authToken {
+		return true
+	}
+
+	if h.fallbackAuthToken != "" && token == h.fallbackAuthToken {
+		log.Printf("fallback auth used; remote=%s; path=%s; session_id=%q", r.RemoteAddr, r.URL.Path, r.Header.Get(headerSessionID))
+		return true
+	}
+
+	return false
 }
 
 func logVersionProbe(r *http.Request) {

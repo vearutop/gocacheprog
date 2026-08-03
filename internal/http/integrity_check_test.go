@@ -79,6 +79,28 @@ func TestIntegrityCheck_RequiresAuthWhenConfigured(t *testing.T) {
 	require.Equal(t, nethttp.StatusUnauthorized, resp.StatusCode)
 }
 
+func TestFallbackAuth_AcceptsOldAndNewToken(t *testing.T) {
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nil, "new-token", "old-token", 2))
+	t.Cleanup(srv.Close)
+
+	get := func(token string) int {
+		req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/integrity-check", nil)
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := srv.Client().Do(req)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+		return resp.StatusCode
+	}
+
+	require.Equal(t, nethttp.StatusOK, get("new-token"))
+	require.Equal(t, nethttp.StatusOK, get("old-token"))
+	require.Equal(t, nethttp.StatusUnauthorized, get("wrong-token"))
+}
+
 func integrityTestItem(actionID, outputID, body string) cache.ResponseItem {
 	now := time.Now()
 	item := cache.ResponseItem{

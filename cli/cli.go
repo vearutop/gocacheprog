@@ -55,6 +55,7 @@ func Main(options ...func(o *Options)) error {
 	dumpLogs := flag.String("dump-log", "", "dump req/resp logs to file")
 	remoteURL := flag.String("remote-url", "", "remote HTTP server cache source, e.g. https://example.com:8080")
 	authToken := flag.String("auth-token", "", "optional bearer token for the remote HTTP cache server")
+	fallbackAuthToken := flag.String("fallback-auth", "", "server mode: additional bearer token accepted alongside -auth-token, for migrating clients to a new token without downtime")
 	maxDiskBytes := flag.Int64("max-disk-bytes", 0, "optional total on-disk cache size limit in bytes; 0 disables eviction")
 	gocacheMaxDiskBytes := flag.Int64("gocache-max-disk-bytes", 0, "optional total on-disk native cache storage size limit in bytes on the remote server; 0 disables eviction")
 	gocacheMaxAge := flag.Duration("gocache-max-age", 48*time.Hour, "maximum age for native GOCACHE objects on the remote server; 0 disables age-based retirement")
@@ -148,7 +149,7 @@ func Main(options ...func(o *Options)) error {
 
 	if *httpListen != "" || *httpsListen != "" || *httpsHost != "" {
 		if *remoteURL == "" {
-			return runStoreServer(*httpListen, *httpsListen, *httpsHost, *dir, *authToken, *maxDiskBytes, *gocacheMaxDiskBytes, *maxFileBytes, *gocacheMaxAge, *preloadLimit)
+			return runStoreServer(*httpListen, *httpsListen, *httpsHost, *dir, *authToken, *fallbackAuthToken, *maxDiskBytes, *gocacheMaxDiskBytes, *maxFileBytes, *gocacheMaxAge, *preloadLimit)
 		}
 
 		if *httpsHost != "" || *httpsListen != "" {
@@ -250,8 +251,8 @@ func Main(options ...func(o *Options)) error {
 	return nil
 }
 
-func runServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *local.Store, nativeStore *gocache.Store, authToken string, preloadLimit int) error {
-	return local.RunServer(httpListen, httpsListen, httpsHost, certCacheDir, store, nativeStore, authToken, preloadLimit)
+func runServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *local.Store, nativeStore *gocache.Store, authToken, fallbackAuthToken string, preloadLimit int) error {
+	return local.RunServer(httpListen, httpsListen, httpsHost, certCacheDir, store, nativeStore, authToken, fallbackAuthToken, preloadLimit)
 }
 
 func parseProxyParams() *local.ProxyParams {
@@ -268,7 +269,7 @@ func parseProxyParams() *local.ProxyParams {
 	return params
 }
 
-func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken string, maxDiskBytes int64, gocacheMaxDiskBytes int64, maxFileBytes int64, gocacheMaxAge time.Duration, preloadLimit int) error {
+func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallbackAuthToken string, maxDiskBytes int64, gocacheMaxDiskBytes int64, maxFileBytes int64, gocacheMaxAge time.Duration, preloadLimit int) error {
 	store, err := local.NewStore(dir, local.WithCompression(), local.WithMaxDiskBytes(maxDiskBytes), local.WithMaxFileBytes(maxFileBytes))
 	if err != nil {
 		return fmt.Errorf("init local storage: %w", err)
@@ -292,7 +293,7 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken string, m
 		}
 	}()
 
-	return runServer(httpListen, httpsListen, httpsHost, filepath.Join(dir, "autocert"), store, nativeStore, authToken, preloadLimit)
+	return runServer(httpListen, httpsListen, httpsHost, filepath.Join(dir, "autocert"), store, nativeStore, authToken, fallbackAuthToken, preloadLimit)
 }
 
 func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, restoreLimitBytes, saveCacheChunkBytes, jobStartUnixNanos int64, startedAt time.Time, params *local.ProxyParams) error {

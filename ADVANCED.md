@@ -97,6 +97,8 @@ Usage of ./bin/gocacheprog:
         current commit SHA used to upload cache usage manifest
   -dump-log string
         dump req/resp logs to file
+  -fallback-auth string
+        server mode: additional bearer token accepted alongside -auth-token, for migrating clients to a new token without downtime
   -github-actions-done
         finalize caching started by -github-actions-init in an always() step
   -github-actions-init string
@@ -581,6 +583,17 @@ an `Authorization: Bearer <token>` header — there's no query-param or basic-au
 ```bash
 curl -H "Authorization: Bearer secret-token" https://cache.example.com/status
 ```
+
+### Rotating the token
+
+`-fallback-auth` lets the server accept a second token alongside `-auth-token`, so clients can be
+migrated to a new token one at a time without downtime:
+
+```bash
+gocacheprog -http :8080 -auth-token new-token -fallback-auth old-token
+```
+
+Once every client has switched to `new-token`, drop `-fallback-auth`.
 
 Without it (or with the wrong token), every endpoint responds `401 unauthorized`:
 
