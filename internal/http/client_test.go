@@ -154,7 +154,7 @@ func TestClient_SaveAndRestoreNativeGOCACHE(t *testing.T) {
 	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
 	require.NoError(t, err)
 
-	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
 	t.Cleanup(srv.Close)
 
 	client, err := http.NewClient(srv.URL, "")
@@ -204,7 +204,7 @@ func TestClient_SaveCache_ChunksAndFinalizes(t *testing.T) {
 	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
 	require.NoError(t, err)
 
-	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
 	t.Cleanup(srv.Close)
 
 	client, err := http.NewClient(srv.URL, "")
@@ -246,7 +246,7 @@ func TestClient_SaveCache_SkipsFilesExceedingServerMaxFileBytesWithoutClientFlag
 	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression(), gocache.WithMaxFileBytes(20))
 	require.NoError(t, err)
 
-	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
 	t.Cleanup(srv.Close)
 
 	client, err := http.NewClient(srv.URL, "")
@@ -283,7 +283,7 @@ func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {
 	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
 	require.NoError(t, err)
 
-	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
 	t.Cleanup(srv.Close)
 
 	uploadID := "test-upload"
@@ -347,7 +347,7 @@ func TestSaveCacheChunk_OversizedItemFollowedByAnotherDoesNotDeadlock(t *testing
 	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression(), gocache.WithMaxFileBytes(20))
 	require.NoError(t, err)
 
-	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", 2))
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
 	t.Cleanup(srv.Close)
 
 	uploadID := "deadlock-test"
@@ -621,7 +621,7 @@ func TestStatus(t *testing.T) {
 	gocacheStore, err := gocache.NewStore(filepath.Join(dir, "native"), gocache.WithCompression(), gocache.WithMaxDiskBytes(654321))
 	require.NoError(t, err)
 
-	h := http.NewHandlerWithPreloadLimit(localStore, gocacheStore, "", 2)
+	h := http.NewHandlerWithPreloadLimit(localStore, gocacheStore, "", "", 2)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
