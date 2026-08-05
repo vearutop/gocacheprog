@@ -24,11 +24,12 @@ import (
 )
 
 type Store struct {
-	dir           string
-	compress      bool
-	maxDiskBytes  int64
-	maxFileBytes  int64
-	evictionDelay time.Duration
+	dir            string
+	compress       bool
+	maxDiskBytes   int64
+	maxFileBytes   int64
+	manifestMaxAge time.Duration
+	evictionDelay  time.Duration
 
 	mu                    sync.Mutex
 	index                 map[string]indexEntry
@@ -94,6 +95,15 @@ func WithEvictionDelay(evictionDelay time.Duration) StoreOption {
 	}
 }
 
+// WithManifestMaxAge sets how long a manifest file may go unwritten before it's deleted by
+// collectStaleManifests. Unlike cache objects, manifests are never touched again once their
+// commit/PR/changes stream goes cold, so nothing else ever prunes them.
+func WithManifestMaxAge(manifestMaxAge time.Duration) StoreOption {
+	return func(s *Store) {
+		s.manifestMaxAge = manifestMaxAge
+	}
+}
+
 func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	dir, err := toAbsPath(dir)
 	if err != nil {
@@ -101,11 +111,12 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	}
 
 	dc := &Store{
-		dir:           dir,
-		evictionDelay: 5 * time.Minute,
-		index:         make(map[string]indexEntry),
-		outputRefs:    make(map[string]int),
-		outputSizes:   make(map[string]int64),
+		dir:            dir,
+		manifestMaxAge: 5 * 24 * time.Hour,
+		evictionDelay:  5 * time.Minute,
+		index:          make(map[string]indexEntry),
+		outputRefs:     make(map[string]int),
+		outputSizes:    make(map[string]int64),
 	}
 	for _, opt := range opts {
 		opt(dc)
@@ -958,7 +969,10 @@ func (dc *Store) releaseOutputRefLocked(outputID string) {
 }
 
 func (dc *Store) scheduleEvictionLocked() {
-	if dc.maxDiskBytes <= 0 || dc.currentDiskBytes <= dc.maxDiskBytes || dc.evictionScheduled {
+	if dc.evictionScheduled {
+		return
+	}
+	if dc.manifestMaxAge <= 0 && (dc.maxDiskBytes <= 0 || dc.currentDiskBytes <= dc.maxDiskBytes) {
 		return
 	}
 
@@ -968,10 +982,76 @@ func (dc *Store) scheduleEvictionLocked() {
 		time.Sleep(delay)
 
 		dc.mu.Lock()
-		defer dc.mu.Unlock()
 		dc.evictionScheduled = false
 		dc.evictIfNeededLocked()
+		dc.mu.Unlock()
+
+		// Pure filesystem work over dir/manifests, unrelated to the in-memory index/
+		// currentDiskBytes that evictIfNeededLocked guards, so it runs without dc.mu held.
+		dc.collectStaleManifests()
 	}()
+}
+
+// collectStaleManifests deletes manifest files under dir/manifests whose mtime is older than
+// manifestMaxAge. See gocache.Store.collectStaleManifests for why nothing else ever prunes them.
+func (dc *Store) collectStaleManifests() {
+	if dc.manifestMaxAge <= 0 {
+		return
+	}
+
+	files, err := listManifestFiles(filepath.Join(dc.dir, "manifests"))
+	if err != nil {
+		log.Printf("collect stale manifests: list %s: %s", dc.dir, err.Error())
+		return
+	}
+
+	cutoff := time.Now().UTC().Add(-dc.manifestMaxAge)
+	removed := 0
+
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("collect stale manifests: stat %s: %s", path, err.Error())
+			}
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("collect stale manifests: remove %s: %s", path, err.Error())
+			continue
+		}
+		removed++
+	}
+
+	if removed > 0 {
+		log.Printf("collect stale manifests: removed %d manifest(s) older than %s", removed, dc.manifestMaxAge)
+	}
+}
+
+func listManifestFiles(root string) ([]string, error) {
+	var files []string
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || strings.HasSuffix(d.Name(), ".tmp") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return files, nil
 }
 
 func (dc *Store) evictIfNeededLocked() {

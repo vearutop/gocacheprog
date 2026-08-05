@@ -288,6 +288,32 @@ func TestStorePostCacheUsed_ReplaceChangesManifestOnColdStart(t *testing.T) {
 	require.Equal(t, []string{"newAction", "sharedAction"}, got)
 }
 
+// TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff mirrors
+// gocache.Store's collector: manifests are never touched again once their commit/PR goes cold, so
+// nothing else ever prunes them.
+func TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff(t *testing.T) {
+	store, err := NewStore(t.TempDir(), WithCompression(), WithManifestMaxAge(24*time.Hour))
+	require.NoError(t, err)
+
+	require.NoError(t, store.PostCacheUsed("stale-commit", "", "", []string{"actionId1"}, false))
+	require.NoError(t, store.PostCacheUsed("fresh-commit", "", "", []string{"actionId2"}, false))
+
+	staleManifest, err := store.commitManifestPath("stale-commit", "")
+	require.NoError(t, err)
+	freshManifest, err := store.commitManifestPath("fresh-commit", "")
+	require.NoError(t, err)
+
+	old := time.Now().Add(-48 * time.Hour)
+	require.NoError(t, os.Chtimes(staleManifest, old, old))
+
+	store.collectStaleManifests()
+
+	_, err = os.Stat(staleManifest)
+	require.True(t, os.IsNotExist(err))
+	_, err = os.Stat(freshManifest)
+	require.NoError(t, err)
+}
+
 func TestStoreHasEntries(t *testing.T) {
 	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)

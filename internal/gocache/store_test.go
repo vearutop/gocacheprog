@@ -51,6 +51,37 @@ func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 	require.Equal(t, "", string(manifestBody))
 }
 
+// TestStoreRestore_SurvivesSelfHealWriteFailure covers a disk-full-on-the-remote scenario: pruning
+// a missing manifest entry marks the manifest "changed" and Restore tries to write the cleaned
+// version back (see TestStoreRestore_PrunesMissingManifestEntries), but that write-back is pure
+// housekeeping. If it fails (e.g. no space left on device), the already-computed, already-correct
+// in-memory result must still be served rather than turning a successful restore into an error.
+func TestStoreRestore_SurvivesSelfHealWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "commit123"}, "ab/cache-entry-a", "payload-a")
+	saveItemForTest(t, store, Request{Commit: "commit123"}, "cd/cache-entry-b", "payload-b")
+
+	manifestPath, err := store.commitManifestPath("commit123", "")
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(store.objectPath("ab/cache-entry-a")))
+
+	manifestDir := filepath.Dir(manifestPath)
+	require.NoError(t, os.Chmod(manifestDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(manifestDir, 0o750) })
+
+	var restored []string
+	sources, err := store.Restore(Request{Commit: "commit123"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"commit"}, sources)
+	require.Equal(t, []string{"cd/cache-entry-b"}, restored)
+}
+
 func saveItemForTest(t *testing.T, store *Store, req Request, path, body string) {
 	t.Helper()
 
@@ -60,6 +91,34 @@ func saveItemForTest(t *testing.T, store *Store, req Request, path, body string)
 	})
 
 	require.NoError(t, store.Save(req, Batch{Items: []FileItem{item}}))
+}
+
+// TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff covers the age-based manifest
+// collector: manifests are never touched again once their commit/PR goes cold, so unlike cache
+// objects nothing else ever prunes them (see collectStaleManifests).
+func TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression(), WithManifestMaxAge(24*time.Hour))
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "stale-commit"}, "ab/stale", "payload")
+	saveItemForTest(t, store, Request{Commit: "fresh-commit"}, "cd/fresh", "payload")
+
+	staleManifest, err := store.commitManifestPath("stale-commit", "")
+	require.NoError(t, err)
+	freshManifest, err := store.commitManifestPath("fresh-commit", "")
+	require.NoError(t, err)
+
+	old := time.Now().Add(-48 * time.Hour)
+	require.NoError(t, os.Chtimes(staleManifest, old, old))
+
+	store.collectStaleManifests()
+
+	_, err = os.Stat(staleManifest)
+	require.True(t, os.IsNotExist(err))
+	_, err = os.Stat(freshManifest)
+	require.NoError(t, err)
 }
 
 // TestStoreRestore_FallsBackToNewestManifestWhenNoSourceMatches covers a cold-start scenario:

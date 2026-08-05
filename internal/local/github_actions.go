@@ -546,7 +546,10 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 	log.Printf("github-actions-init: restoring native GOCACHE into %s from %s", cacheDir, cfg.remoteURL)
 	restoreStats, err := RestoreNativeCache(cacheDir, client, req, startedAt)
 	if err != nil {
-		return fmt.Errorf("restore native cache: %w", err)
+		// The cache is an optimization, not a build dependency: a broken/overloaded/out-of-space
+		// remote shouldn't fail the job, just cost it a cold GOCACHE (cache miss).
+		log.Printf("github-actions-init: WARNING: restore native cache: %s; continuing with a cold cache", err.Error())
+		restoreStats = gocache.TransferStats{}
 	}
 
 	restoreStatsJSON, err := json.Marshal(restoreStats)
@@ -667,7 +670,11 @@ func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit
 	}
 
 	if _, err := RestoreNativeCache(cacheDir, client, req, initStartedAt); err != nil {
-		return fmt.Errorf("fallback_remote restore: %w", err)
+		// Same reasoning as initGocacheMode: a failed warm-up leaves cacheDir cold (cache miss),
+		// it shouldn't fail the job. Skip the fallback env vars below too, so -github-actions-done
+		// doesn't try to upload back to a remote that just failed a restore.
+		log.Printf("github-actions-init: WARNING: fallback_remote restore: %s; continuing with a cold local cache", err.Error())
+		return nil
 	}
 
 	env[envGHALocalFallback] = "1"
@@ -800,7 +807,11 @@ func doneGocacheMode() error {
 	log.Printf("github-actions-done: saving native GOCACHE from %s to %s", cacheDir, remoteURL)
 	saveStats, err := SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
 	if err != nil {
-		return err
+		// The build already finished by this point; a failed upload just means the next job
+		// pays for a cache miss, not a broken job (same swallow-and-log as
+		// doneLocalGocacheFallbackUpload below).
+		log.Printf("github-actions-done: WARNING: save native cache: %s", err.Error())
+		saveStats = gocache.TransferStats{}
 	}
 
 	var restoreStats gocache.TransferStats

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -91,12 +92,13 @@ type InspectStats struct {
 }
 
 type Store struct {
-	dir           string
-	compress      bool
-	maxDiskBytes  int64
-	maxFileBytes  int64
-	maxAge        time.Duration
-	evictionDelay time.Duration
+	dir            string
+	compress       bool
+	maxDiskBytes   int64
+	maxFileBytes   int64
+	maxAge         time.Duration
+	manifestMaxAge time.Duration
+	evictionDelay  time.Duration
 
 	mu                    sync.Mutex
 	index                 map[string]indexEntry
@@ -159,6 +161,16 @@ func WithMaxAge(maxAge time.Duration) StoreOption {
 	}
 }
 
+// WithManifestMaxAge sets how long a manifest file may go unwritten before it's deleted by
+// collectStaleManifests. Unlike cache objects, manifests are never touched again once their
+// commit/PR/changes stream goes cold (loadManifest's self-heal only runs when something actually
+// restores from that manifest), so nothing else ever prunes them.
+func WithManifestMaxAge(manifestMaxAge time.Duration) StoreOption {
+	return func(s *Store) {
+		s.manifestMaxAge = manifestMaxAge
+	}
+}
+
 func WithEvictionDelay(evictionDelay time.Duration) StoreOption {
 	return func(s *Store) {
 		s.evictionDelay = evictionDelay
@@ -172,10 +184,11 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	}
 
 	s := &Store{
-		dir:           dir,
-		maxAge:        48 * time.Hour,
-		evictionDelay: 5 * time.Minute,
-		index:         make(map[string]indexEntry),
+		dir:            dir,
+		maxAge:         48 * time.Hour,
+		manifestMaxAge: 5 * 24 * time.Hour,
+		evictionDelay:  5 * time.Minute,
+		index:          make(map[string]indexEntry),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -1053,7 +1066,7 @@ func (s *Store) putOne(item FileItem) error {
 	}
 	if err := writeAtomic(objectPath, rd, mode); err != nil {
 		atomic.AddInt64(&s.errors, 1)
-		return fmt.Errorf("write object: %w", err)
+		return fmt.Errorf("write object: %w", s.handleWriteErr(err))
 	}
 	if err := os.Chtimes(objectPath, modTime, modTime); err != nil {
 		return fmt.Errorf("set object mtime: %w", err)
@@ -1168,8 +1181,11 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 			if body != "" {
 				body += "\n"
 			}
+			// Self-heal write-back is opportunistic housekeeping (dedup/prune stale entries);
+			// paths already loaded are good regardless, so a failure here (e.g. disk full)
+			// shouldn't fail the restore.
 			if err := s.writeManifest(manifestPath, body); err != nil {
-				return nil, nil, err
+				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
 			}
 		}
 		sources = append(sources, candidate.name)
@@ -1221,8 +1237,9 @@ func (s *Store) newestFallbackPaths(buildType string, seen map[string]struct{}) 
 			body += "\n"
 		}
 
+		// See restorePaths: self-heal write-back failing shouldn't fail the restore.
 		if err := s.writeManifest(manifestPath, body); err != nil {
-			return nil, err
+			log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
 		}
 	}
 
@@ -1415,7 +1432,7 @@ func (s *Store) scheduleEvictionLocked() {
 	if s.evictionScheduled {
 		return
 	}
-	if s.maxAge <= 0 && (s.maxDiskBytes <= 0 || s.currentDiskBytes <= s.maxDiskBytes) {
+	if s.maxAge <= 0 && s.manifestMaxAge <= 0 && (s.maxDiskBytes <= 0 || s.currentDiskBytes <= s.maxDiskBytes) {
 		return
 	}
 
@@ -1425,10 +1442,55 @@ func (s *Store) scheduleEvictionLocked() {
 		time.Sleep(delay)
 
 		s.mu.Lock()
-		defer s.mu.Unlock()
 		s.evictionScheduled = false
 		s.evictIfNeededLocked()
+		s.mu.Unlock()
+
+		// Pure filesystem work over dir/manifests, unrelated to the in-memory index/
+		// currentDiskBytes that evictIfNeededLocked guards, so it runs without s.mu held.
+		s.collectStaleManifests()
 	}()
+}
+
+// collectStaleManifests deletes manifest files under dir/manifests whose mtime is older than
+// manifestMaxAge. Manifests accumulate forever otherwise: a PR or branch that goes cold is never
+// restored from again, so loadManifest's self-heal (which only runs on an actual restore) never
+// gets a chance to even shrink it, let alone remove it.
+func (s *Store) collectStaleManifests() {
+	if s.manifestMaxAge <= 0 {
+		return
+	}
+
+	files, err := listManifestFiles(filepath.Join(s.dir, "manifests"))
+	if err != nil {
+		log.Printf("collect stale manifests: list %s: %s", s.dir, err.Error())
+		return
+	}
+
+	cutoff := time.Now().UTC().Add(-s.manifestMaxAge)
+	removed := 0
+
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("collect stale manifests: stat %s: %s", path, err.Error())
+			}
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("collect stale manifests: remove %s: %s", path, err.Error())
+			continue
+		}
+		removed++
+	}
+
+	if removed > 0 {
+		log.Printf("collect stale manifests: removed %d manifest(s) older than %s", removed, s.manifestMaxAge)
+	}
 }
 
 func (s *Store) evictIfNeededLocked() {
@@ -1452,32 +1514,75 @@ func (s *Store) evictIfNeededLocked() {
 		return
 	}
 
-	for s.currentDiskBytes > s.maxDiskBytes && len(s.index) > 0 {
-		var (
-			evictPath string
-			evictIE   indexEntry
-			found     bool
-		)
+	for s.currentDiskBytes > s.maxDiskBytes && s.evictOneLocked() {
+	}
+}
 
-		for relPath, ie := range s.index {
-			if !found || lruTimeMicro(ie) < lruTimeMicro(evictIE) {
-				evictPath = relPath
-				evictIE = ie
-				found = true
-			}
-		}
-		if !found {
-			return
-		}
+// evictOneLocked removes the single least-recently-used cache object regardless of maxDiskBytes
+// and reports whether one was evicted (false once the index is empty). Shared by the
+// budget-based loop above and evictOnDiskFullLocked below.
+func (s *Store) evictOneLocked() bool {
+	var (
+		evictPath string
+		evictIE   indexEntry
+		found     bool
+	)
 
-		delete(s.index, evictPath)
-		s.currentDiskBytes -= s.entryStoredSize(evictIE)
-		s.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
-		s.dirty = true
-		if err := os.Remove(s.objectPath(evictPath)); err != nil && !os.IsNotExist(err) {
-			log.Printf("remove native cache object %s: %v", evictPath, err)
+	for relPath, ie := range s.index {
+		if !found || lruTimeMicro(ie) < lruTimeMicro(evictIE) {
+			evictPath = relPath
+			evictIE = ie
+			found = true
 		}
 	}
+	if !found {
+		return false
+	}
+
+	delete(s.index, evictPath)
+	s.currentDiskBytes -= s.entryStoredSize(evictIE)
+	s.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
+	s.dirty = true
+	if err := os.Remove(s.objectPath(evictPath)); err != nil && !os.IsNotExist(err) {
+		log.Printf("remove native cache object %s: %v", evictPath, err)
+	}
+
+	return true
+}
+
+// diskFullEvictFraction is the share of the index force-evicted, oldest first, whenever a write
+// hits ENOSPC. maxDiskBytes accounting only tracks this Store's own cache objects, not manifests,
+// uploads, or whatever else shares the disk, so a full disk doesn't imply currentDiskBytes >
+// maxDiskBytes. Evicting an LRU slice regardless of budget gives the next write a chance to
+// succeed instead of every request failing until an operator notices.
+const diskFullEvictFraction = 10
+
+func (s *Store) evictOnDiskFullLocked() {
+	n := len(s.index) / diskFullEvictFraction
+	if n == 0 {
+		n = 1
+	}
+
+	evicted := 0
+	for ; evicted < n; evicted++ {
+		if !s.evictOneLocked() {
+			break
+		}
+	}
+
+	log.Printf("disk full: force-evicted %d native cache object(s) to free space", evicted)
+}
+
+// handleWriteErr forces an eviction pass when err looks like the disk is out of space, then
+// returns err unchanged so callers can keep wrapping/propagating it as before.
+func (s *Store) handleWriteErr(err error) error {
+	if err != nil && errors.Is(err, syscall.ENOSPC) {
+		s.mu.Lock()
+		s.evictOnDiskFullLocked()
+		s.mu.Unlock()
+	}
+
+	return err
 }
 
 func lruTimeMicro(ie indexEntry) int64 {
@@ -1789,7 +1894,7 @@ func (s *Store) writeManifest(manifestPath string, body string) error {
 		return fmt.Errorf("create manifest dir: %w", err)
 	}
 	if err := os.WriteFile(manifestPath+".tmp", []byte(body), 0o600); err != nil {
-		return fmt.Errorf("write manifest: %w", err)
+		return fmt.Errorf("write manifest: %w", s.handleWriteErr(err))
 	}
 	if err := os.Rename(manifestPath+".tmp", manifestPath); err != nil {
 		return fmt.Errorf("rename manifest: %w", err)
