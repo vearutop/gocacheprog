@@ -169,7 +169,7 @@ func (p *Pool) DiscoverPages() error {
 		}
 		pageNum := uint32(pageNum64)
 
-		f, err := os.OpenFile(filepath.Join(p.dir, d.Name()), os.O_RDWR, 0o600) //nolint:gosec // path is derived from configured storage dir.
+		f, err := os.OpenFile(filepath.Join(p.dir, d.Name()), os.O_RDWR, 0o600)
 		if err != nil {
 			return fmt.Errorf("open pool page %s: %w", d.Name(), err)
 		}
@@ -178,8 +178,9 @@ func (p *Pool) DiscoverPages() error {
 		if c == nil {
 			c = &class{
 				recordSize: recordSize,
-				capacity:   uint32(p.pageBytes / recordSize),
-				pages:      make(map[uint32]*page),
+				//nolint:gosec // recordSize/pageBytes are always small, internally-controlled values (see MaxRecordBytes/PageBytes); capacity comfortably fits uint32.
+				capacity: uint32(p.pageBytes / recordSize),
+				pages:    make(map[uint32]*page),
 			}
 			p.classes[recordSize] = c
 		}
@@ -281,8 +282,9 @@ func (p *Pool) Put(size int64, body []byte) (loc Loc, ok bool, err error) {
 
 		c = &class{
 			recordSize: size,
-			capacity:   uint32(p.pageBytes / size),
-			pages:      make(map[uint32]*page),
+			//nolint:gosec // size/pageBytes are always small, internally-controlled values (see MaxRecordBytes/PageBytes); capacity comfortably fits uint32.
+			capacity: uint32(p.pageBytes / size),
+			pages:    make(map[uint32]*page),
 		}
 		p.classes[size] = c
 		delete(p.counts, size)
@@ -406,7 +408,9 @@ func (p *Pool) createPageLocked(c *class, pageNum uint32) (*page, error) {
 	}
 
 	if err := writeZeroes(f, int64(c.capacity)*c.recordSize); err != nil {
-		_ = f.Close()
+		if closeErr := f.Close(); closeErr != nil {
+			log.Printf("recordpool: close pool page after write failure: %s", closeErr.Error())
+		}
 		removeStaleTemp(tmpPath)
 		return nil, fmt.Errorf("write pool page: %w", err)
 	}
@@ -461,7 +465,7 @@ func (p *Pool) freeLocked(c *class, pageNum uint32, slot uint32) {
 	}
 
 	pg.free = append(pg.free, slot)
-	if uint32(len(pg.free)) < c.capacity {
+	if len(pg.free) < int(c.capacity) {
 		return
 	}
 

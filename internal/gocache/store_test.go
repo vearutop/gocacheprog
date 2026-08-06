@@ -73,7 +73,7 @@ func TestStoreRestore_SurvivesSelfHealWriteFailure(t *testing.T) {
 
 	manifestDir := filepath.Dir(manifestPath)
 	require.NoError(t, os.Chmod(manifestDir, 0o500))
-	t.Cleanup(func() { _ = os.Chmod(manifestDir, 0o750) })
+	t.Cleanup(func() { require.NoError(t, os.Chmod(manifestDir, 0o750)) })
 
 	var restored []string
 	sources, err := store.Restore(Request{Commit: "commit123"}, func(item FileItem) {

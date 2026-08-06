@@ -1041,7 +1041,6 @@ func (s *Store) putOne(item FileItem) error {
 	}
 
 	modTime := time.Now().UTC()
-
 	ie := indexEntry{
 		Size:            item.Size,
 		Mode:            item.Mode,
@@ -1049,25 +1048,7 @@ func (s *Store) putOne(item FileItem) error {
 		AccessTimeMicro: modTime.UnixMicro(),
 	}
 
-	var (
-		rd  io.ReadCloser
-		err error
-	)
-
-	switch {
-	case item.IsCompressed && s.compress:
-		rd, err = item.WireBodyReader()
-		ie.Compressed = 1
-		ie.WireSize = item.WireSize
-	case item.IsCompressed && !s.compress:
-		rd, err = item.UncompressedBodyReader()
-	case !item.IsCompressed && s.compress && item.Size >= cache.MinCompressionSize:
-		rd, err = item.CompressedBodyReader()
-		ie.Compressed = 1
-		ie.WireSize = item.WireSize
-	default:
-		rd, err = item.UncompressedBodyReader()
-	}
+	rd, err := bodyReaderForPut(item, s.compress, &ie)
 	if err != nil {
 		atomic.AddInt64(&s.errors, 1)
 		return fmt.Errorf("get reader for save: %w", err)
@@ -1080,51 +1061,9 @@ func (s *Store) putOne(item FileItem) error {
 		}()
 	}
 
-	mode := item.FileMode()
-	if mode == 0 {
-		mode = 0o600
-	}
-
-	recordSize := s.entryStoredSize(ie)
-	poolEligible := recordSize > 0 && recordSize <= s.pool.MaxRecordBytes()
-
-	var body []byte
-	if poolEligible {
-		body, err = io.ReadAll(rd)
-		if err != nil {
-			atomic.AddInt64(&s.errors, 1)
-			return fmt.Errorf("read save body: %w", err)
-		}
-		if int64(len(body)) != recordSize {
-			atomic.AddInt64(&s.errors, 1)
-			return fmt.Errorf("save body length %d does not match expected %d", len(body), recordSize)
-		}
-
-		loc, ok, poolErr := s.pool.Put(recordSize, body)
-		if poolErr != nil {
-			atomic.AddInt64(&s.errors, 1)
-			return fmt.Errorf("write pooled record: %w", s.handleWriteErr(poolErr))
-		}
-		if ok {
-			ie.PoolPage, ie.PoolSlot = loc.Page, loc.Slot
-		}
-	}
-
-	if ie.PoolPage == 0 {
-		// Not pool-eligible, or the size hasn't crossed the promotion threshold yet -- plain
-		// file, same as before the record pool existed.
-		objectPath := s.objectPath(item.Path)
-		var src io.Reader = rd
-		if poolEligible {
-			src = bytes.NewReader(body)
-		}
-		if err := writeAtomic(objectPath, src, mode); err != nil {
-			atomic.AddInt64(&s.errors, 1)
-			return fmt.Errorf("write object: %w", s.handleWriteErr(err))
-		}
-		if err := os.Chtimes(objectPath, modTime, modTime); err != nil {
-			return fmt.Errorf("set object mtime: %w", err)
-		}
+	if err := s.storePutBody(item, &ie, rd, modTime); err != nil {
+		atomic.AddInt64(&s.errors, 1)
+		return err
 	}
 
 	s.mu.Lock()
@@ -1132,15 +1071,7 @@ func (s *Store) putOne(item FileItem) error {
 
 	if hasExisting {
 		s.currentDiskBytes -= s.entryStoredSize(existing)
-		if existing.PoolPage != 0 {
-			s.pool.Free(s.entryStoredSize(existing), recordpool.Loc{Page: existing.PoolPage, Slot: existing.PoolSlot})
-		} else if ie.PoolPage != 0 {
-			// The old plain file is superseded by a pool slot now, rather than overwritten in
-			// place by writeAtomic above -- remove it explicitly.
-			if err := os.Remove(s.objectPath(item.Path)); err != nil && !os.IsNotExist(err) {
-				log.Printf("remove superseded plain object %s: %s", item.Path, err.Error())
-			}
-		}
+		s.releaseSupersededLocked(item.Path, existing, ie)
 	}
 	s.currentDiskBytes += s.entryStoredSize(ie)
 	s.index[item.Path] = ie
@@ -1148,6 +1079,114 @@ func (s *Store) putOne(item FileItem) error {
 	s.scheduleEvictionLocked()
 
 	return nil
+}
+
+// bodyReaderForPut picks the right reader for item given whether the store compresses, setting
+// ie.Compressed/ie.WireSize when the body ends up compressed on disk.
+func bodyReaderForPut(item FileItem, compress bool, ie *indexEntry) (io.ReadCloser, error) {
+	switch {
+	case item.IsCompressed && compress:
+		ie.Compressed = 1
+		ie.WireSize = item.WireSize
+		return item.WireBodyReader()
+	case item.IsCompressed && !compress:
+		return item.UncompressedBodyReader()
+	case !item.IsCompressed && compress && item.Size >= cache.MinCompressionSize:
+		return compressNowBodyReader(item, ie)
+	default:
+		return item.UncompressedBodyReader()
+	}
+}
+
+// compressNowBodyReader compresses item's body immediately, rather than handing back a reader
+// that would compress lazily on read, so ie.WireSize reflects the real compressed length by the
+// time this returns. item.WireSize can't be used here the way the item.IsCompressed branches
+// above do: this item arrived uncompressed, so its WireSize field was never meaningful, and
+// there's no way to know the real compressed length without actually compressing first -- pool
+// eligibility and disk accounting both need that number to be trustworthy.
+func compressNowBodyReader(item FileItem, ie *indexEntry) (io.ReadCloser, error) {
+	rd, err := item.CompressedBodyReader()
+	if err != nil {
+		return nil, err
+	}
+
+	compressed, err := io.ReadAll(rd)
+	if closeErr := rd.Close(); closeErr != nil {
+		log.Printf("close compressed body reader: %s", closeErr.Error())
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	ie.Compressed = 1
+	ie.WireSize = int64(len(compressed))
+
+	return io.NopCloser(bytes.NewReader(compressed)), nil
+}
+
+// storePutBody writes rd's bytes to wherever ie belongs -- a pool slot if eligible and promoted,
+// a plain file otherwise -- setting ie.PoolPage/PoolSlot when it lands in the pool.
+func (s *Store) storePutBody(item FileItem, ie *indexEntry, rd io.Reader, modTime time.Time) error {
+	recordSize := s.entryStoredSize(*ie)
+	poolEligible := recordSize > 0 && recordSize <= s.pool.MaxRecordBytes()
+
+	var body []byte
+	if poolEligible {
+		var err error
+		body, err = io.ReadAll(rd)
+		if err != nil {
+			return fmt.Errorf("read save body: %w", err)
+		}
+		if int64(len(body)) != recordSize {
+			return fmt.Errorf("save body length %d does not match expected %d", len(body), recordSize)
+		}
+
+		loc, ok, poolErr := s.pool.Put(recordSize, body)
+		if poolErr != nil {
+			return fmt.Errorf("write pooled record: %w", s.handleWriteErr(poolErr))
+		}
+		if ok {
+			ie.PoolPage, ie.PoolSlot = loc.Page, loc.Slot
+			return nil
+		}
+	}
+
+	// Not pool-eligible, or the size hasn't crossed the promotion threshold yet -- plain file,
+	// same as before the record pool existed.
+	mode := item.FileMode()
+	if mode == 0 {
+		mode = 0o600
+	}
+
+	objectPath := s.objectPath(item.Path)
+	src := rd
+	if poolEligible {
+		src = bytes.NewReader(body)
+	}
+	if err := writeAtomic(objectPath, src, mode); err != nil {
+		return fmt.Errorf("write object: %w", s.handleWriteErr(err))
+	}
+	if err := os.Chtimes(objectPath, modTime, modTime); err != nil {
+		return fmt.Errorf("set object mtime: %w", err)
+	}
+
+	return nil
+}
+
+// releaseSupersededLocked frees whatever existing occupied when ie now lives somewhere different
+// -- same key, rewritten in place. Called with s.mu held.
+func (s *Store) releaseSupersededLocked(relPath string, existing indexEntry, ie indexEntry) {
+	if existing.PoolPage != 0 {
+		s.pool.Free(s.entryStoredSize(existing), recordpool.Loc{Page: existing.PoolPage, Slot: existing.PoolSlot})
+		return
+	}
+	if ie.PoolPage != 0 {
+		// The old plain file is superseded by a pool slot now, rather than overwritten in place
+		// by storePutBody's writeAtomic -- remove it explicitly.
+		if err := os.Remove(s.objectPath(relPath)); err != nil && !os.IsNotExist(err) {
+			log.Printf("remove superseded plain object %s: %s", relPath, err.Error())
+		}
+	}
 }
 
 func (s *Store) responseItem(relPath string, ie indexEntry) FileItem {

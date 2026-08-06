@@ -321,34 +321,7 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 		AccessTimeMicro: now.UnixMicro(),
 	}
 
-	var (
-		rd  io.Reader
-		err error
-	)
-
-	//nolint:nestif // compression and storage-mode combinations are clearer as explicit branches.
-	if item.IsCompressed {
-		if !dc.compress {
-			// Decompress a compressed body.
-			rd, err = item.UncompressedBodyReader()
-		} else {
-			// Pass compressed body as is.
-			rd, err = item.WireBodyReader()
-			ie.Compressed = 1
-			ie.WireSize = item.WireSize
-		}
-	} else {
-		if dc.compress && item.Size >= cache.MinCompressionSize {
-			// Enable compression if it is not there.
-			rd, err = item.CompressedBodyReader()
-			ie.Compressed = 1
-			ie.WireSize = item.WireSize
-		} else {
-			// Pass uncompressed body as is.
-			rd, err = item.UncompressedBodyReader()
-		}
-	}
-
+	rd, err := bodyReaderForPut(item, dc.compress, &ie)
 	if err != nil {
 		atomic.AddInt64(&dc.errors, 1)
 		println("get reader for put:", err.Error())
@@ -357,51 +330,11 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 
 	newStoredSize := dc.entryStoredSize(ie)
 
-	var loc recordpool.Loc
-
-	//nolint:nestif // storage-destination combinations are clearer as explicit branches.
-	if outputRefExists {
-		// Content-addressed: this OutputID is already stored somewhere, whether by an earlier
-		// ActionID sharing it or a previous put of this same ActionID. Reuse that one copy's
-		// location instead of writing (and, if pool-backed, allocating) the same bytes again --
-		// still drain rd so its underlying body reader/upload machinery finishes cleanly, the
-		// same bytes writeAtomic would otherwise have consumed.
-		if rd != nil {
-			if _, err := io.Copy(io.Discard, rd); err != nil {
-				atomic.AddInt64(&dc.errors, 1)
-				return fmt.Errorf("drain body for already-stored output: %w", err)
-			}
-		}
-		loc = existingOutputLoc
-	} else if !dc.poolDisabled && newStoredSize > 0 && newStoredSize <= dc.pool.MaxRecordBytes() {
-		body, err := io.ReadAll(rd)
-		if err != nil {
-			atomic.AddInt64(&dc.errors, 1)
-			return fmt.Errorf("read body for put: %w", err)
-		}
-		if int64(len(body)) != newStoredSize {
-			atomic.AddInt64(&dc.errors, 1)
-			return fmt.Errorf("put body length %d does not match expected %d", len(body), newStoredSize)
-		}
-
-		poolLoc, ok, poolErr := dc.pool.Put(newStoredSize, body)
-		if poolErr != nil {
-			atomic.AddInt64(&dc.errors, 1)
-			return fmt.Errorf("write pooled record: %w", poolErr)
-		}
-		if ok {
-			loc = poolLoc
-		} else if err := writeAtomic(dc.OutputFilename(item.OutputID), bytes.NewReader(body)); err != nil {
-			atomic.AddInt64(&dc.errors, 1)
-			println("atomic write:", err.Error())
-			return fmt.Errorf("atomic write: %w", err)
-		}
-	} else if err := writeAtomic(dc.OutputFilename(item.OutputID), rd); err != nil {
+	loc, err := dc.storePutBody(item, rd, newStoredSize, outputRefExists, existingOutputLoc)
+	if err != nil {
 		atomic.AddInt64(&dc.errors, 1)
-		println("atomic write:", err.Error())
-		return fmt.Errorf("atomic write: %w", err)
+		return err
 	}
-
 	ie.PoolPage, ie.PoolSlot = loc.Page, loc.Slot
 
 	dc.mu.Lock()
@@ -419,6 +352,105 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 	atomic.AddInt64(&dc.putsCompleted, 1)
 
 	return nil
+}
+
+// bodyReaderForPut picks the right reader for item given whether the store compresses, setting
+// ie.Compressed/ie.WireSize when the body ends up compressed on disk.
+func bodyReaderForPut(item cache.ResponseItem, compress bool, ie *indexEntry) (io.Reader, error) {
+	if item.IsCompressed {
+		if !compress {
+			return item.UncompressedBodyReader() // decompress a compressed body
+		}
+		ie.Compressed = 1
+		ie.WireSize = item.WireSize
+		return item.WireBodyReader() // pass compressed body as is
+	}
+	if compress && item.Size >= cache.MinCompressionSize {
+		return compressNowBodyReader(item, ie) // enable compression if it is not there
+	}
+	return item.UncompressedBodyReader() // pass uncompressed body as is
+}
+
+// compressNowBodyReader compresses item's body immediately, rather than handing back a reader
+// that would compress lazily on read, so ie.WireSize reflects the real compressed length by the
+// time this returns. item.WireSize can't be used the way the IsCompressed branch above does:
+// this item arrived uncompressed, so its WireSize field was never meaningful, and there's no way
+// to know the real compressed length without actually compressing first -- pool eligibility and
+// disk accounting both need that number to be trustworthy.
+func compressNowBodyReader(item cache.ResponseItem, ie *indexEntry) (io.Reader, error) {
+	rd, err := item.CompressedBodyReader()
+	if err != nil {
+		return nil, err
+	}
+
+	compressed, err := io.ReadAll(rd)
+	if closeErr := rd.Close(); closeErr != nil {
+		log.Printf("close compressed body reader: %s", closeErr.Error())
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	ie.Compressed = 1
+	ie.WireSize = int64(len(compressed))
+
+	return bytes.NewReader(compressed), nil
+}
+
+// storePutBody writes rd's bytes to wherever this OutputID belongs: an already-stored location
+// reused as is (content-addressed, see the outputRefExists case), a pool slot if eligible and
+// promoted, or a plain file otherwise.
+func (dc *Store) storePutBody(item cache.ResponseItem, rd io.Reader, newStoredSize int64, outputRefExists bool, existingOutputLoc recordpool.Loc) (recordpool.Loc, error) {
+	if outputRefExists {
+		// Content-addressed: this OutputID is already stored somewhere, whether by an earlier
+		// ActionID sharing it or a previous put of this same ActionID. Reuse that one copy's
+		// location instead of writing (and, if pool-backed, allocating) the same bytes again --
+		// still drain rd so its underlying body reader/upload machinery finishes cleanly, the
+		// same bytes writeAtomic would otherwise have consumed.
+		if rd != nil {
+			if _, err := io.Copy(io.Discard, rd); err != nil {
+				return recordpool.Loc{}, fmt.Errorf("drain body for already-stored output: %w", err)
+			}
+		}
+		return existingOutputLoc, nil
+	}
+
+	if !dc.poolDisabled && newStoredSize > 0 && newStoredSize <= dc.pool.MaxRecordBytes() {
+		return dc.storePoolEligibleBody(item, rd, newStoredSize)
+	}
+
+	if err := writeAtomic(dc.OutputFilename(item.OutputID), rd); err != nil {
+		println("atomic write:", err.Error())
+		return recordpool.Loc{}, fmt.Errorf("atomic write: %w", err)
+	}
+	return recordpool.Loc{}, nil
+}
+
+// storePoolEligibleBody handles a record small enough to be pool-eligible: reads its body,
+// attempts Pool.Put, and falls back to a plain file (from the same already-read bytes) when this
+// size hasn't crossed the promotion threshold yet.
+func (dc *Store) storePoolEligibleBody(item cache.ResponseItem, rd io.Reader, newStoredSize int64) (recordpool.Loc, error) {
+	body, err := io.ReadAll(rd)
+	if err != nil {
+		return recordpool.Loc{}, fmt.Errorf("read body for put: %w", err)
+	}
+	if int64(len(body)) != newStoredSize {
+		return recordpool.Loc{}, fmt.Errorf("put body length %d does not match expected %d", len(body), newStoredSize)
+	}
+
+	loc, ok, poolErr := dc.pool.Put(newStoredSize, body)
+	if poolErr != nil {
+		return recordpool.Loc{}, fmt.Errorf("write pooled record: %w", poolErr)
+	}
+	if ok {
+		return loc, nil
+	}
+
+	if err := writeAtomic(dc.OutputFilename(item.OutputID), bytes.NewReader(body)); err != nil {
+		println("atomic write:", err.Error())
+		return recordpool.Loc{}, fmt.Errorf("atomic write: %w", err)
+	}
+	return recordpool.Loc{}, nil
 }
 
 // writeAtomicSeq disambiguates concurrent writers' temp file names. Two Put calls for
