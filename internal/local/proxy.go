@@ -774,8 +774,16 @@ func (dc *Proxy) Get(req cacheprog.Request) cacheprog.Response {
 	resp.DiskPath = rs.DiskPath
 	resp.Miss = rs.Miss
 
-	if rs.Size > 0 && rs.DiskPath == "" {
-		log.Printf("disk path is empty for %s", req.ActionID)
+	if !resp.Miss && rs.Size > 0 && rs.DiskPath == "" {
+		// The go command reads DiskPath itself, out of process -- there's no body-bytes fallback
+		// on this protocol the way there is over HTTP. dc.disk must always be constructed with
+		// WithoutRecordPool for exactly this reason; if that's ever missed, degrade to a clean
+		// cache miss (go just recomputes) rather than handing back a hit go can't actually open.
+		log.Printf("disk path is empty for %s; reporting as a miss instead of a broken hit", req.ActionID)
+		resp.Miss = true
+		resp.OutputID = ""
+		resp.Size = 0
+		resp.Time = nil
 	}
 
 	return resp

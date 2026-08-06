@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vearutop/gocacheprog/internal/recordpool"
 )
 
 func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
@@ -91,6 +93,81 @@ func saveItemForTest(t *testing.T, store *Store, req Request, path, body string)
 	})
 
 	require.NoError(t, store.Save(req, Batch{Items: []FileItem{item}}))
+}
+
+// TestPoolPromotion_PacksSmallRecordsAndRoundTrips covers dynamic promotion end to end: a size
+// stays plain files below the pool's breakeven, the item that crosses the threshold lands
+// straight in a freshly created page instead of one more plain file, and the read path
+// (responseItem's bodyReader closure, not DiskPath) serves the exact bytes back.
+func TestPoolPromotion_PacksSmallRecordsAndRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	breakeven := store.pool.Breakeven()
+	body := strings.Repeat("x", 50)
+	// breakeven-1 plain files: the pool's internal count reaches breakeven-1, still below the
+	// promotion threshold.
+	for i := 0; i < breakeven-1; i++ {
+		saveItemForTest(t, store, Request{Commit: "c"}, fmt.Sprintf("ab/item-%d", i), body)
+	}
+
+	pagePath := filepath.Join(dir, "records", recordpool.PageFileName(50, 1))
+	require.NoFileExists(t, pagePath)
+
+	// The breakeven-th same-size item crosses the threshold and lands in slot 0 of a fresh page.
+	promotingPath := "cd/item-promoting"
+	saveItemForTest(t, store, Request{Commit: "c"}, promotingPath, body)
+	require.FileExists(t, pagePath)
+
+	store.mu.Lock()
+	ie := store.index[promotingPath]
+	store.mu.Unlock()
+	require.NotZero(t, ie.PoolPage)
+
+	var restoredBody string
+	_, err = store.Restore(Request{Commit: "c"}, func(item FileItem) {
+		if item.Path != promotingPath {
+			return
+		}
+		require.Empty(t, item.DiskPath, "pool-backed item must not carry a plain file path")
+		rc, rerr := item.UncompressedBodyReader()
+		require.NoError(t, rerr)
+		data, rerr := io.ReadAll(rc)
+		require.NoError(t, rerr)
+		require.NoError(t, rc.Close())
+		restoredBody = string(data)
+	})
+	require.NoError(t, err)
+	require.Equal(t, body, restoredBody)
+}
+
+// TestPool_PageRemovedWhenFullyEmptied covers the self-cleaning side of the record pool: once
+// every record in a page has been freed, the page file itself is deleted rather than left around
+// hollow.
+func TestPool_PageRemovedWhenFullyEmptied(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	breakeven := store.pool.Breakeven()
+	body := strings.Repeat("y", 60)
+	// breakeven-1 plain files, then a handful more that land in the pool once promoted --
+	// exercises several slots in the same page, not just the one that triggered promotion.
+	const extraPooledItems = 5
+	for i := 0; i < breakeven-1+extraPooledItems; i++ {
+		saveItemForTest(t, store, Request{Commit: "c2"}, fmt.Sprintf("ab/entry-%d", i), body)
+	}
+
+	pagePath := filepath.Join(dir, "records", recordpool.PageFileName(60, 1))
+	require.FileExists(t, pagePath)
+
+	_, err = store.Clear(Request{Commit: "c2"})
+	require.NoError(t, err)
+
+	require.NoFileExists(t, pagePath)
 }
 
 // TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff covers the age-based manifest

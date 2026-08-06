@@ -327,7 +327,10 @@ func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {
 	require.Contains(t, msg, "path=\"ab/a\"")
 	require.Contains(t, msg, "wire_size=10")
 	require.Contains(t, msg, "read_wire_bytes=5")
-	require.Contains(t, msg, "truncated item body")
+	// Small items are slab-eligible: Store.putOne now validates the read length itself before
+	// ever reaching storage, one layer earlier than the wire-byte-count check that used to catch
+	// this (and still does, for items too large to be slab-eligible).
+	require.Contains(t, msg, "save body length 5 does not match expected 10")
 }
 
 // TestSaveCacheChunk_OversizedItemFollowedByAnotherDoesNotDeadlock guards
