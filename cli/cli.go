@@ -54,11 +54,13 @@ func Main(options ...func(o *Options)) error {
 	stop := flag.String("stop", "", "stop a running local daemon listening on the given unix/tcp address")
 	dumpLogs := flag.String("dump-log", "", "dump req/resp logs to file")
 	remoteURL := flag.String("remote-url", "", "remote HTTP server cache source, e.g. https://example.com:8080")
-	authToken := flag.String("auth-token", "", "optional bearer token for the remote HTTP cache server")
-	fallbackAuthToken := flag.String("fallback-auth", "", "server mode: additional bearer token accepted alongside -auth-token, for migrating clients to a new token without downtime")
+	authToken := flag.String("auth-token", "", "optional bearer token for the remote HTTP cache server; falls back to $GOCACHEPROG_AUTH when unset")
+	authFallbackToken := flag.String("auth-fallback", "", "server mode: additional bearer token accepted alongside -auth-token, for migrating clients to a new token without downtime")
 	maxDiskBytes := flag.Int64("max-disk-bytes", 0, "optional total on-disk cache size limit in bytes; 0 disables eviction")
 	gocacheMaxDiskBytes := flag.Int64("gocache-max-disk-bytes", 0, "optional total on-disk native cache storage size limit in bytes on the remote server; 0 disables eviction")
 	gocacheMaxAge := flag.Duration("gocache-max-age", 48*time.Hour, "maximum age for native GOCACHE objects on the remote server; 0 disables age-based retirement")
+	manifestMaxAge := flag.Duration("manifest-max-age", 5*24*time.Hour, "server mode: maximum age for manifest files with no restore/save activity before they're deleted; 0 disables manifest collection")
+	gocacheManifestMaxAge := flag.Duration("gocache-manifest-max-age", 5*24*time.Hour, "server mode: same as -manifest-max-age but for native GOCACHE manifests")
 	preloadLimit := flag.Int("preload-limit", 2, "maximum number of concurrent preload preparations in server mode")
 	preloadOnly := flag.Bool("preload-only", false, "preload cache into -cache-dir and exit without running as helper or uploading cache-used")
 	restoreCache := flag.Bool("restore-cache", false, "restore native GOCACHE files into -cache-dir and exit")
@@ -75,6 +77,10 @@ func Main(options ...func(o *Options)) error {
 	ver := flag.Bool("version", false, "print version and exit")
 
 	flag.Parse()
+
+	if *authToken == "" {
+		*authToken = os.Getenv("GOCACHEPROG_AUTH")
+	}
 
 	if *quiet {
 		log.SetOutput(io.Discard)
@@ -149,7 +155,7 @@ func Main(options ...func(o *Options)) error {
 
 	if *httpListen != "" || *httpsListen != "" || *httpsHost != "" {
 		if *remoteURL == "" {
-			return runStoreServer(*httpListen, *httpsListen, *httpsHost, *dir, *authToken, *fallbackAuthToken, *maxDiskBytes, *gocacheMaxDiskBytes, *maxFileBytes, *gocacheMaxAge, *preloadLimit)
+			return runStoreServer(*httpListen, *httpsListen, *httpsHost, *dir, *authToken, *authFallbackToken, *maxDiskBytes, *gocacheMaxDiskBytes, *maxFileBytes, *gocacheMaxAge, *manifestMaxAge, *gocacheManifestMaxAge, *preloadLimit)
 		}
 
 		if *httpsHost != "" || *httpsListen != "" {
@@ -200,7 +206,7 @@ func Main(options ...func(o *Options)) error {
 		}
 	}
 
-	store, err := local.NewStore(*dir, local.WithMaxDiskBytes(*maxDiskBytes))
+	store, err := local.NewStore(*dir, local.WithMaxDiskBytes(*maxDiskBytes), local.WithoutRecordPool())
 	if err != nil {
 		return fmt.Errorf("new cache store: %w", err)
 	}
@@ -269,8 +275,8 @@ func parseProxyParams() *local.ProxyParams {
 	return params
 }
 
-func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallbackAuthToken string, maxDiskBytes int64, gocacheMaxDiskBytes int64, maxFileBytes int64, gocacheMaxAge time.Duration, preloadLimit int) error {
-	store, err := local.NewStore(dir, local.WithCompression(), local.WithMaxDiskBytes(maxDiskBytes), local.WithMaxFileBytes(maxFileBytes))
+func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallbackAuthToken string, maxDiskBytes int64, gocacheMaxDiskBytes int64, maxFileBytes int64, gocacheMaxAge time.Duration, manifestMaxAge time.Duration, gocacheManifestMaxAge time.Duration, preloadLimit int) error {
+	store, err := local.NewStore(dir, local.WithCompression(), local.WithMaxDiskBytes(maxDiskBytes), local.WithMaxFileBytes(maxFileBytes), local.WithManifestMaxAge(manifestMaxAge))
 	if err != nil {
 		return fmt.Errorf("init local storage: %w", err)
 	}
@@ -280,6 +286,7 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallback
 		gocache.WithMaxDiskBytes(gocacheMaxDiskBytes),
 		gocache.WithMaxFileBytes(maxFileBytes),
 		gocache.WithMaxAge(gocacheMaxAge),
+		gocache.WithManifestMaxAge(gocacheManifestMaxAge),
 	)
 	if err != nil {
 		return fmt.Errorf("init native GOCACHE storage: %w", err)
@@ -364,7 +371,7 @@ func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, par
 		return fmt.Errorf("remote client: %w", err)
 	}
 
-	store, err := local.NewStore(dir, local.WithMaxDiskBytes(maxDiskBytes))
+	store, err := local.NewStore(dir, local.WithMaxDiskBytes(maxDiskBytes), local.WithoutRecordPool())
 	if err != nil {
 		return fmt.Errorf("new cache store: %w", err)
 	}

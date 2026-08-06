@@ -288,6 +288,32 @@ func TestStorePostCacheUsed_ReplaceChangesManifestOnColdStart(t *testing.T) {
 	require.Equal(t, []string{"newAction", "sharedAction"}, got)
 }
 
+// TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff mirrors
+// gocache.Store's collector: manifests are never touched again once their commit/PR goes cold, so
+// nothing else ever prunes them.
+func TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff(t *testing.T) {
+	store, err := NewStore(t.TempDir(), WithCompression(), WithManifestMaxAge(24*time.Hour))
+	require.NoError(t, err)
+
+	require.NoError(t, store.PostCacheUsed("stale-commit", "", "", []string{"actionId1"}, false))
+	require.NoError(t, store.PostCacheUsed("fresh-commit", "", "", []string{"actionId2"}, false))
+
+	staleManifest, err := store.commitManifestPath("stale-commit", "")
+	require.NoError(t, err)
+	freshManifest, err := store.commitManifestPath("fresh-commit", "")
+	require.NoError(t, err)
+
+	old := time.Now().Add(-48 * time.Hour)
+	require.NoError(t, os.Chtimes(staleManifest, old, old))
+
+	store.collectStaleManifests()
+
+	_, err = os.Stat(staleManifest)
+	require.True(t, os.IsNotExist(err))
+	_, err = os.Stat(freshManifest)
+	require.NoError(t, err)
+}
+
 func TestStoreHasEntries(t *testing.T) {
 	store, err := NewStore(t.TempDir(), WithCompression())
 	require.NoError(t, err)
@@ -347,6 +373,85 @@ func TestStorePut_ConcurrentSameOutputIDDoesNotRace(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(dir, "entries", "sh", "shared-output"))
 	require.NoError(t, err)
 	require.Equal(t, "same-body", string(body))
+}
+
+// TestStorePut_SharedOutputIDReusesOnePoolSlot covers the one genuinely new risk record-pool
+// integration adds to this store specifically: storage here is content-addressed by OutputID, so
+// many ActionIDs can share one OutputID, and putOne must reuse an already-pool-backed OutputID's
+// location rather than allocating (and leaking) a second slot for every ActionID referencing it.
+func TestStorePut_SharedOutputIDReusesOnePoolSlot(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	require.NoError(t, err)
+
+	now := time.Now()
+	body := strings.Repeat("z", 40)
+
+	// Cross the promotion threshold with distinct throwaway OutputIDs of the same size.
+	breakeven := store.pool.Breakeven()
+	for i := 0; i < breakeven; i++ {
+		require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+			testItem(fmt.Sprintf("throwaway-action-%d", i), fmt.Sprintf("throwaway-output-%d", i), body, &now),
+		}}))
+	}
+
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("action-a", "shared-output", body, &now),
+	}}))
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("action-b", "shared-output", body, &now),
+	}}))
+
+	store.mu.Lock()
+	ieA := store.index["action-a"]
+	ieB := store.index["action-b"]
+	refCount := store.outputRefs["shared-output"]
+	store.mu.Unlock()
+
+	require.NotZero(t, ieA.PoolPage, "shared output should have been pool-backed once promoted")
+	require.Equal(t, ieA.PoolPage, ieB.PoolPage, "both actions must reuse the same slot")
+	require.Equal(t, ieA.PoolSlot, ieB.PoolSlot, "both actions must reuse the same slot")
+	require.Equal(t, 2, refCount)
+
+	// Round-trips correctly for both actions via the read path (bodyReader, not DiskPath).
+	for _, actionID := range []string{"action-a", "action-b"} {
+		var got cache.ResponseItem
+		require.NoError(t, store.Get(cache.Request{ActionIDs: []string{actionID}}, func(resp cache.ResponseItem) {
+			got = resp
+		}))
+		require.Empty(t, got.DiskPath, "pool-backed entry must not carry a plain file path")
+		rc, err := got.UncompressedBodyReader()
+		require.NoError(t, err)
+		data, err := io.ReadAll(rc)
+		require.NoError(t, err)
+		require.NoError(t, rc.Close())
+		require.Equal(t, body, string(data))
+	}
+}
+
+// TestStorePut_WithoutRecordPoolNeverPoolsEvenPastBreakeven guards the GOCACHEPROG protocol
+// safety switch: a Store built with WithoutRecordPool must keep writing plain files no matter how
+// many same-size entries accumulate, since Proxy.Get has no fallback for a pool-backed entry's
+// empty DiskPath when answering the go command directly.
+func TestStorePut_WithoutRecordPoolNeverPoolsEvenPastBreakeven(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, WithoutRecordPool())
+	require.NoError(t, err)
+
+	now := time.Now()
+	body := strings.Repeat("q", 40)
+
+	for i := 0; i < store.pool.Breakeven()+5; i++ {
+		require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+			testItem(fmt.Sprintf("action-%d", i), fmt.Sprintf("output-%d", i), body, &now),
+		}}))
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for actionID, ie := range store.index {
+		require.Zero(t, ie.PoolPage, "actionID %s must never be pool-backed with WithoutRecordPool", actionID)
+	}
 }
 
 func TestStoreMaxFileBytes_SkipsPutAndServe(t *testing.T) {

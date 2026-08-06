@@ -2,6 +2,7 @@ package local
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,14 +22,16 @@ import (
 	"time"
 
 	"github.com/vearutop/gocacheprog/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/recordpool"
 )
 
 type Store struct {
-	dir           string
-	compress      bool
-	maxDiskBytes  int64
-	maxFileBytes  int64
-	evictionDelay time.Duration
+	dir            string
+	compress       bool
+	maxDiskBytes   int64
+	maxFileBytes   int64
+	manifestMaxAge time.Duration
+	evictionDelay  time.Duration
 
 	mu                    sync.Mutex
 	index                 map[string]indexEntry
@@ -39,6 +42,18 @@ type Store struct {
 	currentDiskBytes      int64
 	evictionScheduled     bool
 	lastEvictionUnixMicro int64
+
+	// pool packs small records (see recordpool.Pool) instead of one file per output, once a
+	// given size has demonstrably earned it. outputLocs is the in-memory index from OutputID to
+	// where its (single, deduplicated) copy lives -- needed because storage here is
+	// content-addressed by OutputID, not by the ActionID keys in index: many ActionIDs can share
+	// one OutputID, and putOne must reuse that one copy's location rather than writing (and
+	// potentially pool-allocating) the same content again for every ActionID that references it.
+	// Rebuilt from s.index and the pool's own directory at startup (see rebuildStorageState);
+	// nothing pool-related is persisted separately.
+	pool         *recordpool.Pool
+	outputLocs   map[string]recordpool.Loc
+	poolDisabled bool
 
 	prevStats     string
 	hits          int64
@@ -61,6 +76,12 @@ type indexEntry struct {
 	AccessTimeMicro int64  `json:"a,omitempty"`
 	Compressed      int64  `json:"c,omitempty"`
 	WireSize        int64  `json:"w,omitempty"`
+
+	// PoolPage == 0 means "plain file at OutputFilename(OutputID)" -- today's behavior,
+	// untouched. Redundant across every ActionID entry sharing one OutputID (see outputLocs
+	// above), which is harmless: it's derived, never the source of truth for freeing storage.
+	PoolPage uint32 `json:"pp,omitempty"`
+	PoolSlot uint32 `json:"ps,omitempty"`
 }
 
 type actionIndexEntry struct {
@@ -73,6 +94,18 @@ type StoreOption func(*Store)
 func WithCompression() StoreOption {
 	return func(s *Store) {
 		s.compress = true
+	}
+}
+
+// WithoutRecordPool disables record-pool packing for small entries, keeping every entry a plain
+// file with a real on-disk path. Required wherever this Store answers the actual GOCACHEPROG
+// protocol directly (see Proxy.Get): the go command reads Response.DiskPath itself, in a separate
+// process, and there is no fallback if it's empty -- a pool-backed entry only ever offers a
+// bodyReader, never a real path. Safe to omit for a Store that only ever streams response bytes
+// over HTTP instead (the remote cache server), since that path doesn't need DiskPath at all.
+func WithoutRecordPool() StoreOption {
+	return func(s *Store) {
+		s.poolDisabled = true
 	}
 }
 
@@ -94,6 +127,15 @@ func WithEvictionDelay(evictionDelay time.Duration) StoreOption {
 	}
 }
 
+// WithManifestMaxAge sets how long a manifest file may go unwritten before it's deleted by
+// collectStaleManifests. Unlike cache objects, manifests are never touched again once their
+// commit/PR/changes stream goes cold, so nothing else ever prunes them.
+func WithManifestMaxAge(manifestMaxAge time.Duration) StoreOption {
+	return func(s *Store) {
+		s.manifestMaxAge = manifestMaxAge
+	}
+}
+
 func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	dir, err := toAbsPath(dir)
 	if err != nil {
@@ -101,28 +143,26 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	}
 
 	dc := &Store{
-		dir:           dir,
-		evictionDelay: 5 * time.Minute,
-		index:         make(map[string]indexEntry),
-		outputRefs:    make(map[string]int),
-		outputSizes:   make(map[string]int64),
+		dir:            dir,
+		manifestMaxAge: 5 * 24 * time.Hour,
+		evictionDelay:  5 * time.Minute,
+		index:          make(map[string]indexEntry),
+		outputRefs:     make(map[string]int),
+		outputSizes:    make(map[string]int64),
+		outputLocs:     make(map[string]recordpool.Loc),
 	}
 	for _, opt := range opts {
 		opt(dc)
 	}
+	dc.pool = recordpool.New(filepath.Join(dir, "records"))
 
 	indexPath := dc.indexPath()
 	d, err := os.ReadFile(indexPath) //nolint:gosec // indexPath is derived from the configured cache dir.
 	if err != nil {
-		if os.IsNotExist(err) {
-			dc.ready = true
-			return dc, nil
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read %s: %w", indexPath, err)
 		}
-		return nil, fmt.Errorf("read %s: %w", indexPath, err)
-	}
-
-	err = json.Unmarshal(d, &dc.index)
-	if err != nil {
+	} else if err := json.Unmarshal(d, &dc.index); err != nil {
 		return nil, fmt.Errorf("unmarshal %s: %w", indexPath, err)
 	}
 	if dc.maxFileBytes > 0 {
@@ -209,14 +249,34 @@ func (dc *Store) responseItem(actionID string, ie indexEntry) cache.ResponseItem
 
 	res.OutputID = ie.OutputID
 	res.Size = ie.Size
-	res.DiskPath = dc.outputPathForRead(ie.OutputID)
 	res.IsCompressed = ie.Compressed == 1
 	res.WireSize = ie.WireSize
+
+	if ie.PoolPage != 0 {
+		res.SetBodyReader(dc.poolBodyReader(ie))
+	} else {
+		res.DiskPath = dc.outputPathForRead(ie.OutputID)
+	}
 
 	t := time.UnixMicro(ie.TimeMicro)
 	res.Time = &t
 
 	return res
+}
+
+// poolBodyReader returns a body reader for a pool-backed entry, for the two call sites that need
+// one (responseItem for Get/Preload, verifyOutput for IntegrityCheck).
+func (dc *Store) poolBodyReader(ie indexEntry) func() (io.ReadCloser, error) {
+	recordSize := dc.entryStoredSize(ie)
+	loc := recordpool.Loc{Page: ie.PoolPage, Slot: ie.PoolSlot}
+
+	return func() (io.ReadCloser, error) {
+		buf, err := dc.pool.Read(recordSize, loc)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(bytes.NewReader(buf)), nil
+	}
 }
 
 func (dc *Store) Put(values cache.Response) error {
@@ -234,7 +294,6 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 		return nil
 	}
 
-	outputFile := dc.OutputFilename(item.OutputID)
 	now := time.Now().UTC()
 
 	if item.OutputID == "" {
@@ -245,6 +304,8 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 
 	dc.mu.Lock()
 	existingEntry, hadExisting := dc.index[item.ActionID]
+	existingOutputLoc := dc.outputLocs[item.OutputID] // zero value if this output isn't pool-backed
+	_, outputRefExists := dc.outputRefs[item.OutputID]
 	dc.mu.Unlock()
 
 	if hadExisting {
@@ -294,20 +355,62 @@ func (dc *Store) putOne(item cache.ResponseItem) error {
 		return fmt.Errorf("get reader for put: %w", err)
 	}
 
-	if err := writeAtomic(outputFile, rd); err != nil {
+	newStoredSize := dc.entryStoredSize(ie)
+
+	var loc recordpool.Loc
+
+	//nolint:nestif // storage-destination combinations are clearer as explicit branches.
+	if outputRefExists {
+		// Content-addressed: this OutputID is already stored somewhere, whether by an earlier
+		// ActionID sharing it or a previous put of this same ActionID. Reuse that one copy's
+		// location instead of writing (and, if pool-backed, allocating) the same bytes again --
+		// still drain rd so its underlying body reader/upload machinery finishes cleanly, the
+		// same bytes writeAtomic would otherwise have consumed.
+		if rd != nil {
+			if _, err := io.Copy(io.Discard, rd); err != nil {
+				atomic.AddInt64(&dc.errors, 1)
+				return fmt.Errorf("drain body for already-stored output: %w", err)
+			}
+		}
+		loc = existingOutputLoc
+	} else if !dc.poolDisabled && newStoredSize > 0 && newStoredSize <= dc.pool.MaxRecordBytes() {
+		body, err := io.ReadAll(rd)
+		if err != nil {
+			atomic.AddInt64(&dc.errors, 1)
+			return fmt.Errorf("read body for put: %w", err)
+		}
+		if int64(len(body)) != newStoredSize {
+			atomic.AddInt64(&dc.errors, 1)
+			return fmt.Errorf("put body length %d does not match expected %d", len(body), newStoredSize)
+		}
+
+		poolLoc, ok, poolErr := dc.pool.Put(newStoredSize, body)
+		if poolErr != nil {
+			atomic.AddInt64(&dc.errors, 1)
+			return fmt.Errorf("write pooled record: %w", poolErr)
+		}
+		if ok {
+			loc = poolLoc
+		} else if err := writeAtomic(dc.OutputFilename(item.OutputID), bytes.NewReader(body)); err != nil {
+			atomic.AddInt64(&dc.errors, 1)
+			println("atomic write:", err.Error())
+			return fmt.Errorf("atomic write: %w", err)
+		}
+	} else if err := writeAtomic(dc.OutputFilename(item.OutputID), rd); err != nil {
 		atomic.AddInt64(&dc.errors, 1)
 		println("atomic write:", err.Error())
 		return fmt.Errorf("atomic write: %w", err)
 	}
 
+	ie.PoolPage, ie.PoolSlot = loc.Page, loc.Slot
+
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	newStoredSize := dc.entryStoredSize(ie)
 	if hadExisting {
-		dc.replaceOutputRefLocked(existingEntry, ie, newStoredSize)
+		dc.replaceOutputRefLocked(existingEntry, ie, newStoredSize, loc)
 	} else {
-		dc.addOutputRefLocked(ie.OutputID, newStoredSize)
+		dc.addOutputRefLocked(ie.OutputID, newStoredSize, loc)
 	}
 	dc.index[item.ActionID] = ie
 	dc.dirty = true
@@ -387,21 +490,23 @@ func removeStaleTemp(path string) {
 }
 
 func (dc *Store) Close() error {
+	poolErr := dc.pool.Close()
+
 	if !dc.ready || !dc.dirty {
-		return nil
+		return poolErr
 	}
 
 	d, err := json.Marshal(dc.index)
 	if err != nil {
-		return err
+		return errors.Join(poolErr, err)
 	}
 
 	if err := writeFileAtomic(dc.indexPath(), d, 0o600); err != nil {
-		return err
+		return errors.Join(poolErr, err)
 	}
 
 	dc.dirty = false
-	return nil
+	return poolErr
 }
 
 func (dc *Store) OutputFilename(outputID string) string {
@@ -532,9 +637,14 @@ func (dc *Store) verifyOutput(ie indexEntry) error {
 	item := cache.ResponseItem{
 		OutputID:     ie.OutputID,
 		Size:         ie.Size,
-		DiskPath:     dc.outputPathForRead(ie.OutputID),
 		IsCompressed: ie.Compressed == 1,
 		WireSize:     ie.WireSize,
+	}
+
+	if ie.PoolPage != 0 {
+		item.SetBodyReader(dc.poolBodyReader(ie))
+	} else {
+		item.DiskPath = dc.outputPathForRead(ie.OutputID)
 	}
 
 	rd, err := item.UncompressedBodyReader()
@@ -880,22 +990,52 @@ func (dc *Store) outputPathForRead(outputID string) string {
 	return path
 }
 
+// rebuildStorageState discovers existing pool pages, then makes one pass over the already-loaded
+// index to rebuild outputRefs/outputSizes/outputLocs and the pool's own free lists/promotion
+// counters. An entry whose PoolPage/PoolSlot no longer resolves to anything on disk is dropped --
+// the same treatment a plain file that's gone missing already gets, just enforced rather than
+// silently trusted (see outputFileSize), since there's no size to fall back to for a dangling
+// pool location the way there is for a plain file.
 func (dc *Store) rebuildStorageState() error {
+	if err := dc.pool.DiscoverPages(); err != nil {
+		return err
+	}
+
 	seen := map[string]struct{}{}
-	for _, ie := range dc.index {
+	for actionID, ie := range dc.index {
+		size := dc.entryStoredSize(ie)
+		loc := recordpool.Loc{Page: ie.PoolPage, Slot: ie.PoolSlot}
+
+		if !dc.pool.Valid(size, loc) {
+			delete(dc.index, actionID)
+			dc.dirty = true
+			continue
+		}
+
 		dc.outputRefs[ie.OutputID]++
 		if _, ok := seen[ie.OutputID]; ok {
 			continue
 		}
 		seen[ie.OutputID] = struct{}{}
 
-		size, err := dc.outputFileSize(ie)
-		if err != nil {
-			return err
+		if loc.IsZero() {
+			dc.pool.NoteUnpromoted(size)
+
+			fileSize, err := dc.outputFileSize(ie)
+			if err != nil {
+				return err
+			}
+			dc.outputSizes[ie.OutputID] = fileSize
+			dc.currentDiskBytes += fileSize
+		} else {
+			dc.pool.NoteOccupied(size, loc)
+			dc.outputLocs[ie.OutputID] = loc
+			dc.outputSizes[ie.OutputID] = size
+			dc.currentDiskBytes += size
 		}
-		dc.outputSizes[ie.OutputID] = size
-		dc.currentDiskBytes += size
 	}
+
+	dc.pool.FinishReconcile()
 
 	return nil
 }
@@ -920,16 +1060,21 @@ func (dc *Store) entryStoredSize(ie indexEntry) int64 {
 	return ie.Size
 }
 
-func (dc *Store) addOutputRefLocked(outputID string, size int64) {
+func (dc *Store) addOutputRefLocked(outputID string, size int64, loc recordpool.Loc) {
 	if dc.outputRefs[outputID] == 0 {
 		dc.outputSizes[outputID] = size
 		dc.currentDiskBytes += size
+		if !loc.IsZero() {
+			dc.outputLocs[outputID] = loc
+		}
 	}
 	dc.outputRefs[outputID]++
 }
 
-func (dc *Store) replaceOutputRefLocked(oldEntry indexEntry, newEntry indexEntry, newStoredSize int64) {
+func (dc *Store) replaceOutputRefLocked(oldEntry indexEntry, newEntry indexEntry, newStoredSize int64, loc recordpool.Loc) {
 	if oldEntry.OutputID == newEntry.OutputID {
+		// Content-addressed: an unchanged OutputID means unchanged bytes, so the location (if
+		// any) can't have changed either -- only the size bookkeeping might need a touch-up.
 		oldSize := dc.outputSizes[oldEntry.OutputID]
 		dc.outputSizes[oldEntry.OutputID] = newStoredSize
 		dc.currentDiskBytes += newStoredSize - oldSize
@@ -937,15 +1082,22 @@ func (dc *Store) replaceOutputRefLocked(oldEntry indexEntry, newEntry indexEntry
 	}
 
 	dc.releaseOutputRefLocked(oldEntry.OutputID)
-	dc.addOutputRefLocked(newEntry.OutputID, newStoredSize)
+	dc.addOutputRefLocked(newEntry.OutputID, newStoredSize, loc)
 }
 
 func (dc *Store) releaseOutputRefLocked(outputID string) {
 	refCount := dc.outputRefs[outputID]
 	if refCount <= 1 {
 		delete(dc.outputRefs, outputID)
-		dc.currentDiskBytes -= dc.outputSizes[outputID]
+		size := dc.outputSizes[outputID]
+		dc.currentDiskBytes -= size
 		delete(dc.outputSizes, outputID)
+
+		if loc, ok := dc.outputLocs[outputID]; ok {
+			dc.pool.Free(size, loc)
+			delete(dc.outputLocs, outputID)
+			return
+		}
 
 		path := dc.outputPathForRead(outputID)
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -958,7 +1110,10 @@ func (dc *Store) releaseOutputRefLocked(outputID string) {
 }
 
 func (dc *Store) scheduleEvictionLocked() {
-	if dc.maxDiskBytes <= 0 || dc.currentDiskBytes <= dc.maxDiskBytes || dc.evictionScheduled {
+	if dc.evictionScheduled {
+		return
+	}
+	if dc.manifestMaxAge <= 0 && (dc.maxDiskBytes <= 0 || dc.currentDiskBytes <= dc.maxDiskBytes) {
 		return
 	}
 
@@ -968,10 +1123,87 @@ func (dc *Store) scheduleEvictionLocked() {
 		time.Sleep(delay)
 
 		dc.mu.Lock()
-		defer dc.mu.Unlock()
 		dc.evictionScheduled = false
 		dc.evictIfNeededLocked()
+		dc.mu.Unlock()
+
+		// Pure filesystem work over dir/manifests, unrelated to the in-memory index/
+		// currentDiskBytes that evictIfNeededLocked guards, so it runs without dc.mu held.
+		dc.collectStaleManifests()
 	}()
+}
+
+// collectStaleManifests deletes manifest files under dir/manifests whose mtime is older than
+// manifestMaxAge. See gocache.Store.collectStaleManifests for why nothing else ever prunes them.
+func (dc *Store) collectStaleManifests() {
+	if dc.manifestMaxAge <= 0 {
+		return
+	}
+
+	files, err := listManifestFiles(filepath.Join(dc.dir, "manifests"))
+	if err != nil {
+		log.Printf("collect stale manifests: list %s: %s", dc.dir, err.Error())
+		return
+	}
+
+	cutoff := time.Now().UTC().Add(-dc.manifestMaxAge)
+	removed := 0
+
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("collect stale manifests: stat %s: %s", path, err.Error())
+			}
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("collect stale manifests: remove %s: %s", path, err.Error())
+			continue
+		}
+		removed++
+	}
+
+	if removed > 0 {
+		log.Printf("collect stale manifests: removed %d manifest(s) older than %s", removed, humanDuration(dc.manifestMaxAge))
+	}
+}
+
+// humanDuration renders d without Duration.String()'s trailing zero minute/second units for the
+// common case of a whole-hour config value (e.g. "120h" instead of "120h0m0s"). Trimming the
+// literal "0m0s" suffix is only safe because the guard above guarantees minutes are exactly zero
+// whenever it fires -- unconditionally, it could also strip a real "30m0s" down to "3".
+func humanDuration(d time.Duration) string {
+	if d > 0 && d%time.Hour == 0 {
+		return strings.TrimSuffix(d.String(), "0m0s")
+	}
+	return d.String()
+}
+
+func listManifestFiles(root string) ([]string, error) {
+	var files []string
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || strings.HasSuffix(d.Name(), ".tmp") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return files, nil
 }
 
 func (dc *Store) evictIfNeededLocked() {

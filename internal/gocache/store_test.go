@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vearutop/gocacheprog/internal/recordpool"
 )
 
 func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
@@ -51,6 +53,37 @@ func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 	require.Equal(t, "", string(manifestBody))
 }
 
+// TestStoreRestore_SurvivesSelfHealWriteFailure covers a disk-full-on-the-remote scenario: pruning
+// a missing manifest entry marks the manifest "changed" and Restore tries to write the cleaned
+// version back (see TestStoreRestore_PrunesMissingManifestEntries), but that write-back is pure
+// housekeeping. If it fails (e.g. no space left on device), the already-computed, already-correct
+// in-memory result must still be served rather than turning a successful restore into an error.
+func TestStoreRestore_SurvivesSelfHealWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "commit123"}, "ab/cache-entry-a", "payload-a")
+	saveItemForTest(t, store, Request{Commit: "commit123"}, "cd/cache-entry-b", "payload-b")
+
+	manifestPath, err := store.commitManifestPath("commit123", "")
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(store.objectPath("ab/cache-entry-a")))
+
+	manifestDir := filepath.Dir(manifestPath)
+	require.NoError(t, os.Chmod(manifestDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(manifestDir, 0o750) })
+
+	var restored []string
+	sources, err := store.Restore(Request{Commit: "commit123"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"commit"}, sources)
+	require.Equal(t, []string{"cd/cache-entry-b"}, restored)
+}
+
 func saveItemForTest(t *testing.T, store *Store, req Request, path, body string) {
 	t.Helper()
 
@@ -60,6 +93,109 @@ func saveItemForTest(t *testing.T, store *Store, req Request, path, body string)
 	})
 
 	require.NoError(t, store.Save(req, Batch{Items: []FileItem{item}}))
+}
+
+// TestPoolPromotion_PacksSmallRecordsAndRoundTrips covers dynamic promotion end to end: a size
+// stays plain files below the pool's breakeven, the item that crosses the threshold lands
+// straight in a freshly created page instead of one more plain file, and the read path
+// (responseItem's bodyReader closure, not DiskPath) serves the exact bytes back.
+func TestPoolPromotion_PacksSmallRecordsAndRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	breakeven := store.pool.Breakeven()
+	body := strings.Repeat("x", 50)
+	// breakeven-1 plain files: the pool's internal count reaches breakeven-1, still below the
+	// promotion threshold.
+	for i := 0; i < breakeven-1; i++ {
+		saveItemForTest(t, store, Request{Commit: "c"}, fmt.Sprintf("ab/item-%d", i), body)
+	}
+
+	pagePath := filepath.Join(dir, "records", recordpool.PageFileName(50, 1))
+	require.NoFileExists(t, pagePath)
+
+	// The breakeven-th same-size item crosses the threshold and lands in slot 0 of a fresh page.
+	promotingPath := "cd/item-promoting"
+	saveItemForTest(t, store, Request{Commit: "c"}, promotingPath, body)
+	require.FileExists(t, pagePath)
+
+	store.mu.Lock()
+	ie := store.index[promotingPath]
+	store.mu.Unlock()
+	require.NotZero(t, ie.PoolPage)
+
+	var restoredBody string
+	_, err = store.Restore(Request{Commit: "c"}, func(item FileItem) {
+		if item.Path != promotingPath {
+			return
+		}
+		require.Empty(t, item.DiskPath, "pool-backed item must not carry a plain file path")
+		rc, rerr := item.UncompressedBodyReader()
+		require.NoError(t, rerr)
+		data, rerr := io.ReadAll(rc)
+		require.NoError(t, rerr)
+		require.NoError(t, rc.Close())
+		restoredBody = string(data)
+	})
+	require.NoError(t, err)
+	require.Equal(t, body, restoredBody)
+}
+
+// TestPool_PageRemovedWhenFullyEmptied covers the self-cleaning side of the record pool: once
+// every record in a page has been freed, the page file itself is deleted rather than left around
+// hollow.
+func TestPool_PageRemovedWhenFullyEmptied(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	breakeven := store.pool.Breakeven()
+	body := strings.Repeat("y", 60)
+	// breakeven-1 plain files, then a handful more that land in the pool once promoted --
+	// exercises several slots in the same page, not just the one that triggered promotion.
+	const extraPooledItems = 5
+	for i := 0; i < breakeven-1+extraPooledItems; i++ {
+		saveItemForTest(t, store, Request{Commit: "c2"}, fmt.Sprintf("ab/entry-%d", i), body)
+	}
+
+	pagePath := filepath.Join(dir, "records", recordpool.PageFileName(60, 1))
+	require.FileExists(t, pagePath)
+
+	_, err = store.Clear(Request{Commit: "c2"})
+	require.NoError(t, err)
+
+	require.NoFileExists(t, pagePath)
+}
+
+// TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff covers the age-based manifest
+// collector: manifests are never touched again once their commit/PR goes cold, so unlike cache
+// objects nothing else ever prunes them (see collectStaleManifests).
+func TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression(), WithManifestMaxAge(24*time.Hour))
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "stale-commit"}, "ab/stale", "payload")
+	saveItemForTest(t, store, Request{Commit: "fresh-commit"}, "cd/fresh", "payload")
+
+	staleManifest, err := store.commitManifestPath("stale-commit", "")
+	require.NoError(t, err)
+	freshManifest, err := store.commitManifestPath("fresh-commit", "")
+	require.NoError(t, err)
+
+	old := time.Now().Add(-48 * time.Hour)
+	require.NoError(t, os.Chtimes(staleManifest, old, old))
+
+	store.collectStaleManifests()
+
+	_, err = os.Stat(staleManifest)
+	require.True(t, os.IsNotExist(err))
+	_, err = os.Stat(freshManifest)
+	require.NoError(t, err)
 }
 
 // TestStoreRestore_FallsBackToNewestManifestWhenNoSourceMatches covers a cold-start scenario:

@@ -97,12 +97,14 @@ Usage of ./bin/gocacheprog:
         current commit SHA used to upload cache usage manifest
   -dump-log string
         dump req/resp logs to file
-  -fallback-auth string
+  -auth-fallback string
         server mode: additional bearer token accepted alongside -auth-token, for migrating clients to a new token without downtime
   -github-actions-done
         finalize caching started by -github-actions-init in an always() step
   -github-actions-init string
         set up caching for a GitHub Actions job from a single DSN; see internal/local/github_actions.go for the DSN format
+  -gocache-manifest-max-age duration
+        server mode: same as -manifest-max-age but for native GOCACHE manifests (default 120h0m0s)
   -gocache-max-age duration
         maximum age for native GOCACHE objects on the remote server; 0 disables age-based retirement (default 48h0m0s)
   -gocache-max-disk-bytes int
@@ -115,6 +117,8 @@ Usage of ./bin/gocacheprog:
         public hostname for automatic Let's Encrypt certificates
   -job-start-unix int
         job start Unix timestamp in nanoseconds for -save-cache; when empty, read the marker written by -restore-cache
+  -manifest-max-age duration
+        server mode: maximum age for manifest files with no restore/save activity before they're deleted; 0 disables manifest collection (default 120h0m0s)
   -max-disk-bytes int
         optional total on-disk cache size limit in bytes; 0 disables eviction
   -max-file-bytes int
@@ -483,23 +487,62 @@ In native `GOCACHE` batch mode, both `commit` and `changes-id` manifests are mer
 
 In daemon mode this becomes naturally simpler because one daemon owns the whole local session.
 
-## Local Cache Layout
+## Storage structure
 
-Remote entries and manifests are separated on disk.
-
-Cache objects live under:
+Server mode (`-http`/`-https`) manages two independent stores under one `-cache-dir`:
 
 ```text
-entries/<prefix>/<output-id>
+<cache-dir>/
+  index.json              # hash-cache store's index (ActionID -> OutputID + metadata)
+  entries/<prefix>/<output-id>
+  manifests/<scope>/...
+  records/records.<size>.p<N>.bin
+  native-gocache/
+    index.json            # native GOCACHE store's own index (relPath -> metadata)
+    objects/<prefix>/<hash>
+    manifests/<scope>/...
+    records/records.<size>.p<N>.bin
 ```
 
-Manifests live under:
+Each store keeps cache objects, manifests, and its index separated on disk so cached blobs never mix with sidecar metadata:
 
-```text
-manifests/<scope>/...
+- `entries/` (hash-cache store) / `objects/` (native GOCACHE store) hold the actual cached bytes, one file per key, sharded by a short prefix of the key.
+- `manifests/` hold per-`commit`/per-`changes-id`/per-`build-type` lists of which keys are still relevant to restore; see [Manifest Model](#manifest-model).
+- `index.json` is the full index, flushed to disk only on a clean shutdown -- see [Everything is reconciled, nothing extra persisted](#everything-is-reconciled-nothing-extra-persisted) for what that means across a crash.
+- `records/` is the record pool described next, present only where pooling is enabled (see below).
+
+### Record pool: packing small entries
+
+A plain file costs at least one filesystem block (typically 4096 bytes) on disk regardless of how small its content is. Investigating a real remote server's disk usage found a workload whose object sizes clustered overwhelmingly around one exact byte count -- hundreds of thousands of ~175-byte Go build-cache action records -- rounded up to a full block each, wasting hundreds of megabytes on data that was barely tens of megabytes in reality.
+
+`internal/recordpool` fixes that by packing many same-size records into a handful of shared, pre-sized page files instead of one file per record:
+
+- Records are grouped by **exact size**, not a size range -- a size only earns its own page set (a "class") once it demonstrably needs one.
+- **Promotion is dynamic and self-correcting.** A size stays plain files until the count of same-size plain files crosses a breakeven point (`page size / 4096`; 2048 at the 8MB default page size) -- below that, a whole page would cost more than the block-rounding waste it eliminates, so nothing gets packed. A promoted size is never un-promoted, but if every record in it is later evicted, its pages are deleted too and it looks exactly like a size that was never promoted -- ready to re-promote if it becomes common again.
+- Each page (`records.<size>.p<N>.bin`) is fixed-length and eagerly written in full on creation, not just given a length -- it either exists fully-sized or doesn't exist at all, so there's no partial-page state to reconcile after a crash.
+- Allocation is first-fit into the oldest page with a free slot, so pages stay dense as records churn instead of always growing the newest page while earlier ones go sparse. A page that empties out completely is deleted rather than left around hollow.
+- A pool-backed index entry carries a page/slot pointer; `0` means "plain file, unchanged from before pooling existed." Nothing about which slots are free or which sizes are promoted is ever persisted separately -- both are rebuilt from the index and a directory listing of `records/` once, at startup.
+
+**Not used in daemon/direct mode.** The `GOCACHEPROG` protocol that `go build` talks to directly needs a real file path for every cache hit -- it reads the response's disk path itself, out of process, with no fallback to a byte stream (the same constraint already keeps daemon-local files uncompressed; see [Compression](#compression)). A pool-backed record only ever offers a stream, not a path, so record-pool packing is enabled only for the HTTP server's stores; direct mode, daemon mode, and `-github-actions-init` always construct their local store with pooling disabled.
+
+### Manifest collection
+
+Manifests are cheap individually but easy to leave behind: a manifest for a closed PR or an abandoned branch is never restored from again, so nothing naturally revisits it to notice it's gone stale. Left alone, they accumulate forever.
+
+Both stores age out manifest files that haven't been written to (including a self-heal rewrite triggered by a restore) in 5 days by default:
+
+```bash
+gocacheprog -http :8080 -manifest-max-age 120h          # hash-cache store's own manifests
+gocacheprog -http :8080 -gocache-manifest-max-age 120h   # native GOCACHE store's manifests
 ```
 
-This avoids mixing actual cached blobs with sidecar metadata.
+Set either to `0` to disable manifest collection for that store.
+
+### Everything is reconciled, nothing extra persisted
+
+Free lists, promotion counts, and which pool pages exist are never written to disk as their own record -- every one of them is derived, every time, from two things already trusted: the index and a listing of what's actually on disk. Plain-file existence checks work the same way.
+
+That keeps startup recovery uniform, and it means a crash between writes degrades gracefully instead of corrupting anything: an object written but never captured in `index.json` before a crash was already unreachable either way, and under record pooling its slot becomes eligible for reuse on the next startup instead of leaking forever the way an orphaned plain file would.
 
 ## Eviction
 
@@ -571,6 +614,12 @@ Client:
 gocacheprog -auth-token secret-token ...
 ```
 
+`-auth-token` falls back to `$GOCACHEPROG_AUTH` when not passed explicitly, so a token doesn't have to appear in a process's argv (visible via `ps`) or in a CI step's logged command line:
+
+```bash
+GOCACHEPROG_AUTH=secret-token gocacheprog ...
+```
+
 If auth is wrong or missing, client startup reports:
 
 ```text
@@ -586,14 +635,14 @@ curl -H "Authorization: Bearer secret-token" https://cache.example.com/status
 
 ### Rotating the token
 
-`-fallback-auth` lets the server accept a second token alongside `-auth-token`, so clients can be
+`-auth-fallback` lets the server accept a second token alongside `-auth-token`, so clients can be
 migrated to a new token one at a time without downtime:
 
 ```bash
-gocacheprog -http :8080 -auth-token new-token -fallback-auth old-token
+gocacheprog -http :8080 -auth-token new-token -auth-fallback old-token
 ```
 
-Once every client has switched to `new-token`, drop `-fallback-auth`.
+Once every client has switched to `new-token`, drop `-auth-fallback`.
 
 Without it (or with the wrong token), every endpoint responds `401 unauthorized`:
 

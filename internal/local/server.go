@@ -24,11 +24,15 @@ import (
 
 func RunServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *Store, nativeStore *gocache.Store, authToken, fallbackAuthToken string, preloadLimit int) error {
 	h := cachehttp.NewHandlerWithPreloadLimit(store, nativeStore, authToken, fallbackAuthToken, preloadLimit)
+	printStats := func() {
+		store.PrintStats()
+		nativeStore.PrintStats()
+	}
 	if httpsHost == "" {
-		return serveHTTP(httpListen, h, store.PrintStats)
+		return serveHTTP(httpListen, h, printStats)
 	}
 
-	return serveHTTPAndHTTPS(httpListen, httpsListen, httpsHost, certCacheDir, h, store.PrintStats)
+	return serveHTTPAndHTTPS(httpListen, httpsListen, httpsHost, certCacheDir, h, printStats)
 }
 
 func serveHTTP(listen string, h nethttp.Handler, printStats func()) error {

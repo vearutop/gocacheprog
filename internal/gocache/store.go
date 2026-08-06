@@ -21,10 +21,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/vearutop/gocacheprog/internal/cache"
+	"github.com/vearutop/gocacheprog/internal/recordpool"
 )
 
 const (
@@ -91,12 +93,13 @@ type InspectStats struct {
 }
 
 type Store struct {
-	dir           string
-	compress      bool
-	maxDiskBytes  int64
-	maxFileBytes  int64
-	maxAge        time.Duration
-	evictionDelay time.Duration
+	dir            string
+	compress       bool
+	maxDiskBytes   int64
+	maxFileBytes   int64
+	maxAge         time.Duration
+	manifestMaxAge time.Duration
+	evictionDelay  time.Duration
 
 	mu                    sync.Mutex
 	index                 map[string]indexEntry
@@ -105,6 +108,11 @@ type Store struct {
 	currentDiskBytes      int64
 	evictionScheduled     bool
 	lastEvictionUnixMicro int64
+
+	// pool packs small records (see recordpool.Pool) instead of one file per object, once a
+	// given size has demonstrably earned it. Rebuilt from s.index and its own directory at
+	// startup (see reconcilePoolLocked); nothing pool-related is persisted separately.
+	pool *recordpool.Pool
 
 	prevStats string
 	hits      int64
@@ -121,6 +129,12 @@ type indexEntry struct {
 	Compressed      int64  `json:"c,omitempty"`
 	ModTimeMicro    int64  `json:"m,omitempty"`
 	AccessTimeMicro int64  `json:"a,omitempty"`
+
+	// PoolPage == 0 means "plain file at objectPath(relPath)" -- today's behavior, untouched.
+	// The record size isn't stored here: it's always entryStoredSize(ie), so it can't drift out
+	// of sync with Size/WireSize.
+	PoolPage uint32 `json:"pp,omitempty"`
+	PoolSlot uint32 `json:"ps,omitempty"`
 }
 
 type restoreEntry struct {
@@ -159,6 +173,16 @@ func WithMaxAge(maxAge time.Duration) StoreOption {
 	}
 }
 
+// WithManifestMaxAge sets how long a manifest file may go unwritten before it's deleted by
+// collectStaleManifests. Unlike cache objects, manifests are never touched again once their
+// commit/PR/changes stream goes cold (loadManifest's self-heal only runs when something actually
+// restores from that manifest), so nothing else ever prunes them.
+func WithManifestMaxAge(manifestMaxAge time.Duration) StoreOption {
+	return func(s *Store) {
+		s.manifestMaxAge = manifestMaxAge
+	}
+}
+
 func WithEvictionDelay(evictionDelay time.Duration) StoreOption {
 	return func(s *Store) {
 		s.evictionDelay = evictionDelay
@@ -172,29 +196,35 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	}
 
 	s := &Store{
-		dir:           dir,
-		maxAge:        48 * time.Hour,
-		evictionDelay: 5 * time.Minute,
-		index:         make(map[string]indexEntry),
+		dir:            dir,
+		maxAge:         48 * time.Hour,
+		manifestMaxAge: 5 * 24 * time.Hour,
+		evictionDelay:  5 * time.Minute,
+		index:          make(map[string]indexEntry),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.pool = recordpool.New(filepath.Join(dir, "records"))
 
 	data, err := os.ReadFile(s.indexPath())
 	if err != nil {
-		if os.IsNotExist(err) {
-			s.ready = true
-			return s, nil
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read index: %w", err)
 		}
-		return nil, fmt.Errorf("read index: %w", err)
-	}
-
-	if err := json.Unmarshal(data, &s.index); err != nil {
+	} else if err := json.Unmarshal(data, &s.index); err != nil {
 		return nil, fmt.Errorf("unmarshal index: %w", err)
 	}
 
+	if err := s.reconcilePoolLocked(); err != nil {
+		return nil, fmt.Errorf("reconcile record pool: %w", err)
+	}
+
 	for path, ie := range s.index {
+		if ie.PoolPage != 0 {
+			s.currentDiskBytes += s.entryStoredSize(ie)
+			continue
+		}
 		if !s.objectExistsLocked(path) {
 			delete(s.index, path)
 			s.dirty = true
@@ -745,6 +775,8 @@ func (s *Store) Restore(req Request, cb func(FileItem)) ([]string, error) {
 			Compressed:      ie.Compressed,
 			ModTimeMicro:    ie.ModTimeMicro,
 			AccessTimeMicro: nowUnixMicro,
+			PoolPage:        ie.PoolPage,
+			PoolSlot:        ie.PoolSlot,
 		}
 		s.dirty = true
 
@@ -841,8 +873,10 @@ func (s *Store) Clear(req Request) (ClearStats, error) {
 			delete(s.index, relPath)
 			s.currentDiskBytes -= s.entryStoredSize(ie)
 			s.dirty = true
-		}
-		if err := os.Remove(s.objectPath(relPath)); err != nil && !os.IsNotExist(err) {
+			if err := s.removeObjectLocked(relPath, ie); err != nil {
+				return stats, fmt.Errorf("remove object %s: %w", relPath, err)
+			}
+		} else if err := os.Remove(s.objectPath(relPath)); err != nil && !os.IsNotExist(err) {
 			return stats, fmt.Errorf("remove object %s: %w", relPath, err)
 		}
 		stats.ObjectsDeleted++
@@ -1046,17 +1080,51 @@ func (s *Store) putOne(item FileItem) error {
 		}()
 	}
 
-	objectPath := s.objectPath(item.Path)
 	mode := item.FileMode()
 	if mode == 0 {
 		mode = 0o600
 	}
-	if err := writeAtomic(objectPath, rd, mode); err != nil {
-		atomic.AddInt64(&s.errors, 1)
-		return fmt.Errorf("write object: %w", err)
+
+	recordSize := s.entryStoredSize(ie)
+	poolEligible := recordSize > 0 && recordSize <= s.pool.MaxRecordBytes()
+
+	var body []byte
+	if poolEligible {
+		body, err = io.ReadAll(rd)
+		if err != nil {
+			atomic.AddInt64(&s.errors, 1)
+			return fmt.Errorf("read save body: %w", err)
+		}
+		if int64(len(body)) != recordSize {
+			atomic.AddInt64(&s.errors, 1)
+			return fmt.Errorf("save body length %d does not match expected %d", len(body), recordSize)
+		}
+
+		loc, ok, poolErr := s.pool.Put(recordSize, body)
+		if poolErr != nil {
+			atomic.AddInt64(&s.errors, 1)
+			return fmt.Errorf("write pooled record: %w", s.handleWriteErr(poolErr))
+		}
+		if ok {
+			ie.PoolPage, ie.PoolSlot = loc.Page, loc.Slot
+		}
 	}
-	if err := os.Chtimes(objectPath, modTime, modTime); err != nil {
-		return fmt.Errorf("set object mtime: %w", err)
+
+	if ie.PoolPage == 0 {
+		// Not pool-eligible, or the size hasn't crossed the promotion threshold yet -- plain
+		// file, same as before the record pool existed.
+		objectPath := s.objectPath(item.Path)
+		var src io.Reader = rd
+		if poolEligible {
+			src = bytes.NewReader(body)
+		}
+		if err := writeAtomic(objectPath, src, mode); err != nil {
+			atomic.AddInt64(&s.errors, 1)
+			return fmt.Errorf("write object: %w", s.handleWriteErr(err))
+		}
+		if err := os.Chtimes(objectPath, modTime, modTime); err != nil {
+			return fmt.Errorf("set object mtime: %w", err)
+		}
 	}
 
 	s.mu.Lock()
@@ -1064,6 +1132,15 @@ func (s *Store) putOne(item FileItem) error {
 
 	if hasExisting {
 		s.currentDiskBytes -= s.entryStoredSize(existing)
+		if existing.PoolPage != 0 {
+			s.pool.Free(s.entryStoredSize(existing), recordpool.Loc{Page: existing.PoolPage, Slot: existing.PoolSlot})
+		} else if ie.PoolPage != 0 {
+			// The old plain file is superseded by a pool slot now, rather than overwritten in
+			// place by writeAtomic above -- remove it explicitly.
+			if err := os.Remove(s.objectPath(item.Path)); err != nil && !os.IsNotExist(err) {
+				log.Printf("remove superseded plain object %s: %s", item.Path, err.Error())
+			}
+		}
 	}
 	s.currentDiskBytes += s.entryStoredSize(ie)
 	s.index[item.Path] = ie
@@ -1080,7 +1157,6 @@ func (s *Store) responseItem(relPath string, ie indexEntry) FileItem {
 		Mode:         ie.Mode,
 		WireSize:     ie.WireSize,
 		IsCompressed: ie.Compressed == 1,
-		DiskPath:     s.objectPath(relPath),
 	}
 	if item.WireSize == 0 {
 		item.WireSize = item.Size
@@ -1089,6 +1165,21 @@ func (s *Store) responseItem(relPath string, ie indexEntry) FileItem {
 		t := time.UnixMicro(ie.ModTimeMicro)
 		item.ModTime = &t
 	}
+
+	if ie.PoolPage != 0 {
+		recordSize := s.entryStoredSize(ie)
+		loc := recordpool.Loc{Page: ie.PoolPage, Slot: ie.PoolSlot}
+		item.SetBodyReader(func() (io.ReadCloser, error) {
+			buf, err := s.pool.Read(recordSize, loc)
+			if err != nil {
+				return nil, err
+			}
+			return io.NopCloser(bytes.NewReader(buf)), nil
+		})
+	} else {
+		item.DiskPath = s.objectPath(relPath)
+	}
+
 	return item
 }
 
@@ -1168,8 +1259,11 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 			if body != "" {
 				body += "\n"
 			}
+			// Self-heal write-back is opportunistic housekeeping (dedup/prune stale entries);
+			// paths already loaded are good regardless, so a failure here (e.g. disk full)
+			// shouldn't fail the restore.
 			if err := s.writeManifest(manifestPath, body); err != nil {
-				return nil, nil, err
+				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
 			}
 		}
 		sources = append(sources, candidate.name)
@@ -1221,8 +1315,9 @@ func (s *Store) newestFallbackPaths(buildType string, seen map[string]struct{}) 
 			body += "\n"
 		}
 
+		// See restorePaths: self-heal write-back failing shouldn't fail the restore.
 		if err := s.writeManifest(manifestPath, body); err != nil {
-			return nil, err
+			log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
 		}
 	}
 
@@ -1371,25 +1466,27 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	poolErr := s.pool.Close()
+
 	if !s.ready || !s.dirty {
-		return nil
+		return poolErr
 	}
 
 	data, err := json.Marshal(s.index)
 	if err != nil {
-		return err
+		return errors.Join(poolErr, err)
 	}
 
 	if err := os.MkdirAll(s.dir, 0o750); err != nil {
-		return err
+		return errors.Join(poolErr, err)
 	}
 
 	if err := writeFileAtomic(s.indexPath(), data, 0o600); err != nil {
-		return err
+		return errors.Join(poolErr, err)
 	}
 
 	s.dirty = false
-	return nil
+	return poolErr
 }
 
 func (s *Store) objectPath(relPath string) string {
@@ -1397,8 +1494,14 @@ func (s *Store) objectPath(relPath string) string {
 }
 
 func (s *Store) objectExistsLocked(relPath string) bool {
-	if _, ok := s.index[relPath]; !ok {
+	ie, ok := s.index[relPath]
+	if !ok {
 		return false
+	}
+	if ie.PoolPage != 0 {
+		// Pool-backed entries have no per-item file to stat; validity was already established by
+		// reconcilePoolLocked at startup and is maintained incrementally from then on.
+		return true
 	}
 	_, err := os.Stat(s.objectPath(relPath))
 	return err == nil
@@ -1415,7 +1518,7 @@ func (s *Store) scheduleEvictionLocked() {
 	if s.evictionScheduled {
 		return
 	}
-	if s.maxAge <= 0 && (s.maxDiskBytes <= 0 || s.currentDiskBytes <= s.maxDiskBytes) {
+	if s.maxAge <= 0 && s.manifestMaxAge <= 0 && (s.maxDiskBytes <= 0 || s.currentDiskBytes <= s.maxDiskBytes) {
 		return
 	}
 
@@ -1425,10 +1528,66 @@ func (s *Store) scheduleEvictionLocked() {
 		time.Sleep(delay)
 
 		s.mu.Lock()
-		defer s.mu.Unlock()
 		s.evictionScheduled = false
 		s.evictIfNeededLocked()
+		s.mu.Unlock()
+
+		// Pure filesystem work over dir/manifests, unrelated to the in-memory index/
+		// currentDiskBytes that evictIfNeededLocked guards, so it runs without s.mu held.
+		s.collectStaleManifests()
 	}()
+}
+
+// collectStaleManifests deletes manifest files under dir/manifests whose mtime is older than
+// manifestMaxAge. Manifests accumulate forever otherwise: a PR or branch that goes cold is never
+// restored from again, so loadManifest's self-heal (which only runs on an actual restore) never
+// gets a chance to even shrink it, let alone remove it.
+func (s *Store) collectStaleManifests() {
+	if s.manifestMaxAge <= 0 {
+		return
+	}
+
+	files, err := listManifestFiles(filepath.Join(s.dir, "manifests"))
+	if err != nil {
+		log.Printf("collect stale manifests: list %s: %s", s.dir, err.Error())
+		return
+	}
+
+	cutoff := time.Now().UTC().Add(-s.manifestMaxAge)
+	removed := 0
+
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("collect stale manifests: stat %s: %s", path, err.Error())
+			}
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("collect stale manifests: remove %s: %s", path, err.Error())
+			continue
+		}
+		removed++
+	}
+
+	if removed > 0 {
+		log.Printf("collect stale manifests: removed %d manifest(s) older than %s", removed, humanDuration(s.manifestMaxAge))
+	}
+}
+
+// humanDuration renders d without Duration.String()'s trailing zero minute/second units for the
+// common case of a whole-hour config value (e.g. "120h" instead of "120h0m0s"). Trimming the
+// literal "0m0s" suffix is only safe because the guard above guarantees minutes are exactly zero
+// whenever it fires -- unconditionally, it could also strip a real "30m0s" down to "3".
+func humanDuration(d time.Duration) string {
+	if d > 0 && d%time.Hour == 0 {
+		return strings.TrimSuffix(d.String(), "0m0s")
+	}
+	return d.String()
 }
 
 func (s *Store) evictIfNeededLocked() {
@@ -1442,7 +1601,7 @@ func (s *Store) evictIfNeededLocked() {
 			s.currentDiskBytes -= s.entryStoredSize(ie)
 			s.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
 			s.dirty = true
-			if err := os.Remove(s.objectPath(relPath)); err != nil && !os.IsNotExist(err) {
+			if err := s.removeObjectLocked(relPath, ie); err != nil {
 				log.Printf("remove expired native cache object %s: %v", relPath, err)
 			}
 		}
@@ -1452,32 +1611,120 @@ func (s *Store) evictIfNeededLocked() {
 		return
 	}
 
-	for s.currentDiskBytes > s.maxDiskBytes && len(s.index) > 0 {
-		var (
-			evictPath string
-			evictIE   indexEntry
-			found     bool
-		)
+	for s.currentDiskBytes > s.maxDiskBytes && s.evictOneLocked() {
+	}
+}
 
-		for relPath, ie := range s.index {
-			if !found || lruTimeMicro(ie) < lruTimeMicro(evictIE) {
-				evictPath = relPath
-				evictIE = ie
-				found = true
-			}
-		}
-		if !found {
-			return
-		}
+// evictOneLocked removes the single least-recently-used cache object regardless of maxDiskBytes
+// and reports whether one was evicted (false once the index is empty). Shared by the
+// budget-based loop above and evictOnDiskFullLocked below.
+func (s *Store) evictOneLocked() bool {
+	var (
+		evictPath string
+		evictIE   indexEntry
+		found     bool
+	)
 
-		delete(s.index, evictPath)
-		s.currentDiskBytes -= s.entryStoredSize(evictIE)
-		s.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
-		s.dirty = true
-		if err := os.Remove(s.objectPath(evictPath)); err != nil && !os.IsNotExist(err) {
-			log.Printf("remove native cache object %s: %v", evictPath, err)
+	for relPath, ie := range s.index {
+		if !found || lruTimeMicro(ie) < lruTimeMicro(evictIE) {
+			evictPath = relPath
+			evictIE = ie
+			found = true
 		}
 	}
+	if !found {
+		return false
+	}
+
+	delete(s.index, evictPath)
+	s.currentDiskBytes -= s.entryStoredSize(evictIE)
+	s.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
+	s.dirty = true
+	if err := s.removeObjectLocked(evictPath, evictIE); err != nil {
+		log.Printf("remove native cache object %s: %v", evictPath, err)
+	}
+
+	return true
+}
+
+// diskFullEvictFraction is the share of the index force-evicted, oldest first, whenever a write
+// hits ENOSPC. maxDiskBytes accounting only tracks this Store's own cache objects, not manifests,
+// uploads, or whatever else shares the disk, so a full disk doesn't imply currentDiskBytes >
+// maxDiskBytes. Evicting an LRU slice regardless of budget gives the next write a chance to
+// succeed instead of every request failing until an operator notices.
+const diskFullEvictFraction = 10
+
+func (s *Store) evictOnDiskFullLocked() {
+	n := len(s.index) / diskFullEvictFraction
+	if n == 0 {
+		n = 1
+	}
+
+	evicted := 0
+	for ; evicted < n; evicted++ {
+		if !s.evictOneLocked() {
+			break
+		}
+	}
+
+	log.Printf("disk full: force-evicted %d native cache object(s) to free space", evicted)
+}
+
+// handleWriteErr forces an eviction pass when err looks like the disk is out of space, then
+// returns err unchanged so callers can keep wrapping/propagating it as before.
+func (s *Store) handleWriteErr(err error) error {
+	if err != nil && errors.Is(err, syscall.ENOSPC) {
+		s.mu.Lock()
+		s.evictOnDiskFullLocked()
+		s.mu.Unlock()
+	}
+
+	return err
+}
+
+// removeObjectLocked releases whatever storage ie occupies: a pool slot, or a plain file.
+func (s *Store) removeObjectLocked(relPath string, ie indexEntry) error {
+	if ie.PoolPage != 0 {
+		s.pool.Free(s.entryStoredSize(ie), recordpool.Loc{Page: ie.PoolPage, Slot: ie.PoolSlot})
+		return nil
+	}
+	if err := os.Remove(s.objectPath(relPath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// reconcilePoolLocked runs once, from NewStore: it discovers existing pool pages, then makes one
+// pass over the already-loaded index to (a) drop entries whose PoolPage/PoolSlot no longer
+// resolves to anything on disk (the same treatment objectExistsLocked already gives a plain file
+// that's gone missing), and (b) feed everything else to the pool so it can derive free lists and
+// promotion counters. Nothing pool-related is persisted separately -- it's all rebuilt from the
+// index and the pool's own directory every time.
+func (s *Store) reconcilePoolLocked() error {
+	if err := s.pool.DiscoverPages(); err != nil {
+		return err
+	}
+
+	for relPath, ie := range s.index {
+		size := s.entryStoredSize(ie)
+		loc := recordpool.Loc{Page: ie.PoolPage, Slot: ie.PoolSlot}
+
+		if !s.pool.Valid(size, loc) {
+			delete(s.index, relPath)
+			s.dirty = true
+			continue
+		}
+
+		if loc.IsZero() {
+			s.pool.NoteUnpromoted(size)
+		} else {
+			s.pool.NoteOccupied(size, loc)
+		}
+	}
+
+	s.pool.FinishReconcile()
+
+	return nil
 }
 
 func lruTimeMicro(ie indexEntry) int64 {
@@ -1789,7 +2036,7 @@ func (s *Store) writeManifest(manifestPath string, body string) error {
 		return fmt.Errorf("create manifest dir: %w", err)
 	}
 	if err := os.WriteFile(manifestPath+".tmp", []byte(body), 0o600); err != nil {
-		return fmt.Errorf("write manifest: %w", err)
+		return fmt.Errorf("write manifest: %w", s.handleWriteErr(err))
 	}
 	if err := os.Rename(manifestPath+".tmp", manifestPath); err != nil {
 		return fmt.Errorf("rename manifest: %w", err)
