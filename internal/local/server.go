@@ -22,8 +22,8 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-func RunServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *Store, nativeStore *gocache.Store, authToken, fallbackAuthToken string, preloadLimit int) error {
-	h := cachehttp.NewHandlerWithPreloadLimit(store, nativeStore, authToken, fallbackAuthToken, preloadLimit)
+func RunServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *Store, nativeStore *gocache.Store, authToken, fallbackAuthToken string, maxDiskBytes int64, preloadLimit int) error {
+	h := cachehttp.NewHandlerWithPreloadLimit(store, nativeStore, authToken, fallbackAuthToken, preloadLimit, cachehttp.WithMaxDiskBytes(maxDiskBytes))
 	printStats := func() {
 		store.PrintStats()
 		nativeStore.PrintStats()

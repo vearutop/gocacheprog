@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bool64/dev/version"
 	"github.com/vearutop/dynhist-go"
 	"github.com/vearutop/gocacheprog/internal/cache"
 	"github.com/vearutop/gocacheprog/internal/gocache"
@@ -58,6 +59,7 @@ const (
 	headerRestoreTotalTime   = "X-Gocacheprog-Restore-Total-Time"
 	headerSaveTotalTime      = "X-Gocacheprog-Save-Total-Time"
 	headerSaveMaxFileBytes   = "X-Gocacheprog-Save-Max-File-Bytes"
+	headerClientVersion      = "X-Gocacheprog-Client-Version"
 )
 
 type SessionInfo struct {
@@ -79,6 +81,7 @@ type SessionParams interface {
 type Client struct {
 	baseURL   string
 	authToken string
+	sessionID string
 
 	tr *http.Transport
 
@@ -120,8 +123,12 @@ func NewClientWithSession(baseURL string, authToken string, sessionInfo *Session
 	}
 	setAuthHeader(req, authToken)
 	setSessionHeaders(req, sessionInfo)
+	req.Header.Set(headerClientVersion, version.Module("github.com/vearutop/gocacheprog").Version)
 
 	client := &Client{baseURL: baseURL, authToken: authToken}
+	if sessionInfo != nil {
+		client.sessionID = sessionInfo.SessionID
+	}
 	client.latencyGet = &dynhist.Collector{WeightFunc: dynhist.LatencyWidth, BucketsLimit: 50}
 	client.latencyPut = &dynhist.Collector{WeightFunc: dynhist.LatencyWidth, BucketsLimit: 50}
 
@@ -221,6 +228,15 @@ func setSessionHeaders(req *http.Request, sessionInfo *SessionInfo) {
 	}
 }
 
+// setSessionAuthHeaders sets the auth header and, for a client created with a session, resends
+// its session ID on every request so the server can tell an active session from a finished one.
+func (c *Client) setSessionAuthHeaders(r *http.Request) {
+	setAuthHeader(r, c.authToken)
+	if c.sessionID != "" {
+		r.Header.Set(headerSessionID, c.sessionID)
+	}
+}
+
 type countingConn struct {
 	net.Conn
 	c *Client
@@ -257,7 +273,7 @@ func (c *Client) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 		return err
 	}
 	r.Header.Set("Content-Type", "application/json")
-	setAuthHeader(r, c.authToken)
+	c.setSessionAuthHeaders(r)
 
 	res, err := c.roundTrip(r)
 	if err != nil {
@@ -315,7 +331,7 @@ func (c *Client) RestoreCache(req gocache.Request, cb func(item gocache.FileItem
 	if err != nil {
 		return gocache.TransferStats{}, err
 	}
-	setAuthHeader(r, c.authToken)
+	c.setSessionAuthHeaders(r)
 
 	res, err := c.roundTrip(r)
 	if err != nil {
@@ -579,7 +595,7 @@ func (c *Client) startSaveCache(req gocache.Request, uploadID string) (int64, er
 	if err != nil {
 		return 0, err
 	}
-	setAuthHeader(r, c.authToken)
+	c.setSessionAuthHeaders(r)
 
 	res, err := c.roundTrip(r)
 	if err != nil {
@@ -613,7 +629,7 @@ func (c *Client) saveCacheChunk(req gocache.Request, uploadID string, chunk []by
 	if err != nil {
 		return err
 	}
-	setAuthHeader(r, c.authToken)
+	c.setSessionAuthHeaders(r)
 
 	res, err := c.roundTrip(r)
 	if err != nil {
@@ -641,7 +657,7 @@ func (c *Client) postSaveCacheControl(req gocache.Request, uploadID, path, op st
 	if err != nil {
 		return err
 	}
-	setAuthHeader(r, c.authToken)
+	c.setSessionAuthHeaders(r)
 
 	res, err := c.roundTrip(r)
 	if err != nil {
@@ -720,7 +736,7 @@ func (c *Client) PostCacheUsed(commit string, changesID string, buildType string
 		return err
 	}
 	r.Header.Set("Content-Type", "text/plain")
-	setAuthHeader(r, c.authToken)
+	c.setSessionAuthHeaders(r)
 
 	res, err := c.roundTrip(r)
 	if err != nil {
@@ -757,7 +773,7 @@ func (c *Client) Get(req cache.Request, cb func(resp cache.ResponseItem)) error 
 		return err
 	}
 	r.Header.Set("Content-Type", "application/json")
-	setAuthHeader(r, c.authToken)
+	c.setSessionAuthHeaders(r)
 
 	st := time.Now()
 
@@ -814,7 +830,7 @@ func (c *Client) head(req cache.Request) (cache.Response, error) {
 		return resp, err
 	}
 	r.Header.Set("Content-Type", "application/json")
-	setAuthHeader(r, c.authToken)
+	c.setSessionAuthHeaders(r)
 
 	res, err := c.roundTrip(r)
 	if err != nil {
@@ -905,7 +921,7 @@ func (c *Client) Put(values cache.Response) error {
 		return fmt.Errorf("creating request: %w", err)
 	}
 	req.ContentLength = cl
-	setAuthHeader(req, c.authToken)
+	c.setSessionAuthHeaders(req)
 
 	st := time.Now()
 

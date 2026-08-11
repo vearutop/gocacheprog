@@ -1238,35 +1238,68 @@ func listManifestFiles(root string) ([]string, error) {
 	return files, nil
 }
 
+// EvictNow forces an eviction pass immediately, bypassing evictionDelay.
+func (dc *Store) EvictNow() {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	dc.evictIfNeededLocked()
+}
+
 func (dc *Store) evictIfNeededLocked() {
 	if dc.maxDiskBytes <= 0 {
 		return
 	}
 
-	for dc.currentDiskBytes > dc.maxDiskBytes && len(dc.index) > 0 {
-		var (
-			evictActionID string
-			evictEntry    indexEntry
-			found         bool
-		)
-
-		for actionID, ie := range dc.index {
-			if !found || lruTimeMicro(ie) < lruTimeMicro(evictEntry) {
-				evictActionID = actionID
-				evictEntry = ie
-				found = true
-			}
-		}
-		if !found {
-			return
-		}
-
-		delete(dc.index, evictActionID)
-		dc.releaseOutputRefLocked(evictEntry.OutputID)
-		dc.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
-		dc.dirty = true
-		log.Printf("evicted cache entry action_id=%s output_id=%s current_disk_bytes=%d max_disk_bytes=%d", evictActionID, evictEntry.OutputID, dc.currentDiskBytes, dc.maxDiskBytes)
+	for dc.currentDiskBytes > dc.maxDiskBytes && dc.evictOneLocked() {
 	}
+}
+
+// evictOneLocked removes the single least-recently-used cache object regardless of maxDiskBytes
+// and reports whether one was evicted (false once the index is empty). Shared by the
+// budget-based loop above and an external combined-budget enforcer (EvictOne).
+func (dc *Store) evictOneLocked() bool {
+	var (
+		evictActionID string
+		evictEntry    indexEntry
+		found         bool
+	)
+
+	for actionID, ie := range dc.index {
+		if !found || lruTimeMicro(ie) < lruTimeMicro(evictEntry) {
+			evictActionID = actionID
+			evictEntry = ie
+			found = true
+		}
+	}
+	if !found {
+		return false
+	}
+
+	delete(dc.index, evictActionID)
+	dc.releaseOutputRefLocked(evictEntry.OutputID)
+	dc.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
+	dc.dirty = true
+	log.Printf("evicted cache entry action_id=%s output_id=%s current_disk_bytes=%d max_disk_bytes=%d", evictActionID, evictEntry.OutputID, dc.currentDiskBytes, dc.maxDiskBytes)
+
+	return true
+}
+
+// DiskBytes reports current tracked on-disk usage, for an external combined-budget enforcer.
+func (dc *Store) DiskBytes() int64 {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	return dc.currentDiskBytes
+}
+
+// EvictOne evicts a single least-recently-used entry regardless of maxDiskBytes, for use by an
+// external combined-budget enforcer spanning multiple stores. Reports whether anything was
+// evicted.
+func (dc *Store) EvictOne() bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	return dc.evictOneLocked()
 }
 
 func lruTimeMicro(ie indexEntry) int64 {
