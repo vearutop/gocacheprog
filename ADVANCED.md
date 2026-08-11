@@ -29,7 +29,6 @@ docker run -d \
   ghcr.io/vearutop/gocacheprog:latest \
   -auth-token secret-token \
   -max-disk-bytes 2000000000 \
-  -gocache-max-disk-bytes 5000000000 \
   -preload-limit 4 \
   -max-file-bytes 5000000 \
   -https-host cache.example.com
@@ -66,8 +65,6 @@ services:
       - "secret-token"
       - -max-disk-bytes
       - "2000000000"
-      - -gocache-max-disk-bytes
-      - "5000000000"
       - -preload-limit
       - "4"
       - -max-file-bytes
@@ -107,8 +104,6 @@ Usage of ./bin/gocacheprog:
         server mode: same as -manifest-max-age but for native GOCACHE manifests (default 120h0m0s)
   -gocache-max-age duration
         maximum age for native GOCACHE objects on the remote server; 0 disables age-based retirement (default 48h0m0s)
-  -gocache-max-disk-bytes int
-        optional total on-disk native cache storage size limit in bytes on the remote server; 0 disables eviction
   -http string
         HTTP listen address or unix socket path
   -https string
@@ -120,7 +115,7 @@ Usage of ./bin/gocacheprog:
   -manifest-max-age duration
         server mode: maximum age for manifest files with no restore/save activity before they're deleted; 0 disables manifest collection (default 120h0m0s)
   -max-disk-bytes int
-        optional total on-disk cache size limit in bytes; 0 disables eviction
+        optional total on-disk cache size limit in bytes, shared across the local and native GOCACHE stores in server mode; 0 disables eviction
   -max-file-bytes int
         maximum single file size in bytes for remote cache storage, preload item wire size, and native -restore-cache/-save-cache; 0 disables the limit except preload defaults to 1000000
   -max-remote-get-time duration
@@ -546,33 +541,34 @@ That keeps startup recovery uniform, and it means a crash between writes degrade
 
 ## Eviction
 
-Server mode supports a total on-disk cache size limit:
+Server mode supports a total on-disk cache size limit, shared across both the local objects store
+and the native `GOCACHE` store:
 
 ```bash
 gocacheprog -http :8080 -max-disk-bytes 5000000000
 ```
 
-Native `GOCACHE` storage has a separate quota:
+Whichever of the two stores currently holds the most bytes is evicted from first (LRU) until
+their combined usage is back under the limit. This runs synchronously after every request, so a
+burst of writes can't outrun it the way a delayed background sweep could.
 
-```bash
-gocacheprog -http :8080 -gocache-max-disk-bytes 5000000000
-```
-
-Native `GOCACHE` storage also has an age-based retirement policy, defaulting to `48h`:
+Native `GOCACHE` storage also has an age-based retirement policy, defaulting to `48h`, independent
+of the disk-size budget above:
 
 ```bash
 gocacheprog -http :8080 -gocache-max-age 48h
 ```
 
-Set `-gocache-max-age 0` to disable age-based retirement.
+Set `-gocache-max-age 0` to disable age-based retirement. Age-based cleanup runs on a delayed
+background sweep rather than inline on `Put`, since it's not needed to bound disk usage the way
+the size-based budget is.
 
-Eviction policy:
+### Status page
 
-- LRU
-- delayed background cleanup
-- not inline on `Put`
-
-The implementation schedules cleanup after a delay so active CI jobs are less likely to get disrupted by immediate eviction work.
+`GET /` serves an HTML status page gated by HTTP Basic Auth (any username, password is
+`-auth-token`) showing both stores' stats, the combined disk budget and current usage, and
+in-progress client sessions with their versions. A "Run cleanup now" button on the page triggers
+an immediate eviction pass without waiting for the next request.
 
 ## Authentication
 

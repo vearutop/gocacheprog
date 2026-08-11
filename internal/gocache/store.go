@@ -1629,6 +1629,31 @@ func humanDuration(d time.Duration) string {
 	return d.String()
 }
 
+// EvictNow forces an eviction pass immediately, bypassing evictionDelay.
+func (s *Store) EvictNow() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evictIfNeededLocked()
+}
+
+// DiskBytes reports current tracked on-disk usage, for an external combined-budget enforcer.
+func (s *Store) DiskBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.currentDiskBytes
+}
+
+// EvictOne evicts a single least-recently-used entry regardless of maxDiskBytes, for use by an
+// external combined-budget enforcer spanning multiple stores. Reports whether anything was
+// evicted.
+func (s *Store) EvictOne() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.evictOneLocked()
+}
+
 func (s *Store) evictIfNeededLocked() {
 	if s.maxAge > 0 {
 		cutoff := time.Now().UTC().Add(-s.maxAge).UnixMicro()
