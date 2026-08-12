@@ -130,7 +130,7 @@ func TestCombinedBudget_EvictsAcrossStores(t *testing.T) {
 	// Seed the native store directly (bypassing HTTP/the budget enforcer entirely) so its size
 	// is known exactly before the budget is set, instead of guessing at wire-encoding overhead.
 	payload := make([]byte, 1000)
-	_, err = rand.New(rand.NewSource(1)).Read(payload) //nolint:gosec // test fixture, not security-sensitive.
+	_, err = rand.New(rand.NewSource(1)).Read(payload)
 	require.NoError(t, err)
 
 	bigItem := gocache.FileItem{Path: "ab/big", Size: int64(len(payload)), WireSize: int64(len(payload))}
