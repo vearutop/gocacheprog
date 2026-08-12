@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,6 +82,66 @@ func TestStoreRestore_SurvivesSelfHealWriteFailure(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"commit"}, sources)
+	require.Equal(t, []string{"cd/cache-entry-b"}, restored)
+}
+
+// TestStorePutBody_RejectsTruncatedPlainFileWrite covers the actual reported bug: an interrupted
+// upload whose body reader EOFs early must not be silently indexed as a complete object -- that
+// produced a real production incident where restore-cache served a file a client couldn't
+// decompress. The item here is deliberately >4096 bytes of incompressible content, so it's never
+// pool-eligible (see TestStorePoolBody_RejectsTruncatedWrite for the pool-eligible path, which
+// already had this guard).
+func TestStorePutBody_RejectsTruncatedPlainFileWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir)
+	require.NoError(t, err)
+
+	full := make([]byte, 5000)
+	_, err = rand.New(rand.NewSource(1)).Read(full)
+	require.NoError(t, err)
+
+	item := FileItem{Path: "ab/truncated", Size: int64(len(full)), WireSize: int64(len(full))}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(io.LimitReader(bytes.NewReader(full), 3000)), nil
+	})
+
+	err = store.SaveItem(item)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "save body length 3000 does not match expected 5000")
+
+	require.NoFileExists(t, store.objectPath("ab/truncated"))
+	require.Equal(t, "0", store.Stats()["index"])
+}
+
+// TestStoreRestore_SkipsAndRemovesTruncatedPlainFileEntry covers a pre-existing corrupted entry
+// (e.g. from before storePutBody validated write length): Restore must not serve a client bytes
+// it can't use, and must drop the entry so a later restore doesn't hit it again either.
+func TestStoreRestore_SkipsAndRemovesTruncatedPlainFileEntry(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "commit123"}, "ab/cache-entry-a", "payload-a")
+	saveItemForTest(t, store, Request{Commit: "commit123"}, "cd/cache-entry-b", "payload-b")
+
+	require.NoError(t, os.Truncate(store.objectPath("ab/cache-entry-a"), 3))
+
+	var restored []string
+	sources, err := store.Restore(Request{Commit: "commit123"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"commit"}, sources)
+	require.Equal(t, []string{"cd/cache-entry-b"}, restored)
+
+	// The broken entry must be gone from the index, not just skipped this one time.
+	restored = nil
+	_, err = store.Restore(Request{Commit: "commit123"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
 	require.Equal(t, []string{"cd/cache-entry-b"}, restored)
 }
 

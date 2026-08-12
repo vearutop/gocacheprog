@@ -787,12 +787,42 @@ func (s *Store) Restore(req Request, cb func(FileItem)) ([]string, error) {
 	entries = s.selectRestoreEntries(req, entries)
 
 	for _, entry := range entries {
+		// Plain-file entries (not pool-backed) predate storePutBody validating a write's actual
+		// length -- a pre-existing truncated-but-indexed object could still be on disk. Catch it
+		// here, at serve time, rather than handing a client bytes it can't decompress: skip it
+		// and drop it from the store so the next restore doesn't hit it either.
+		if entry.ie.PoolPage == 0 {
+			expected := s.entryStoredSize(entry.ie)
+			fi, statErr := os.Stat(s.objectPath(entry.path))
+			if statErr != nil || fi.Size() != expected {
+				log.Printf("restore: skipping broken object path=%q expected_size=%d actual_size_err=%v", entry.path, expected, statErr)
+				s.removeBrokenEntry(entry.path, entry.ie)
+				continue
+			}
+		}
+
 		item := s.responseItem(entry.path, entry.ie)
 		cb(item)
 		atomic.AddInt64(&s.hits, 1)
 	}
 
 	return sources, nil
+}
+
+// removeBrokenEntry drops a corrupted/truncated on-disk object from the index and deletes its
+// file, so a future restore skips it instead of repeatedly serving something a client can't use.
+func (s *Store) removeBrokenEntry(relPath string, ie indexEntry) {
+	s.mu.Lock()
+	if current, ok := s.index[relPath]; ok {
+		delete(s.index, relPath)
+		s.currentDiskBytes -= s.entryStoredSize(current)
+		s.dirty = true
+	}
+	s.mu.Unlock()
+
+	if err := s.removeObjectLocked(relPath, ie); err != nil {
+		log.Printf("remove broken object %s: %s", relPath, err.Error())
+	}
 }
 
 func (s *Store) RestoreSources(req Request) ([]string, error) {
@@ -1159,13 +1189,32 @@ func (s *Store) storePutBody(item FileItem, ie *indexEntry, rd io.Reader, modTim
 	}
 
 	objectPath := s.objectPath(item.Path)
-	src := rd
+
+	var src io.Reader
+	var counted *countingReader
 	if poolEligible {
 		src = bytes.NewReader(body)
+	} else {
+		// Unlike the pool path above, rd hasn't been read yet, so its length can't be checked
+		// before writing. io.Copy inside writeAtomic treats a short read from rd (e.g. an
+		// interrupted upload) as a normal, successful end of input -- count what's actually
+		// written and verify it after, so a truncated body is caught here rather than silently
+		// indexed as a complete, valid object that fails to decompress whenever it's later read.
+		counted = &countingReader{r: rd}
+		src = counted
 	}
+
 	if err := writeAtomic(objectPath, src, mode); err != nil {
 		return fmt.Errorf("write object: %w", s.handleWriteErr(err))
 	}
+
+	if counted != nil && counted.n != recordSize {
+		if rmErr := os.Remove(objectPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("remove truncated object %s: %s", objectPath, rmErr.Error())
+		}
+		return fmt.Errorf("save body length %d does not match expected %d", counted.n, recordSize)
+	}
+
 	if err := os.Chtimes(objectPath, modTime, modTime); err != nil {
 		return fmt.Errorf("set object mtime: %w", err)
 	}

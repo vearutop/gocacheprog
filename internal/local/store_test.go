@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -649,6 +650,59 @@ func TestStoreRemoveIfUnchanged_SkipsEntryReplacedSinceItWasVerified(t *testing.
 	current, ok := store.index["actionId1"]
 	require.True(t, ok)
 	require.Equal(t, "outputId2", current.OutputID, "the replacing entry must be untouched")
+}
+
+// TestStorePutBody_RejectsTruncatedPlainFileWrite mirrors the same fix in internal/gocache:
+// an interrupted upload whose body reader EOFs early must not be silently indexed as a complete
+// object. The item is deliberately >4096 bytes of incompressible content, so it's never
+// pool-eligible.
+func TestStorePutBody_RejectsTruncatedPlainFileWrite(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	full := make([]byte, 5000)
+	_, err = rand.New(rand.NewSource(1)).Read(full)
+	require.NoError(t, err)
+
+	item := cache.ResponseItem{ActionID: "a1", OutputID: "o1", Size: int64(len(full)), WireSize: int64(len(full))}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(io.LimitReader(bytes.NewReader(full), 3000)), nil
+	})
+
+	err = store.Put(cache.Response{Items: []cache.ResponseItem{item}})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "put body length 3000 does not match expected 5000")
+
+	require.NoFileExists(t, store.OutputFilename("o1"))
+	require.Equal(t, "0", store.Stats()["index"])
+}
+
+// TestStorePreload_SkipsAndRemovesTruncatedPlainFileEntry covers a pre-existing corrupted entry
+// (e.g. from before storePutBody validated write length): Preload must not serve a client bytes
+// it can't use, and must drop the entry so a later preload doesn't hit it again either.
+func TestStorePreload_SkipsAndRemovesTruncatedPlainFileEntry(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	now := time.Now()
+	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
+		testItem("actionId1", "outputId1", "payload-a", &now),
+		testItem("actionId2", "outputId2", "payload-b", &now),
+	}}))
+
+	require.NoError(t, os.Truncate(store.OutputFilename("outputId1"), 3))
+
+	var got []string
+	require.NoError(t, store.Preload(cache.PreloadRequest{MaxSize: 1024}, func(resp cache.ResponseItem) {
+		got = append(got, resp.ActionID)
+	}))
+	require.Equal(t, []string{"actionId2"}, got)
+
+	got = nil
+	require.NoError(t, store.Preload(cache.PreloadRequest{MaxSize: 1024}, func(resp cache.ResponseItem) {
+		got = append(got, resp.ActionID)
+	}))
+	require.Equal(t, []string{"actionId2"}, got)
 }
 
 func testItem(actionID, outputID, body string, now *time.Time) cache.ResponseItem {

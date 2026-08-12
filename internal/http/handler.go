@@ -379,7 +379,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 }
 
 type saveCacheSession struct {
-	writer          io.WriteCloser
+	writer          *io.PipeWriter
 	done            chan error
 	startedAt       time.Time
 	chunks          int64
