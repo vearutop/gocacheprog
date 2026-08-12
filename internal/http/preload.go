@@ -109,6 +109,7 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set(headerPreloadQueueWait, queueWait.String())
 	rw.Header().Set(headerPreloadPrepareTime, prepareTime.String())
 	rw.Header().Set(headerPreloadTotalTime, totalTime.String())
+	h.recordSessionPreload(r, cl, totalTime)
 
 	log.Printf(
 		"preload queue_wait=%s prepare_time=%s total_time=%s; remote=%s; commit=%q; parent=%q; changes=%q; build_type=%q; sources=%s; items=%d; content_length=%d",

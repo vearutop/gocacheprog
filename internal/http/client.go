@@ -676,6 +676,28 @@ func (c *Client) postSaveCacheControl(req gocache.Request, uploadID, path, op st
 	return checkStatus(res, http.StatusNoContent, op)
 }
 
+// MarkSessionDone tells the server this client's session has finished, so the status page can
+// show it as done instead of leaving it to look abandoned once requests stop arriving.
+func (c *Client) MarkSessionDone() error {
+	r, err := http.NewRequest(http.MethodPost, c.baseURL+"/session-done", nil)
+	if err != nil {
+		return err
+	}
+	c.setSessionAuthHeaders(r)
+
+	res, err := c.roundTrip(r)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close session-done body: %s", err.Error())
+		}
+	}()
+
+	return checkStatus(res, http.StatusNoContent, "session-done")
+}
+
 func gocacheQuery(req gocache.Request) url.Values {
 	v := url.Values{}
 	if req.Commit != "" {

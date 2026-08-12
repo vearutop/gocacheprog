@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/binary"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -49,20 +50,45 @@ func (h *Handler) RestoreCache(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set(headerRestorePrepareTime, prepareTime.String())
 	rw.WriteHeader(http.StatusOK)
 
-	sw := gocache.NewStreamWriter(rw)
+	cw := &countingWriter{w: rw}
+	sw := gocache.NewStreamWriter(cw)
+	var writeErrLogged bool
 	_, err = h.gocacheStore.Restore(req, func(item gocache.FileItem) {
+		// Once one item's header is flushed without a matching body, the stream is
+		// desynced for the rest of the response; stop attempting further writes so this
+		// doesn't log once per remaining item for what is really a single failure.
+		if writeErrLogged {
+			return
+		}
 		if err := sw.WriteItem(item); err != nil {
-			log.Print("restore-cache write item error")
+			log.Printf("restore-cache write item error: path=%q: %s", item.Path, err.Error())
+			writeErrLogged = true
 		}
 	})
 	if err != nil {
-		log.Print("restore-cache prepare error")
+		log.Printf("restore-cache prepare error: %s", err.Error())
 		return
 	}
 	if err := sw.Close(); err != nil {
-		log.Print("restore-cache close error")
+		log.Printf("restore-cache close error: %s", err.Error())
 	}
-	rw.Header().Set(headerRestoreTotalTime, time.Since(startedAt).String())
+	totalTime := time.Since(startedAt)
+	rw.Header().Set(headerRestoreTotalTime, totalTime.String())
+	h.recordSessionPreload(r, cw.n, totalTime)
+}
+
+// countingWriter tracks bytes written through it, for attributing a restore-cache transfer's
+// wire size to the requesting session without changing how gocache.StreamWriter itself writes.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+
+	return n, err
 }
 
 func parseGOCACHERequest(r *http.Request) gocache.Request {

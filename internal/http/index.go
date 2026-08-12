@@ -20,6 +20,7 @@ td,th{border:1px solid #ccc;padding:.25rem .75rem;text-align:left;}
 h2{margin-top:0;}
 .warn{color:#b00;font-weight:bold;}
 .active{color:#080;font-weight:bold;}
+.done{color:#357;font-weight:bold;}
 .idle{color:#888;}
 </style>
 </head>
@@ -36,17 +37,17 @@ h2{margin-top:0;}
 {{end}}
 <h2>Client sessions</h2>
 <table>
-<tr><th>session</th><th>status</th><th>version</th><th>pid</th><th>cache dir</th><th>commit</th><th>build type</th><th>first seen</th><th>last seen</th></tr>
+<tr><th>status</th><th>version</th><th>ref</th><th>build type</th><th>preload size</th><th>preload time</th><th>finalize size</th><th>finalize time</th><th>session time</th></tr>
 {{range .Sessions}}<tr>
-<td>{{.SessionID}}</td>
-<td>{{if .InProgress}}<span class="active">in progress</span>{{else}}<span class="idle">idle</span>{{end}}</td>
+<td>{{if eq .Status "done"}}<span class="done">done</span>{{else if eq .Status "in progress"}}<span class="active">in progress</span>{{else}}<span class="idle">idle</span>{{end}}</td>
 <td>{{.Version}}</td>
-<td>{{.PID}}</td>
-<td>{{.CacheDir}}</td>
-<td>{{.Commit}}</td>
+<td>{{.Ref}}</td>
 <td>{{.BuildType}}</td>
-<td>{{.FirstSeen}}</td>
-<td>{{.LastSeen}}</td>
+<td>{{.PreloadSize}}</td>
+<td>{{.PreloadTime}}</td>
+<td>{{.FinalizeSize}}</td>
+<td>{{.FinalizeTime}}</td>
+<td>{{.SessionTime}}</td>
 </tr>
 {{end}}
 </table>
@@ -68,15 +69,15 @@ type statSection struct {
 }
 
 type sessionRow struct {
-	SessionID  string
-	InProgress bool
-	Version    string
-	PID        string
-	CacheDir   string
-	Commit     string
-	BuildType  string
-	FirstSeen  string
-	LastSeen   string
+	Status       string
+	Version      string
+	Ref          string
+	BuildType    string
+	PreloadSize  string
+	PreloadTime  string
+	FinalizeSize string
+	FinalizeTime string
+	SessionTime  string
 }
 
 // Index serves a Basic-Auth-gated HTML status page at "/" with storage stats and a manual
@@ -120,15 +121,15 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 	var sessions []sessionRow
 	for _, cs := range h.clientSessionsSnapshot() {
 		sessions = append(sessions, sessionRow{
-			SessionID:  cs.SessionID,
-			InProgress: cs.InProgress,
-			Version:    cs.Version,
-			PID:        cs.PID,
-			CacheDir:   cs.CacheDir,
-			Commit:     cs.Commit,
-			BuildType:  cs.BuildType,
-			FirstSeen:  cs.FirstSeen.Format(time.RFC3339),
-			LastSeen:   cs.LastSeen.Format(time.RFC3339),
+			Status:       cs.Status,
+			Version:      cs.Version,
+			Ref:          cs.Ref,
+			BuildType:    cs.BuildType,
+			PreloadSize:  byteSize(cs.PreloadBytes),
+			PreloadTime:  cs.PreloadTime.Round(time.Millisecond).String(),
+			FinalizeSize: byteSize(cs.FinalizeBytes),
+			FinalizeTime: cs.FinalizeTime.Round(time.Millisecond).String(),
+			SessionTime:  cs.SessionTime.Round(time.Second).String(),
 		})
 	}
 

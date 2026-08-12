@@ -143,9 +143,11 @@ func (h *Handler) FinalizeSaveCache(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("save-cache upload_id=%q finalize succeeded: received_chunks=%d received_bytes=%d duration=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt))
+	finalizeTime := time.Since(session.startedAt)
+	log.Printf("save-cache upload_id=%q finalize succeeded: received_chunks=%d received_bytes=%d duration=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), finalizeTime)
+	h.recordSessionFinalize(r, atomic.LoadInt64(&session.bytes), finalizeTime)
 
-	rw.Header().Set(headerSaveTotalTime, time.Since(session.startedAt).String())
+	rw.Header().Set(headerSaveTotalTime, finalizeTime.String())
 	rw.WriteHeader(http.StatusNoContent)
 }
 
