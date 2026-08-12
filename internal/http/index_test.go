@@ -91,6 +91,10 @@ func TestIndex_ShowsInProgressClientSession(t *testing.T) {
 		SessionID: "session-abc",
 		PID:       123,
 		CacheDir:  "/tmp/build",
+		Params: local.ProxyParams{
+			ChangesID: "repo/pr-123",
+			BuildType: "unit",
+		},
 	})
 	require.NoError(t, err)
 
@@ -109,10 +113,34 @@ func TestIndex_ShowsInProgressClientSession(t *testing.T) {
 	require.NoError(t, err)
 	body := string(b)
 
-	require.True(t, strings.Contains(body, "session-abc"))
 	require.True(t, strings.Contains(body, "in progress"))
-	require.True(t, strings.Contains(body, "123"))
-	require.True(t, strings.Contains(body, "/tmp/build"))
+	require.True(t, strings.Contains(body, "repo/pr-123"))
+	require.True(t, strings.Contains(body, "unit"))
+	// The raw session ID, pid, and cache dir are tracking keys, not displayed columns.
+	require.False(t, strings.Contains(body, "session-abc"))
+}
+
+func TestIndex_SessionMarkedDone(t *testing.T) {
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandler(localStore, "")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{SessionID: "session-xyz"})
+	require.NoError(t, err)
+
+	require.NoError(t, client.MarkSessionDone())
+
+	req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	res, err := nethttp.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, res.Body.Close()) }()
+	b, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(b), `class="done"`)
 }
 
 // TestCombinedBudget_EvictsAcrossStores exercises the actual reported bug: a shared budget must

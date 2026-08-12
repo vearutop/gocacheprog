@@ -107,6 +107,7 @@ const (
 	envGHAInitTime      = "GOCACHEPROG_GHA_INIT_TIME"
 	envGHAMaxCacheBytes = "GOCACHEPROG_GHA_MAX_CACHE_BYTES"
 	envGHALocalFallback = "GOCACHEPROG_GHA_LOCAL_FALLBACK"
+	envGHASessionID     = "GOCACHEPROG_GHA_SESSION_ID"
 )
 
 type githubActionsConfig struct {
@@ -545,8 +546,9 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 	}
 
 	startedAt := time.Now().UTC()
+	sessionID := fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano())
 	client, err := newRemoteClientWithRetry(cfg.remoteURL, cfg.authToken, &cachehttp.SessionInfo{
-		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano()),
+		SessionID: sessionID,
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
@@ -599,6 +601,7 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 		envGHAMaxFileBytes: strconv.FormatInt(cfg.maxFileBytes, 10),
 		envGHARestoreStats: string(restoreStatsJSON),
 		envGHAInitTime:     initStartedAt.Format(time.RFC3339Nano),
+		envGHASessionID:    sessionID,
 	}
 
 	log.Printf("github-actions-init: gocache mode ready, GOCACHE=%q", cacheDir)
@@ -805,8 +808,12 @@ func doneGocacheMode() error {
 	}
 
 	startedAt := time.Now().UTC()
+	sessionID := os.Getenv(envGHASessionID)
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano())
+	}
 	client, err := newRemoteClientWithRetry(remoteURL, auth, &cachehttp.SessionInfo{
-		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano()),
+		SessionID: sessionID,
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
@@ -873,6 +880,10 @@ func doneGocacheMode() error {
 		summary += " total_time=" + elapsed.String()
 	}
 	log.Printf("github-actions-done: cache summary: %s", summary)
+
+	if err := client.MarkSessionDone(); err != nil {
+		log.Printf("github-actions-done: WARNING: mark session done: %s", err.Error())
+	}
 
 	return nil
 }

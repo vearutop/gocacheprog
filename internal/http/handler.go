@@ -46,13 +46,18 @@ func WithMaxDiskBytes(n int64) HandlerOption {
 // clientSession tracks the most recent request seen from one client process (identified by its
 // session ID), so the status page can show which sessions are still active and on what version.
 type clientSession struct {
-	Version   string
-	PID       string
-	CacheDir  string
-	Commit    string
-	BuildType string
-	FirstSeen time.Time
-	LastSeen  time.Time
+	Version       string
+	ChangesID     string
+	Commit        string
+	BuildType     string
+	PreloadBytes  int64
+	PreloadTime   time.Duration
+	FinalizeBytes int64
+	FinalizeTime  time.Duration
+	Done          bool
+	FirstSeen     time.Time
+	LastSeen      time.Time
+	DoneAt        time.Time
 }
 
 // sessionIdleTimeout is how long a session is still shown as "in progress" after its last
@@ -60,10 +65,23 @@ type clientSession struct {
 // between requests.
 const sessionIdleTimeout = 5 * time.Minute
 
-// sessionRetention bounds how long a finished session lingers on the status page before being
-// pruned. ponytail: prune is a linear scan of the whole map on every request; fine at CI-fleet
-// scale, revisit with a time-ordered index if session churn ever makes this measurable.
-const sessionRetention = 24 * time.Hour
+// doneSessionRetention bounds how long a session that explicitly called -github-actions-done
+// stays on the status page afterward, before being dropped from the list entirely.
+const doneSessionRetention = 5 * time.Minute
+
+// sessionRetention bounds how long a session with no done signal (idle status, or a mode that
+// never marks done) lingers on the status page before being pruned: sessionIdleTimeout to go
+// idle, plus doneSessionRetention more to actually see it, then gone.
+const sessionRetention = sessionIdleTimeout + doneSessionRetention
+
+// sessionExpired reports whether cs should be dropped from the status page entirely.
+func sessionExpired(cs *clientSession, now time.Time) bool {
+	if cs.Done {
+		return now.Sub(cs.DoneAt) > doneSessionRetention
+	}
+
+	return now.Sub(cs.LastSeen) > sessionRetention
+}
 
 func NewHandler(store cache.Store, authToken string) *Handler {
 	return NewHandlerWithPreloadLimit(store, nil, authToken, "", 2)
@@ -161,7 +179,7 @@ func (h *Handler) touchSession(r *http.Request) {
 	defer h.clientSessionsMu.Unlock()
 
 	for id, cs := range h.clientSessions {
-		if now.Sub(cs.LastSeen) > sessionRetention {
+		if sessionExpired(cs, now) {
 			delete(h.clientSessions, id)
 		}
 	}
@@ -175,55 +193,165 @@ func (h *Handler) touchSession(r *http.Request) {
 	if v := r.Header.Get(headerClientVersion); v != "" {
 		cs.Version = v
 	}
-	if v := r.Header.Get(headerPID); v != "" {
-		cs.PID = v
-	}
-	if v := r.Header.Get(headerCacheDir); v != "" {
-		cs.CacheDir = v
-	}
 	if v := r.Header.Get(headerCommit); v != "" {
 		cs.Commit = v
+	}
+	if v := r.Header.Get(headerChanges); v != "" {
+		cs.ChangesID = v
 	}
 	if v := r.Header.Get(headerBuildType); v != "" {
 		cs.BuildType = v
 	}
 }
 
+// recordSessionPreload attributes a completed preload/restore-cache transfer (whichever the
+// session's mode actually uses to pull the cache down at job start) to its session, if any.
+func (h *Handler) recordSessionPreload(r *http.Request, wireBytes int64, dur time.Duration) {
+	sid := r.Header.Get(headerSessionID)
+	if sid == "" {
+		return
+	}
+
+	h.clientSessionsMu.Lock()
+	defer h.clientSessionsMu.Unlock()
+
+	if cs := h.clientSessions[sid]; cs != nil {
+		cs.PreloadBytes += wireBytes
+		cs.PreloadTime += dur
+	}
+}
+
+// recordSessionFinalize attributes a completed save-cache upload to its session, if any.
+func (h *Handler) recordSessionFinalize(r *http.Request, wireBytes int64, dur time.Duration) {
+	sid := r.Header.Get(headerSessionID)
+	if sid == "" {
+		return
+	}
+
+	h.clientSessionsMu.Lock()
+	defer h.clientSessionsMu.Unlock()
+
+	if cs := h.clientSessions[sid]; cs != nil {
+		cs.FinalizeBytes += wireBytes
+		cs.FinalizeTime += dur
+	}
+}
+
+// markSessionDone flags the request's session as finished, e.g. once -github-actions-done
+// completes. Done sessions are dropped from the status page after doneSessionRetention.
+func (h *Handler) markSessionDone(r *http.Request) {
+	sid := r.Header.Get(headerSessionID)
+	if sid == "" {
+		return
+	}
+
+	h.clientSessionsMu.Lock()
+	defer h.clientSessionsMu.Unlock()
+
+	if cs := h.clientSessions[sid]; cs != nil {
+		cs.Done = true
+		cs.DoneAt = time.Now()
+	}
+}
+
 // clientSessionsSnapshot returns a stable-ordered copy for rendering, most recently active first.
+// Expired sessions (see sessionExpired) are dropped from the underlying map here, so the page
+// never has to be visited by another session's activity to clean itself up.
 func (h *Handler) clientSessionsSnapshot() []clientSessionView {
 	h.clientSessionsMu.Lock()
 	defer h.clientSessionsMu.Unlock()
 
+	now := time.Now()
 	views := make([]clientSessionView, 0, len(h.clientSessions))
 	for id, cs := range h.clientSessions {
+		if sessionExpired(cs, now) {
+			delete(h.clientSessions, id)
+			continue
+		}
+
+		ref := cs.ChangesID
+		if ref == "" {
+			ref = cs.Commit
+		}
+
+		status := "idle"
+		if cs.Done {
+			status = "done"
+		} else if now.Sub(cs.LastSeen) <= sessionIdleTimeout {
+			status = "in progress"
+		}
+
+		end := now
+		if cs.Done {
+			end = cs.DoneAt
+		}
+
 		views = append(views, clientSessionView{
-			SessionID:  id,
-			Version:    cs.Version,
-			PID:        cs.PID,
-			CacheDir:   cs.CacheDir,
-			Commit:     cs.Commit,
-			BuildType:  cs.BuildType,
-			FirstSeen:  cs.FirstSeen,
-			LastSeen:   cs.LastSeen,
-			InProgress: time.Since(cs.LastSeen) <= sessionIdleTimeout,
+			Status:        status,
+			Version:       cs.Version,
+			Ref:           ref,
+			BuildType:     cs.BuildType,
+			PreloadBytes:  cs.PreloadBytes,
+			PreloadTime:   cs.PreloadTime,
+			FinalizeBytes: cs.FinalizeBytes,
+			FinalizeTime:  cs.FinalizeTime,
+			SessionTime:   end.Sub(cs.FirstSeen),
+			lastSeen:      cs.LastSeen,
 		})
 	}
 
-	sort.Slice(views, func(i, j int) bool { return views[i].LastSeen.After(views[j].LastSeen) })
+	sort.Slice(views, func(i, j int) bool { return views[i].lastSeen.After(views[j].lastSeen) })
 
 	return views
 }
 
 type clientSessionView struct {
-	SessionID  string
-	Version    string
-	PID        string
-	CacheDir   string
-	Commit     string
-	BuildType  string
-	FirstSeen  time.Time
-	LastSeen   time.Time
-	InProgress bool
+	Status        string
+	Version       string
+	Ref           string
+	BuildType     string
+	PreloadBytes  int64
+	PreloadTime   time.Duration
+	FinalizeBytes int64
+	FinalizeTime  time.Duration
+	SessionTime   time.Duration
+	lastSeen      time.Time
+}
+
+// routes maps each authenticated endpoint to its handler method, so ServeHTTP is a single lookup
+// instead of a long if-chain. "/" and "/session-done"/"/version" (both trivial, listed here for
+// the same one-lookup dispatch) are the only paths with logic that doesn't fit a bare method
+// value; see serveVersion and serveSessionDone.
+var routes = map[string]func(*Handler, http.ResponseWriter, *http.Request){
+	"/version":             (*Handler).serveVersion,
+	"/status":              (*Handler).Status,
+	"/session-done":        (*Handler).serveSessionDone,
+	"/preload":             (*Handler).Preload,
+	"/cache-used":          (*Handler).CacheUsed,
+	"/restore-cache":       (*Handler).RestoreCache,
+	"/clear":               (*Handler).ClearCache,
+	"/inspect":             (*Handler).InspectCache,
+	"/integrity-check":     (*Handler).IntegrityCheck,
+	"/save-cache":          (*Handler).SaveCache,
+	"/save-cache-chunk":    (*Handler).SaveCacheChunk,
+	"/save-cache-start":    (*Handler).StartSaveCache,
+	"/save-cache-finalize": (*Handler).FinalizeSaveCache,
+	"/save-cache-abort":    (*Handler).AbortSaveCache,
+	"/put":                 (*Handler).Put,
+	"/get":                 (*Handler).Get,
+	"/head":                (*Handler).Head,
+}
+
+func (h *Handler) serveVersion(rw http.ResponseWriter, r *http.Request) {
+	logVersionProbe(r)
+	if _, err := rw.Write([]byte("gocacheprog " + version.Module("github.com/vearutop/gocacheprog").Version)); err != nil {
+		log.Printf("write version response: %s", err.Error())
+	}
+}
+
+func (h *Handler) serveSessionDone(rw http.ResponseWriter, r *http.Request) {
+	h.markSessionDone(r)
+	rw.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
@@ -241,91 +369,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	h.touchSession(r)
 	defer h.enforceCombinedBudget()
 
-	if r.URL.Path == "/version" {
-		logVersionProbe(r)
-		if _, err := rw.Write([]byte("gocacheprog " + version.Module("github.com/vearutop/gocacheprog").Version)); err != nil {
-			log.Printf("write version response: %s", err.Error())
-		}
+	route, ok := routes[r.URL.Path]
+	if !ok {
+		http.NotFound(rw, r)
 		return
 	}
 
-	if r.URL.Path == "/status" {
-		h.Status(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/preload" {
-		println("preload")
-		h.Preload(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/cache-used" {
-		h.CacheUsed(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/restore-cache" {
-		h.RestoreCache(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/clear" {
-		h.ClearCache(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/inspect" {
-		h.InspectCache(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/integrity-check" {
-		h.IntegrityCheck(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/save-cache" {
-		h.SaveCache(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/save-cache-chunk" {
-		h.SaveCacheChunk(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/save-cache-start" {
-		h.StartSaveCache(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/save-cache-finalize" {
-		h.FinalizeSaveCache(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/save-cache-abort" {
-		h.AbortSaveCache(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/put" {
-		h.Put(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/get" {
-		h.Get(rw, r)
-		return
-	}
-
-	if r.URL.Path == "/head" {
-		h.Head(rw, r)
-		return
-	}
-
-	http.NotFound(rw, r)
+	route(h, rw, r)
 }
 
 type saveCacheSession struct {
