@@ -90,7 +90,13 @@ func (h *Handler) SaveCacheChunk(rw http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&session.chunks, 1)
 	atomic.AddInt64(&session.bytes, n)
 	if err != nil {
-		closeWithLog(session.writer, "close save-cache session writer after chunk failure")
+		// CloseWithError, not a plain Close: the background reader (processSaveCacheStream,
+		// mid-item) must see this as a real error, not a clean EOF -- an EOF here reads as "the
+		// upload ended here on purpose," letting a short item body be written and indexed as if
+		// it were complete.
+		if closeErr := session.writer.CloseWithError(fmt.Errorf("chunk upload failed: %w", err)); closeErr != nil {
+			log.Printf("close save-cache session writer after chunk failure: %s", closeErr.Error())
+		}
 		h.deleteSaveSession(uploadID)
 		http.Error(rw, fmt.Sprintf("save-cache upload %s chunk failed after %d chunks, %d bytes: %s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), err.Error()), http.StatusInternalServerError)
 		return
@@ -167,7 +173,11 @@ func (h *Handler) AbortSaveCache(rw http.ResponseWriter, r *http.Request) {
 
 	log.Printf("save-cache upload_id=%q abort received: received_chunks=%d received_bytes=%d elapsed=%s", uploadID, atomic.LoadInt64(&session.chunks), atomic.LoadInt64(&session.bytes), time.Since(session.startedAt))
 
-	closeWithLog(session.writer, "close save-cache session writer on abort")
+	// Same reasoning as the chunk-failure path: CloseWithError so a mid-item abort can't read as
+	// a clean EOF and let a short body be written and indexed as complete.
+	if err := session.writer.CloseWithError(errors.New("save-cache upload aborted")); err != nil {
+		log.Printf("close save-cache session writer on abort: %s", err.Error())
+	}
 	h.deleteSaveSession(uploadID)
 	<-session.done
 
@@ -200,6 +210,9 @@ func (h *Handler) processSaveCacheStream(req gocache.Request, body io.Reader, up
 			expectedWireSize = item.Size
 		}
 
+		// Store.SaveItem itself now verifies the body it actually received matches the
+		// declared size before ever indexing it (both the pool and plain-file paths) -- counted
+		// here purely so a failure's error message can report how many bytes actually arrived.
 		var counted *countingReader
 		if itemBody != nil {
 			counted = &countingReader{rd: itemBody}
@@ -213,9 +226,6 @@ func (h *Handler) processSaveCacheStream(req gocache.Request, body io.Reader, up
 				readBytes = counted.n
 			}
 			return fmt.Errorf("upload_id=%s item=%d path=%q size=%d wire_size=%d read_wire_bytes=%d: save item: %w", uploadID, progress.items, item.Path, item.Size, expectedWireSize, readBytes, err)
-		}
-		if counted != nil && counted.n != expectedWireSize {
-			return fmt.Errorf("upload_id=%s item=%d path=%q size=%d wire_size=%d read_wire_bytes=%d: truncated item body", uploadID, progress.items, item.Path, item.Size, expectedWireSize, counted.n)
 		}
 		progress.wireBytes += expectedWireSize
 		paths = append(paths, item.Path)
@@ -248,6 +258,7 @@ type countingReader struct {
 func (r *countingReader) Read(p []byte) (int, error) {
 	n, err := r.rd.Read(p)
 	r.n += int64(n)
+
 	return n, err
 }
 

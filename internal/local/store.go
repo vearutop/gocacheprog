@@ -419,11 +419,36 @@ func (dc *Store) storePutBody(item cache.ResponseItem, rd io.Reader, newStoredSi
 		return dc.storePoolEligibleBody(item, rd, newStoredSize)
 	}
 
-	if err := writeAtomic(dc.OutputFilename(item.OutputID), rd); err != nil {
-		println("atomic write:", err.Error())
+	// Unlike storePoolEligibleBody above, rd hasn't been read yet, so its length can't be
+	// checked before writing. io.Copy inside writeAtomic treats a short read from rd (e.g. an
+	// interrupted upload) as a normal, successful end of input -- count what's actually written
+	// and verify it after, so a truncated body is caught here rather than silently indexed as a
+	// complete, valid object that fails to read correctly whenever it's later served.
+	outputFile := dc.OutputFilename(item.OutputID)
+	counted := &countingReader{r: rd}
+	if err := writeAtomic(outputFile, counted); err != nil {
 		return recordpool.Loc{}, fmt.Errorf("atomic write: %w", err)
 	}
+	if counted.n != newStoredSize {
+		if rmErr := os.Remove(outputFile); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("remove truncated object %s: %s", outputFile, rmErr.Error())
+		}
+		return recordpool.Loc{}, fmt.Errorf("put body length %d does not match expected %d", counted.n, newStoredSize)
+	}
+
 	return recordpool.Loc{}, nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+
+	return n, err
 }
 
 // storePoolEligibleBody handles a record small enough to be pool-eligible: reads its body,
@@ -594,6 +619,20 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 			continue
 		}
 
+		// Plain-file entries (not pool-backed) predate storePutBody validating a write's actual
+		// length -- a pre-existing truncated-but-indexed object could still be on disk. Catch it
+		// here, at serve time, rather than handing a client bytes it can't use: skip it and drop
+		// it from the store so a future preload doesn't hit it either.
+		if v.PoolPage == 0 {
+			expected := dc.entryStoredSize(v)
+			fi, statErr := os.Stat(dc.OutputFilename(v.OutputID))
+			if statErr != nil || fi.Size() != expected {
+				log.Printf("preload: skipping broken object action_id=%q output_id=%q expected_size=%d actual_size_err=%v", k, v.OutputID, expected, statErr)
+				dc.removeBrokenActionEntry(k, v)
+				continue
+			}
+		}
+
 		res = append(res, dc.responseItem(k, v))
 	}
 
@@ -602,6 +641,21 @@ func (dc *Store) Preload(req cache.PreloadRequest, cb func(resp cache.ResponseIt
 	}
 
 	return nil
+}
+
+// removeBrokenActionEntry drops a corrupted/truncated on-disk object from the index. The
+// underlying file is only actually deleted once every ActionID sharing its OutputID has been
+// dropped this way (see releaseOutputRefLocked), so a still-valid dedup reference isn't broken.
+func (dc *Store) removeBrokenActionEntry(actionID string, ie indexEntry) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	if _, ok := dc.index[actionID]; !ok {
+		return
+	}
+	delete(dc.index, actionID)
+	dc.releaseOutputRefLocked(ie.OutputID)
+	dc.dirty = true
 }
 
 func (dc *Store) PreloadSources(req cache.PreloadRequest) ([]string, error) {
