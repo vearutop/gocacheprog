@@ -88,6 +88,9 @@ const (
 	githubActionsShimSocketWait           = 10 * time.Second
 	githubActionsLogTailBytes       int64 = 8_000
 
+	remoteClientMaxRetries = 3
+	remoteClientRetryDelay = 5 * time.Second
+
 	envGHAMode          = "GOCACHEPROG_GHA_MODE"
 	envGHASocket        = "GOCACHEPROG_GHA_SOCKET"
 	envGHAAuth          = "GOCACHEPROG_GHA_AUTH"
@@ -509,6 +512,29 @@ func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, chan
 	return setGitHubEnv(env)
 }
 
+// newRemoteClientWithRetry retries a failed connection to the remote cache server (it not being
+// up yet, a brief network blip) up to remoteClientMaxRetries times before giving up, since a
+// single transient failure here would otherwise cost the whole job its cache for no good reason.
+func newRemoteClientWithRetry(remoteURL, authToken string, sessionInfo *cachehttp.SessionInfo) (*cachehttp.Client, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= remoteClientMaxRetries+1; attempt++ {
+		client, err := cachehttp.NewClientWithSession(remoteURL, authToken, sessionInfo)
+		if err == nil {
+			return client, nil
+		}
+
+		lastErr = err
+		if attempt > remoteClientMaxRetries {
+			break
+		}
+		log.Printf("remote client connect attempt %d/%d failed, retrying in %s: %s", attempt, remoteClientMaxRetries+1, remoteClientRetryDelay, err.Error())
+		time.Sleep(remoteClientRetryDelay)
+	}
+
+	return nil, lastErr
+}
+
 func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
 	cacheDir, err := ResolveNativeCacheDir(cfg.cacheDir)
 	if err != nil {
@@ -519,7 +545,7 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 	}
 
 	startedAt := time.Now().UTC()
-	client, err := cachehttp.NewClientWithSession(cfg.remoteURL, cfg.authToken, &cachehttp.SessionInfo{
+	client, err := newRemoteClientWithRetry(cfg.remoteURL, cfg.authToken, &cachehttp.SessionInfo{
 		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano()),
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
@@ -531,25 +557,28 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 			BaseCommit: baseCommit,
 		},
 	})
+	var restoreStats gocache.TransferStats
 	if err != nil {
-		return fmt.Errorf("remote client: %w", err)
-	}
+		// Same reasoning as the RestoreNativeCache failure below: a remote that can't even be
+		// reached is just a cold GOCACHE, not a broken job.
+		log.Printf("github-actions-init: WARNING: remote client: %s; continuing with a cold cache", err.Error())
+	} else {
+		req := gocache.Request{
+			Commit:       commit,
+			ChangesID:    changesID,
+			BuildType:    cfg.buildType,
+			BaseCommit:   baseCommit,
+			MaxFileBytes: cfg.maxFileBytes,
+		}
 
-	req := gocache.Request{
-		Commit:       commit,
-		ChangesID:    changesID,
-		BuildType:    cfg.buildType,
-		BaseCommit:   baseCommit,
-		MaxFileBytes: cfg.maxFileBytes,
-	}
-
-	log.Printf("github-actions-init: restoring native GOCACHE into %s from %s", cacheDir, cfg.remoteURL)
-	restoreStats, err := RestoreNativeCache(cacheDir, client, req, startedAt)
-	if err != nil {
-		// The cache is an optimization, not a build dependency: a broken/overloaded/out-of-space
-		// remote shouldn't fail the job, just cost it a cold GOCACHE (cache miss).
-		log.Printf("github-actions-init: WARNING: restore native cache: %s; continuing with a cold cache", err.Error())
-		restoreStats = gocache.TransferStats{}
+		log.Printf("github-actions-init: restoring native GOCACHE into %s from %s", cacheDir, cfg.remoteURL)
+		restoreStats, err = RestoreNativeCache(cacheDir, client, req, startedAt)
+		if err != nil {
+			// The cache is an optimization, not a build dependency: a broken/overloaded/out-of-space
+			// remote shouldn't fail the job, just cost it a cold GOCACHE (cache miss).
+			log.Printf("github-actions-init: WARNING: restore native cache: %s; continuing with a cold cache", err.Error())
+			restoreStats = gocache.TransferStats{}
+		}
 	}
 
 	restoreStatsJSON, err := json.Marshal(restoreStats)
@@ -645,7 +674,7 @@ func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit
 
 	log.Printf("github-actions-init: fallback_remote is set and build_type=%q has no recorded usage, restoring from %s into %s", cfg.buildType, cfg.remoteURL, cacheDir)
 
-	client, err := cachehttp.NewClientWithSession(cfg.remoteURL, cfg.authToken, &cachehttp.SessionInfo{
+	client, err := newRemoteClientWithRetry(cfg.remoteURL, cfg.authToken, &cachehttp.SessionInfo{
 		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), initStartedAt.UnixNano()),
 		StartedAt: initStartedAt,
 		PID:       os.Getpid(),
@@ -658,7 +687,10 @@ func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("fallback_remote client: %w", err)
+		// Same reasoning as below: a remote that can't even be reached leaves cacheDir cold
+		// (cache miss), it shouldn't fail the job.
+		log.Printf("github-actions-init: WARNING: fallback_remote client: %s; continuing with a cold local cache", err.Error())
+		return nil
 	}
 
 	req := gocache.Request{
@@ -773,7 +805,7 @@ func doneGocacheMode() error {
 	}
 
 	startedAt := time.Now().UTC()
-	client, err := cachehttp.NewClientWithSession(remoteURL, auth, &cachehttp.SessionInfo{
+	client, err := newRemoteClientWithRetry(remoteURL, auth, &cachehttp.SessionInfo{
 		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano()),
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
@@ -786,7 +818,12 @@ func doneGocacheMode() error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("remote client: %w", err)
+		// Caching is a build optimization, not a build dependency: the job already finished by
+		// this point, so a remote cache server being unreachable just means the next job pays
+		// for a cache miss, not a broken job (same swallow-and-log as
+		// doneLocalGocacheFallbackUpload below).
+		log.Printf("github-actions-done: WARNING: remote client: %s; skipping cache upload", err.Error())
+		return nil
 	}
 
 	req := gocache.Request{
@@ -920,7 +957,7 @@ func doneLocalGocacheFallbackUpload(cacheDir, buildType string) {
 	}
 
 	startedAt := time.Now().UTC()
-	client, err := cachehttp.NewClientWithSession(remoteURL, auth, &cachehttp.SessionInfo{
+	client, err := newRemoteClientWithRetry(remoteURL, auth, &cachehttp.SessionInfo{
 		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano()),
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
