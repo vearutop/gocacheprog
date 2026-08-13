@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bool64/dev/version"
@@ -92,6 +94,42 @@ type sessionRow struct {
 	SessionTime  string
 }
 
+// prNumberFromRef extracts a PR number from ref if it looks like a changes-id in this codebase's
+// "owner/repo#123" convention (see -changes-id). Returns "" if ref doesn't match -- e.g. it's a
+// raw commit hash, which never contains "#".
+func prNumberFromRef(ref string) string {
+	repo, num, ok := strings.Cut(ref, "#")
+	if !ok || !strings.Contains(repo, "/") || num == "" {
+		return ""
+	}
+	if _, err := strconv.Atoi(num); err != nil {
+		return ""
+	}
+
+	return num
+}
+
+// jobURLWithPR appends ?pr=<number> to jobURL when ref carries a PR number, the same query
+// param GitHub's own UI adds when you navigate to a run from a PR's checks tab -- it makes the
+// run page show a "part of #<number>" link back to the PR.
+func jobURLWithPR(jobURL, ref string) string {
+	if jobURL == "" {
+		return ""
+	}
+
+	num := prNumberFromRef(ref)
+	if num == "" {
+		return jobURL
+	}
+
+	sep := "?"
+	if strings.Contains(jobURL, "?") {
+		sep = "&"
+	}
+
+	return jobURL + sep + "pr=" + num
+}
+
 // Index serves a Basic-Auth-gated HTML status page at "/" with storage stats and a manual
 // cleanup trigger, for operators without easy access to the Bearer-token JSON /status endpoint.
 func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
@@ -136,7 +174,7 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 			Status:       cs.Status,
 			Version:      cs.Version,
 			Ref:          cs.Ref,
-			JobURL:       cs.JobURL,
+			JobURL:       jobURLWithPR(cs.JobURL, cs.Ref),
 			BuildType:    cs.BuildType,
 			PreloadSize:  byteSize(cs.PreloadBytes),
 			PreloadTime:  cs.PreloadTime.Round(time.Millisecond).String(),

@@ -132,7 +132,7 @@ func TestIndex_RefLinksToJobURLWhenAvailable(t *testing.T) {
 		SessionID: "session-with-job",
 		JobURL:    "https://github.com/acme/widgets/actions/runs/12345",
 		Params: local.ProxyParams{
-			ChangesID: "repo/pr-456",
+			ChangesID: "acme/widgets#456",
 		},
 	})
 	require.NoError(t, err)
@@ -152,7 +152,10 @@ func TestIndex_RefLinksToJobURLWhenAvailable(t *testing.T) {
 	require.NoError(t, err)
 	body := string(b)
 
-	require.True(t, strings.Contains(body, `<a href="https://github.com/acme/widgets/actions/runs/12345" target="_blank" rel="noopener noreferrer">repo/pr-456</a>`))
+	// GitHub's own UI recognizes ?pr=<number> on a run URL and shows a "part of #<number>" link
+	// back to the PR -- the same param it appends itself when you navigate to a run from a PR's
+	// checks tab.
+	require.True(t, strings.Contains(body, `<a href="https://github.com/acme/widgets/actions/runs/12345?pr=456" target="_blank" rel="noopener noreferrer">acme/widgets#456</a>`))
 }
 
 func TestIndex_SessionMarkedDone(t *testing.T) {
