@@ -101,9 +101,13 @@ func TestApp_IterateInputAndResponses(t *testing.T) {
 	var commands, outputIDs []string
 	for _, line := range lines {
 		if cmd, ok := line["Command"]; ok {
-			commands = append(commands, cmd.(string))
+			s, ok := cmd.(string)
+			require.True(t, ok, "Command field is not a string: %+v", cmd)
+			commands = append(commands, s)
 		} else if oid, ok := line["OutputID"]; ok {
-			outputIDs = append(outputIDs, oid.(string))
+			s, ok := oid.(string)
+			require.True(t, ok, "OutputID field is not a string: %+v", oid)
+			outputIDs = append(outputIDs, s)
 		}
 	}
 
