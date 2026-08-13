@@ -586,6 +586,43 @@ func logAbortSaveCacheError(err error) {
 	}
 }
 
+// ExistingPaths asks the server which of paths it already has, so a caller about to save-cache
+// can skip re-compressing and re-uploading objects the server already stores.
+func (c *Client) ExistingPaths(paths []string) ([]string, error) {
+	body, err := json.Marshal(paths)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := http.NewRequest(http.MethodPost, c.baseURL+"/save-cache-has", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	r.Header.Set("Content-Type", "application/json")
+	c.setSessionAuthHeaders(r)
+
+	res, err := c.roundTrip(r)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close save-cache-has body: %s", err.Error())
+		}
+	}()
+
+	if err := checkStatus(res, http.StatusOK, "save-cache-has"); err != nil {
+		return nil, err
+	}
+
+	var existing []string
+	if err := json.NewDecoder(res.Body).Decode(&existing); err != nil {
+		return nil, err
+	}
+
+	return existing, nil
+}
+
 // startSaveCache begins a save-cache upload session and returns the server's
 // configured single-file size limit (0 if the server has no limit), so the
 // client can skip oversized files before spending time compressing and

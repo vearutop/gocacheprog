@@ -1598,6 +1598,37 @@ func (s *Store) objectExistsLocked(relPath string) bool {
 	return err == nil
 }
 
+// ExistingPaths returns the subset of paths already present in the store, so a caller about to
+// upload a batch (e.g. save-cache) can skip re-compressing and re-uploading what the server
+// already has instead of finding out only after paying that cost. Index lookups happen under
+// s.mu, but the (potentially many) os.Stat calls for plain-file entries run unlocked, so a large
+// batch doesn't hold up concurrent puts/evictions for the duration of the check.
+func (s *Store) ExistingPaths(paths []string) []string {
+	s.mu.Lock()
+	existing := make([]string, 0, len(paths))
+	var plainFiles []string
+	for _, p := range paths {
+		ie, ok := s.index[p]
+		if !ok {
+			continue
+		}
+		if ie.PoolPage != 0 {
+			existing = append(existing, p)
+			continue
+		}
+		plainFiles = append(plainFiles, p)
+	}
+	s.mu.Unlock()
+
+	for _, p := range plainFiles {
+		if _, err := os.Stat(s.objectPath(p)); err == nil {
+			existing = append(existing, p)
+		}
+	}
+
+	return existing
+}
+
 func (s *Store) entryStoredSize(ie indexEntry) int64 {
 	if ie.WireSize > 0 {
 		return ie.WireSize

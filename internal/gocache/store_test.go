@@ -132,6 +132,20 @@ func TestStorePutBody_AcceptsZeroSizeItem(t *testing.T) {
 	require.Equal(t, "1", store.Stats()["index"])
 }
 
+// TestExistingPaths_ReportsWhatServerAlreadyHas covers the primitive save-cache's pre-upload
+// dedup check is built on: a bulk existence check keyed by path, not by ActionID.
+func TestExistingPaths_ReportsWhatServerAlreadyHas(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir)
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "commit123"}, "ab/cache-entry-a", "payload-a")
+
+	existing := store.ExistingPaths([]string{"ab/cache-entry-a", "cd/missing"})
+	require.Equal(t, []string{"ab/cache-entry-a"}, existing)
+}
+
 // TestStoreRestore_SkipsAndRemovesTruncatedPlainFileEntry covers a pre-existing corrupted entry
 // (e.g. from before storePutBody validated write length): Restore must not serve a client bytes
 // it can't use, and must drop the entry so a later restore doesn't hit it again either.

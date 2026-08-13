@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,6 +91,43 @@ func TestSaveFreshNativeCache_NoFreshFilesIsNoop(t *testing.T) {
 	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
 	require.NoError(t, err)
 	require.Equal(t, 0, stats.Files)
+}
+
+// TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas covers the actual reported waste: many
+// parallel jobs rebuilding the same unchanged dependency from an empty local GOCACHE each think
+// it's "fresh" locally, but it's only genuinely new to the server the first time. The pre-upload
+// existence check must filter it out before it's compressed and uploaded again.
+func TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := NewStore(serverDir, WithCompression())
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(cachehttp.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := cachehttp.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	preExisting := gocache.FileItem{Path: "ab/shared-dep", Size: int64(len("shared content")), WireSize: int64(len("shared content"))}
+	preExisting.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("shared content")), nil
+	})
+	require.NoError(t, nativeStore.SaveItem(preExisting))
+
+	cacheDir := t.TempDir()
+	since := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	writeCacheFile(t, cacheDir, "ab/shared-dep", "shared content", since.Add(time.Minute))
+	writeCacheFile(t, cacheDir, "cd/genuinely-new", "new content", since.Add(time.Minute))
+
+	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
+	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Files, "only the genuinely new file should be uploaded")
+
+	require.Equal(t, "0", nativeStore.Stats()["putsExist"], "the pre-existing object must never reach SaveItem")
 }
 
 func TestInitLocalGocacheMode_FallbackRemoteRestoresWhenCold(t *testing.T) {
