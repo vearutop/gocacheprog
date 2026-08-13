@@ -92,11 +92,23 @@ func TestApp_IterateInputAndResponses(t *testing.T) {
 	}
 
 	require.Len(t, lines, 5)
-	require.Equal(t, "put", lines[0]["Command"])
-	require.Equal(t, "get", lines[1]["Command"])
-	require.Equal(t, "close", lines[2]["Command"])
-	require.Equal(t, "outputId1", lines[3]["OutputID"])
-	require.Equal(t, "outputId1", lines[4]["OutputID"])
+
+	// Requests are dumped by IterateInput and responses by IterateResponses, two goroutines
+	// racing to append to the same log under a mutex that only guarantees each write lands
+	// intact -- not that request dumps land before response dumps. Each stream is internally
+	// ordered (IterateInput dumps sequentially; resps is read in the order Put/Lookup sent to
+	// it), so assert order within each stream rather than absolute position.
+	var commands, outputIDs []string
+	for _, line := range lines {
+		if cmd, ok := line["Command"]; ok {
+			commands = append(commands, cmd.(string))
+		} else if oid, ok := line["OutputID"]; ok {
+			outputIDs = append(outputIDs, oid.(string))
+		}
+	}
+
+	require.Equal(t, []string{"put", "get", "close"}, commands)
+	require.Equal(t, []string{"outputId1", "outputId1"}, outputIDs)
 }
 
 func TestApp_IterateInput_RejectsDeclaredBodySizeMismatch(t *testing.T) {
