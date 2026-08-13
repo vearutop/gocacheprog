@@ -1367,6 +1367,12 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 		}
 	}
 
+	if len(sources) > 0 {
+		if err := s.supplementSmallResultWithNewest(req.BuildType, &result, &sources, seen); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	if len(sources) == 0 {
 		newest, err := s.newestFallbackPaths(req.BuildType, seen)
 		if err != nil {
@@ -1384,6 +1390,58 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 	}
 
 	return result, sources, nil
+}
+
+// smallRestoreRatio: when a resolved commit/parent/changes/base result has fewer paths than this
+// fraction of the newest manifest for the same build type, treat it as likely hollowed out by
+// eviction (which has no awareness of which manifests still reference an object) and supplement
+// it with the newest manifest's paths too, rather than silently serving a shrunken result. Builds
+// tend to migrate forward to newer code, so the newest manifest for a build type is usually still
+// broadly relevant even to an older commit/PR (same reasoning as newestFallbackPaths below).
+const smallRestoreRatio = 0.5
+
+// supplementSmallResultWithNewest tops up result/sources in place with the newest manifest's
+// paths for buildType, if the result resolved so far looks abnormally small next to it (see
+// smallRestoreRatio). A no-op if there's no newest manifest, or the result isn't small.
+func (s *Store) supplementSmallResultWithNewest(buildType string, result *[]string, sources *[]string, seen map[string]struct{}) error {
+	newestPaths, changed, manifestPath, err := s.loadNewestManifest(buildType)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+
+		return err
+	}
+
+	if len(newestPaths) == 0 || float64(len(*result)) >= float64(len(newestPaths))*smallRestoreRatio {
+		return nil
+	}
+
+	if changed {
+		body := strings.Join(newestPaths, "\n")
+		if body != "" {
+			body += "\n"
+		}
+		// See restorePaths: self-heal write-back failing shouldn't fail the restore.
+		if err := s.writeManifest(manifestPath, body); err != nil {
+			log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
+		}
+	}
+
+	added := false
+	for _, relPath := range newestPaths {
+		if _, ok := seen[relPath]; ok {
+			continue
+		}
+		seen[relPath] = struct{}{}
+		*result = append(*result, relPath)
+		added = true
+	}
+	if added {
+		*sources = append(*sources, "newest")
+	}
+
+	return nil
 }
 
 // newestFallbackPaths is restorePaths' last-resort source: when no commit/parent/changes/base

@@ -17,6 +17,57 @@ import (
 	"github.com/vearutop/gocacheprog/internal/recordpool"
 )
 
+// TestRestorePaths_SupplementsSmallChangesResultWithNewest covers the actual reported production
+// symptom: eviction has no awareness of which manifests still reference an object, so a
+// long-lived "changes" manifest can quietly hollow out over many eviction cycles (each Restore
+// self-heals it down further) while a newer commit's manifest for the same build type stays
+// intact. The resolved result should be supplemented with the newest manifest rather than
+// silently served small.
+func TestRestorePaths_SupplementsSmallChangesResultWithNewest(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{ChangesID: "pr#1", BuildType: "unit"}, "ab/changes-only", "changes-only-payload")
+
+	saveItemForTest(t, store, Request{Commit: "commit-newer", BuildType: "unit"}, "cd/newer-1", "p1")
+	saveItemForTest(t, store, Request{Commit: "commit-newer", BuildType: "unit"}, "cd/newer-2", "p2")
+	saveItemForTest(t, store, Request{Commit: "commit-newer", BuildType: "unit"}, "cd/newer-3", "p3")
+
+	var restored []string
+	sources, err := store.Restore(Request{ChangesID: "pr#1", BuildType: "unit"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"changes", "newest"}, sources)
+	require.ElementsMatch(t, []string{"ab/changes-only", "cd/newer-1", "cd/newer-2", "cd/newer-3"}, restored)
+}
+
+// TestRestorePaths_DoesNotSupplementNormallySizedResult confirms the heuristic doesn't kick in
+// (and doesn't add "newest" to sources) when the resolved result isn't actually small relative to
+// the newest manifest for the same build type.
+func TestRestorePaths_DoesNotSupplementNormallySizedResult(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "commit-a", BuildType: "unit"}, "ab/a-1", "p1")
+	saveItemForTest(t, store, Request{Commit: "commit-a", BuildType: "unit"}, "ab/a-2", "p2")
+
+	saveItemForTest(t, store, Request{Commit: "commit-newer", BuildType: "unit"}, "cd/newer-1", "p1")
+	saveItemForTest(t, store, Request{Commit: "commit-newer", BuildType: "unit"}, "cd/newer-2", "p2")
+
+	var restored []string
+	sources, err := store.Restore(Request{Commit: "commit-a", BuildType: "unit"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"commit"}, sources)
+	require.ElementsMatch(t, []string{"ab/a-1", "ab/a-2"}, restored)
+}
+
 func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 	dir := t.TempDir()
 
