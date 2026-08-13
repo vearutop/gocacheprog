@@ -170,6 +170,38 @@ func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache
 	}
 	batch.Items = fresh
 
+	// "New to this job's local GOCACHE" isn't the same as "new to the server": many parallel
+	// jobs rebuilding the same unchanged dependency from an empty local cache each produce the
+	// same content-addressed path. Check before paying to compress and upload objects the
+	// server already has -- errors here are non-fatal, same reasoning as everywhere else in
+	// this file: caching is an optimization, not a build dependency, so fall back to uploading
+	// everything rather than failing the job.
+	if len(batch.Items) > 0 {
+		paths := make([]string, len(batch.Items))
+		for i, item := range batch.Items {
+			paths[i] = item.Path
+		}
+
+		if existing, existErr := client.ExistingPaths(paths); existErr != nil {
+			log.Printf("save-cache: check existing objects failed, uploading everything: %s", existErr.Error())
+		} else if len(existing) > 0 {
+			existingSet := make(map[string]struct{}, len(existing))
+			for _, p := range existing {
+				existingSet[p] = struct{}{}
+			}
+
+			deduped := batch.Items[:0]
+			for _, item := range batch.Items {
+				if _, ok := existingSet[item.Path]; ok {
+					continue
+				}
+				deduped = append(deduped, item)
+			}
+			log.Printf("save-cache: skipping %d/%d objects the server already has", len(batch.Items)-len(deduped), len(batch.Items))
+			batch.Items = deduped
+		}
+	}
+
 	if len(batch.Items) == 0 {
 		log.Printf(
 			"save-cache completed: files=0 upload_time=0s compressed=0 B uncompressed=0 B; commit=%q changes_id=%q build_type=%q base_commit=%q parent_commit=%q",

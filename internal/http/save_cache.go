@@ -1,6 +1,7 @@
 package http
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,32 @@ import (
 
 	"github.com/vearutop/gocacheprog/internal/gocache"
 )
+
+// SaveCacheHas reports which of the posted paths the native store already has, so a client about
+// to save-cache can skip re-compressing and re-uploading objects it already stores -- callers
+// commonly rebuild byte-identical shared dependencies across many parallel jobs from an empty
+// local GOCACHE, so "new to this job" and "new to the server" are very different things.
+func (h *Handler) SaveCacheHas(rw http.ResponseWriter, r *http.Request) {
+	if h.gocacheStore == nil {
+		http.Error(rw, "save-cache is not supported", http.StatusNotImplemented)
+		return
+	}
+
+	defer closeRequestBody(r)
+
+	var paths []string
+	if err := json.NewDecoder(r.Body).Decode(&paths); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	existing := h.gocacheStore.ExistingPaths(paths)
+
+	rw.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(rw).Encode(existing); err != nil {
+		log.Printf("encode save-cache-has response: %s", err.Error())
+	}
+}
 
 func (h *Handler) SaveCache(rw http.ResponseWriter, r *http.Request) {
 	if h.gocacheStore == nil {

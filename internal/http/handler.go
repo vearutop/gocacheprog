@@ -70,11 +70,11 @@ type clientSession struct {
 // sessionIdleTimeout is how long a session is still shown as "in progress" after its last
 // request; a client resends its session ID on every call, so a real build never goes this long
 // between requests.
-const sessionIdleTimeout = 5 * time.Minute
+const sessionIdleTimeout = 10 * time.Minute
 
 // doneSessionRetention bounds how long a session that explicitly called -github-actions-done
 // stays on the status page afterward, before being dropped from the list entirely.
-const doneSessionRetention = 5 * time.Minute
+const doneSessionRetention = 24 * time.Hour
 
 // sessionRetention bounds how long a session with no done signal (idle status, or a mode that
 // never marks done) lingers on the status page before being pruned: sessionIdleTimeout to go
@@ -339,6 +339,7 @@ var routes = map[string]func(*Handler, http.ResponseWriter, *http.Request){
 	"/clear":               (*Handler).ClearCache,
 	"/inspect":             (*Handler).InspectCache,
 	"/integrity-check":     (*Handler).IntegrityCheck,
+	"/save-cache-has":      (*Handler).SaveCacheHas,
 	"/save-cache":          (*Handler).SaveCache,
 	"/save-cache-chunk":    (*Handler).SaveCacheChunk,
 	"/save-cache-start":    (*Handler).StartSaveCache,

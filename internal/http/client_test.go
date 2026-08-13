@@ -275,6 +275,31 @@ func TestClient_SaveCache_SkipsFilesExceedingServerMaxFileBytesWithoutClientFlag
 	require.Equal(t, "ab/small\n", string(commitBody))
 }
 
+func TestClient_ExistingPaths(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir)
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"))
+	require.NoError(t, err)
+
+	present := gocache.FileItem{Path: "ab/present", Size: 5, WireSize: 5}
+	present.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString("hello")), nil
+	})
+	require.NoError(t, nativeStore.SaveItem(present))
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	existing, err := client.ExistingPaths([]string{"ab/present", "cd/missing"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"ab/present"}, existing)
+}
+
 func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {
 	serverDir := t.TempDir()
 	localStore, err := local.NewStore(serverDir, local.WithCompression())
