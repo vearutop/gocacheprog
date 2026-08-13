@@ -114,6 +114,24 @@ func TestStorePutBody_RejectsTruncatedPlainFileWrite(t *testing.T) {
 	require.Equal(t, "0", store.Stats()["index"])
 }
 
+// TestStorePutBody_AcceptsZeroSizeItem is a regression test for a production panic: a zero-size
+// item's body reader legitimately returns (nil, nil) (see FileItem.UncompressedBodyReader), and
+// wrapping that nil reader unconditionally in countingReader for the truncation-length check
+// above made writeAtomic's own `if rd != nil` guard moot -- io.Copy then called Read on a
+// countingReader wrapping a nil io.Reader, panicking the whole process.
+func TestStorePutBody_AcceptsZeroSizeItem(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir)
+	require.NoError(t, err)
+
+	item := FileItem{Path: "ab/empty", Size: 0}
+	require.NoError(t, store.SaveItem(item))
+
+	require.FileExists(t, store.objectPath("ab/empty"))
+	require.Equal(t, "1", store.Stats()["index"])
+}
+
 // TestStoreRestore_SkipsAndRemovesTruncatedPlainFileEntry covers a pre-existing corrupted entry
 // (e.g. from before storePutBody validated write length): Restore must not serve a client bytes
 // it can't use, and must drop the entry so a later restore doesn't hit it again either.

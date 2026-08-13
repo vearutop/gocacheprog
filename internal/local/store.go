@@ -445,6 +445,9 @@ type countingReader struct {
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
+	if c.r == nil {
+		return 0, io.EOF
+	}
 	n, err := c.r.Read(p)
 	c.n += int64(n)
 

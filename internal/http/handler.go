@@ -1,9 +1,11 @@
 package http
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +32,11 @@ type Handler struct {
 	clientSessionsMu     sync.Mutex
 	clientSessions       map[string]*clientSession
 	combinedMaxDiskBytes int64
+	panicCount           int64
+	panicMu              sync.Mutex
+	lastPanicMessage     string
+	lastPanicStack       string
+	lastPanicAt          time.Time
 }
 
 // HandlerOption configures optional Handler behavior not covered by NewHandlerWithPreloadLimit's
@@ -354,7 +361,39 @@ func (h *Handler) serveSessionDone(rw http.ResponseWriter, r *http.Request) {
 	rw.WriteHeader(http.StatusNoContent)
 }
 
+// recordPanic tracks a recovered panic so the status page can surface it, instead of it only
+// ever showing up as a one-line log entry easy to miss.
+func (h *Handler) recordPanic(rec any) {
+	atomic.AddInt64(&h.panicCount, 1)
+	stack := string(debug.Stack())
+
+	h.panicMu.Lock()
+	h.lastPanicMessage = fmt.Sprintf("%v", rec)
+	h.lastPanicStack = stack
+	h.lastPanicAt = time.Now()
+	h.panicMu.Unlock()
+
+	log.Printf("panic recovered: %v\n%s", rec, stack)
+}
+
+func (h *Handler) panicSnapshot() (count int64, message, stack string, at time.Time) {
+	h.panicMu.Lock()
+	defer h.panicMu.Unlock()
+
+	return atomic.LoadInt64(&h.panicCount), h.lastPanicMessage, h.lastPanicStack, h.lastPanicAt
+}
+
 func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	// A panic anywhere below would otherwise crash the whole process (a Go panic in any
+	// goroutine, unrecovered, takes down every in-flight request across every session, not just
+	// this one) -- recover it here so one bad request fails on its own instead.
+	defer func() {
+		if rec := recover(); rec != nil {
+			h.recordPanic(rec)
+			http.Error(rw, "internal server error", http.StatusInternalServerError)
+		}
+	}()
+
 	if r.URL.Path == "/" {
 		h.Index(rw, r)
 		return
@@ -433,5 +472,6 @@ func (h *Handler) Stats() map[string]string {
 		"preloadStarted":   strconv.FormatInt(atomic.LoadInt64(&h.preloadStarted), 10),
 		"preloadCompleted": strconv.FormatInt(atomic.LoadInt64(&h.preloadCompleted), 10),
 		"preloadLimit":     strconv.Itoa(cap(h.preloadSem)),
+		"panics":           strconv.FormatInt(atomic.LoadInt64(&h.panicCount), 10),
 	}
 }
