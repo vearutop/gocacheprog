@@ -1368,20 +1368,20 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 	}
 
 	if len(sources) > 0 {
-		if err := s.supplementSmallResultWithNewest(req.BuildType, &result, &sources, seen); err != nil {
+		if err := s.supplementSmallResultWithDefault(req.BuildType, &result, &sources, seen); err != nil {
 			return nil, nil, err
 		}
 	}
 
 	if len(sources) == 0 {
-		newest, err := s.newestFallbackPaths(req.BuildType, seen)
+		def, err := s.defaultFallbackPaths(req.BuildType, seen)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if len(newest) > 0 {
-			sources = []string{"newest"}
-			result = append(result, newest...)
+		if len(def) > 0 {
+			sources = []string{"default"}
+			result = append(result, def...)
 		}
 	}
 
@@ -1392,19 +1392,27 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 	return result, sources, nil
 }
 
+// defaultManifestSampleSize is how many of a build type's most-recently-written manifests get
+// unioned together as its "default" fallback source: a single newest manifest is fragile (a
+// brand-new PR that just saved its first few files counts as "newest" the moment it's touched,
+// even though it's nowhere near representative of a healthy cache for this build type, once many
+// PRs/branches share one build type). Unioning a handful smooths that out, while staying bounded
+// -- this is always freshly recomputed from whichever manifests currently exist, never a
+// persisted, ever-growing set.
+const defaultManifestSampleSize = 3
+
 // smallRestoreRatio: when a resolved commit/parent/changes/base result has fewer paths than this
-// fraction of the newest manifest for the same build type, treat it as likely hollowed out by
-// eviction (which has no awareness of which manifests still reference an object) and supplement
-// it with the newest manifest's paths too, rather than silently serving a shrunken result. Builds
-// tend to migrate forward to newer code, so the newest manifest for a build type is usually still
-// broadly relevant even to an older commit/PR (same reasoning as newestFallbackPaths below).
+// fraction of the default source (see loadDefaultManifestPaths) for the same build type, treat it
+// as likely hollowed out by eviction (which has no awareness of which manifests still reference
+// an object) and supplement it with the default source's paths too, rather than silently serving
+// a shrunken result.
 const smallRestoreRatio = 0.5
 
-// supplementSmallResultWithNewest tops up result/sources in place with the newest manifest's
+// supplementSmallResultWithDefault tops up result/sources in place with the default source's
 // paths for buildType, if the result resolved so far looks abnormally small next to it (see
-// smallRestoreRatio). A no-op if there's no newest manifest, or the result isn't small.
-func (s *Store) supplementSmallResultWithNewest(buildType string, result *[]string, sources *[]string, seen map[string]struct{}) error {
-	newestPaths, changed, manifestPath, err := s.loadNewestManifest(buildType)
+// smallRestoreRatio). A no-op if there's no default source, or the result isn't small.
+func (s *Store) supplementSmallResultWithDefault(buildType string, result *[]string, sources *[]string, seen map[string]struct{}) error {
+	defaultPaths, err := s.loadDefaultManifestPaths(buildType)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -1413,39 +1421,27 @@ func (s *Store) supplementSmallResultWithNewest(buildType string, result *[]stri
 		return err
 	}
 
-	small := len(newestPaths) > 0 && float64(len(*result)) < float64(len(newestPaths))*smallRestoreRatio
+	small := len(defaultPaths) > 0 && float64(len(*result)) < float64(len(defaultPaths))*smallRestoreRatio
 
-	// novel counts how many of newest's paths aren't already in the resolved result -- if small
-	// is true but novel is 0, the resolved manifest(s) and "newest" are the same file (e.g. an
-	// actively-pushed PR's own manifest is also the most recently written one for this build
-	// type), so there's nothing healthier to borrow from and this check can't help. Logged
-	// unconditionally (not just when small) so a "why didn't this help" report can be diagnosed
-	// from the log alone instead of guessing.
+	// novel counts how many of default's paths aren't already in the resolved result -- if small
+	// is true but novel is 0, the resolved manifest(s) already cover everything default has, so
+	// there's nothing healthier to borrow from and this check can't help. Logged unconditionally
+	// (not just when small) so a "why didn't this help" report can be diagnosed from the log
+	// alone instead of guessing.
 	novel := 0
-	for _, relPath := range newestPaths {
+	for _, relPath := range defaultPaths {
 		if _, ok := seen[relPath]; !ok {
 			novel++
 		}
 	}
-	log.Printf("restore-cache: size check build_type=%q resolved=%d newest=%d newest_manifest=%q novel_in_newest=%d small=%v", buildType, len(*result), len(newestPaths), manifestPath, novel, small)
+	log.Printf("restore-cache: size check build_type=%q resolved=%d default=%d novel_in_default=%d small=%v", buildType, len(*result), len(defaultPaths), novel, small)
 
 	if !small {
 		return nil
 	}
 
-	if changed {
-		body := strings.Join(newestPaths, "\n")
-		if body != "" {
-			body += "\n"
-		}
-		// See restorePaths: self-heal write-back failing shouldn't fail the restore.
-		if err := s.writeManifest(manifestPath, body); err != nil {
-			log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
-		}
-	}
-
 	added := false
-	for _, relPath := range newestPaths {
+	for _, relPath := range defaultPaths {
 		if _, ok := seen[relPath]; ok {
 			continue
 		}
@@ -1454,36 +1450,24 @@ func (s *Store) supplementSmallResultWithNewest(buildType string, result *[]stri
 		added = true
 	}
 	if added {
-		*sources = append(*sources, "newest")
+		*sources = append(*sources, "default")
 	}
 
 	return nil
 }
 
-// newestFallbackPaths is restorePaths' last-resort source: when no commit/parent/changes/base
-// manifest matched anything, it loads whichever manifest for this build type was written most
-// recently (see loadNewestManifest), self-heals it if needed, and returns whatever of its paths
-// aren't already in seen. Returns (nil, nil) - not an error - when no manifest exists at all yet.
-func (s *Store) newestFallbackPaths(buildType string, seen map[string]struct{}) ([]string, error) {
-	paths, changed, manifestPath, err := s.loadNewestManifest(buildType)
+// defaultFallbackPaths is restorePaths' last-resort source: when no commit/parent/changes/base
+// manifest matched anything, it loads buildType's default source (see loadDefaultManifestPaths)
+// and returns whatever of its paths aren't already in seen. Returns (nil, nil) - not an error -
+// when no manifest exists at all yet for this build type.
+func (s *Store) defaultFallbackPaths(buildType string, seen map[string]struct{}) ([]string, error) {
+	paths, err := s.loadDefaultManifestPaths(buildType)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 
 		return nil, err
-	}
-
-	if changed {
-		body := strings.Join(paths, "\n")
-		if body != "" {
-			body += "\n"
-		}
-
-		// See restorePaths: self-heal write-back failing shouldn't fail the restore.
-		if err := s.writeManifest(manifestPath, body); err != nil {
-			log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
-		}
 	}
 
 	result := make([]string, 0, len(paths))
@@ -1499,29 +1483,29 @@ func (s *Store) newestFallbackPaths(buildType string, seen map[string]struct{}) 
 	return result, nil
 }
 
-// loadNewestManifest is the last-resort restore source: when no commit/parent/changes/base
-// manifest matched - a long pause with nothing relevant built on the target branch since, or the
-// very first build of a new build type - it falls back to whichever manifest for this build type
-// was written most recently, from any commit or PR. In practice, cache entries are usually still
-// largely relevant across unrelated PRs of the same build type, so this beats every PR starting
-// completely cold until the target branch catches up. Returns os.ErrNotExist if no manifest
-// exists yet for this build type at all.
-func (s *Store) loadNewestManifest(buildType string) ([]string, bool, string, error) {
+// loadDefaultManifestPaths unions the paths of buildType's defaultManifestSampleSize most
+// recently written manifests (any commit/changes/base scope), self-healing each along the way.
+// This is restorePaths' fallback source, both when nothing matched at all and when what matched
+// looks abnormally small (see supplementSmallResultWithDefault) -- more representative of "what a
+// healthy cache for this build type looks like" than picking a single newest manifest, since
+// recency and completeness aren't strongly correlated once many PRs/branches share a build type.
+// Returns os.ErrNotExist if no manifest exists yet for this build type at all.
+func (s *Store) loadDefaultManifestPaths(buildType string) ([]string, error) {
 	scopeDir, err := manifestScopeDir(buildType)
 	if err != nil {
-		return nil, false, "", err
+		return nil, err
 	}
 
 	files, err := listManifestFiles(filepath.Join(s.dir, "manifests", scopeDir))
 	if err != nil {
-		return nil, false, "", err
+		return nil, err
 	}
 
-	var (
-		newestPath string
-		newestTime time.Time
-	)
-
+	type candidate struct {
+		path    string
+		modTime time.Time
+	}
+	candidates := make([]candidate, 0, len(files))
 	for _, path := range files {
 		info, statErr := os.Stat(path)
 		if statErr != nil {
@@ -1529,22 +1513,47 @@ func (s *Store) loadNewestManifest(buildType string) ([]string, bool, string, er
 				continue
 			}
 
-			return nil, false, "", statErr
+			return nil, statErr
 		}
+		candidates = append(candidates, candidate{path: path, modTime: info.ModTime()})
+	}
 
-		if info.ModTime().After(newestTime) {
-			newestTime = info.ModTime()
-			newestPath = path
+	if len(candidates) == 0 {
+		return nil, os.ErrNotExist
+	}
+
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].modTime.After(candidates[j].modTime) })
+	if len(candidates) > defaultManifestSampleSize {
+		candidates = candidates[:defaultManifestSampleSize]
+	}
+
+	seen := map[string]struct{}{}
+	var result []string
+	for _, c := range candidates {
+		paths, changed, err := s.loadManifest(c.path)
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			body := strings.Join(paths, "\n")
+			if body != "" {
+				body += "\n"
+			}
+			// See restorePaths: self-heal write-back failing shouldn't fail the restore.
+			if err := s.writeManifest(c.path, body); err != nil {
+				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", c.path, err.Error())
+			}
+		}
+		for _, p := range paths {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			result = append(result, p)
 		}
 	}
 
-	if newestPath == "" {
-		return nil, false, "", os.ErrNotExist
-	}
-
-	paths, changed, err := s.loadManifest(newestPath)
-
-	return paths, changed, newestPath, err
+	return result, nil
 }
 
 func (s *Store) loadCommitManifest(commit string, buildType string) ([]string, bool, string, error) {
@@ -2091,7 +2100,8 @@ func (s *Store) uploadSessionPath(uploadID string) (string, error) {
 func (s *Store) targetManifestPaths(req Request) ([]string, error) {
 	if strings.TrimSpace(req.BuildType) != "" &&
 		strings.TrimSpace(req.Commit) == "" &&
-		strings.TrimSpace(req.ChangesID) == "" {
+		strings.TrimSpace(req.ChangesID) == "" &&
+		strings.TrimSpace(req.BaseCommit) == "" {
 		scopeDir, err := manifestScopeDir(req.BuildType)
 		if err != nil {
 			return nil, err
