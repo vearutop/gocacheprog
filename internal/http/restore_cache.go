@@ -74,7 +74,7 @@ func (h *Handler) RestoreCache(rw http.ResponseWriter, r *http.Request) {
 	}
 	totalTime := time.Since(startedAt)
 	rw.Header().Set(headerRestoreTotalTime, totalTime.String())
-	h.recordSessionPreload(r, cw.n, totalTime)
+	h.recordSessionPreload(r, cw.n, totalTime, strings.Join(sources, ","))
 }
 
 // countingWriter tracks bytes written through it, for attributing a restore-cache transfer's

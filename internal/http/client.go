@@ -594,14 +594,18 @@ func logAbortSaveCacheError(err error) {
 }
 
 // ExistingPaths asks the server which of paths it already has, so a caller about to save-cache
-// can skip re-compressing and re-uploading objects the server already stores.
-func (c *Client) ExistingPaths(paths []string) ([]string, error) {
+// can skip re-compressing and re-uploading objects the server already stores. req scopes which
+// commit/changes-id/build-type manifest the existing paths get merged into server-side (see
+// SaveCacheHas) -- skipping the upload must not also mean silently leaving those paths out of
+// this commit/PR's own manifest, or a future restore for it wouldn't find them even though the
+// underlying objects are right there.
+func (c *Client) ExistingPaths(req gocache.Request, paths []string) ([]string, error) {
 	body, err := json.Marshal(paths)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := http.NewRequest(http.MethodPost, c.baseURL+"/save-cache-has", bytes.NewReader(body))
+	r, err := http.NewRequest(http.MethodPost, c.baseURL+"/save-cache-has?"+gocacheQuery(req).Encode(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

@@ -182,7 +182,7 @@ func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache
 			paths[i] = item.Path
 		}
 
-		if existing, existErr := client.ExistingPaths(paths); existErr != nil {
+		if existing, existErr := client.ExistingPaths(req, paths); existErr != nil {
 			log.Printf("save-cache: check existing objects failed, uploading everything: %s", existErr.Error())
 		} else if len(existing) > 0 {
 			existingSet := make(map[string]struct{}, len(existing))

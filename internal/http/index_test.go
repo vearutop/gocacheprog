@@ -120,6 +120,38 @@ func TestIndex_ShowsInProgressClientSession(t *testing.T) {
 	require.False(t, strings.Contains(body, "session-abc"))
 }
 
+func TestIndex_ShowsPreloadSource(t *testing.T) {
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	item := cache.ResponseItem{ActionID: "a1", OutputID: "o1", Size: 5, WireSize: 5, Time: nil}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString("hello")), nil
+	})
+	require.NoError(t, localStore.Put(cache.Response{Items: []cache.ResponseItem{item}}))
+	require.NoError(t, localStore.PostCacheUsed("commit123", "", "", []string{"a1"}, false))
+
+	h := http.NewHandler(localStore, "")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{SessionID: "session-preload-source"})
+	require.NoError(t, err)
+
+	require.NoError(t, client.Preload(cache.PreloadRequest{Commit: "commit123", MaxSize: 1024}, func(resp cache.ResponseItem) {}))
+
+	req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	res, err := nethttp.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, res.Body.Close()) }()
+	b, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	body := string(b)
+
+	require.True(t, strings.Contains(body, "commit"), "expected the preload source column to show \"commit\", got body: %s", body)
+}
+
 func TestIndex_RefLinksToJobURLWhenAvailable(t *testing.T) {
 	localStore, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)

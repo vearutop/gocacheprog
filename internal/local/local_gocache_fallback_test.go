@@ -128,6 +128,15 @@ func TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas(t *testing.T) {
 	require.Equal(t, 1, stats.Files, "only the genuinely new file should be uploaded")
 
 	require.Equal(t, "0", nativeStore.Stats()["putsExist"], "the pre-existing object must never reach SaveItem")
+
+	// Skipping the re-upload must not also mean the path silently drops out of this
+	// commit's manifest -- a later restore for commit123 needs to find it even though it
+	// was never re-uploaded in this session.
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "co", "commit123")
+	commitBody, err := os.ReadFile(commitManifestPath)
+	require.NoError(t, err)
+	require.Contains(t, string(commitBody), "ab/shared-dep\n", "skipped-but-existing path must still be merged into the manifest")
+	require.Contains(t, string(commitBody), "cd/genuinely-new\n")
 }
 
 func TestInitLocalGocacheMode_FallbackRemoteRestoresWhenCold(t *testing.T) {

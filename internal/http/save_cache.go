@@ -34,6 +34,14 @@ func (h *Handler) SaveCacheHas(rw http.ResponseWriter, r *http.Request) {
 
 	existing := h.gocacheStore.ExistingPaths(paths)
 
+	// A caller skips re-uploading these, so they'll never reach processSaveCacheStream's
+	// paths slice -- merge them into this request's manifest here instead, or a path the
+	// server already has silently drops out of the commit/changes-id's own manifest.
+	req := parseGOCACHERequest(r)
+	if err := h.gocacheStore.MergeSavedPaths(req, existing); err != nil {
+		log.Printf("merge save-cache-has manifests: %s", err.Error())
+	}
+
 	rw.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(rw).Encode(existing); err != nil {
 		log.Printf("encode save-cache-has response: %s", err.Error())

@@ -44,6 +44,53 @@ func TestRestorePaths_SupplementsSmallChangesResultWithDefault(t *testing.T) {
 	require.ElementsMatch(t, []string{"ab/changes-only", "cd/newer-1", "cd/newer-2", "cd/newer-3"}, restored)
 }
 
+// TestRestorePaths_DefaultExcludesAlreadyMatchedManifest is a regression test for the actual
+// reported production incident: the just-matched "changes" manifest is always among the most
+// recently written for its build type (restorePaths just self-healed it moments ago), so without
+// excluding it, it eats one of only defaultManifestSampleSize candidate slots for nothing -- all
+// its content is already in the resolved result. That crowds out a genuinely large, independent
+// manifest (commit-big below) that would otherwise have made the cut, silently serving a shrunken
+// result even though substantial healthy content exists elsewhere for this build type.
+func TestRestorePaths_DefaultExcludesAlreadyMatchedManifest(t *testing.T) {
+	require.GreaterOrEqual(t, defaultManifestSampleSize, 3, "test assumes at least 3 sample slots")
+
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	// Oldest: filler, never a candidate either way.
+	saveItemForTest(t, store, Request{Commit: "commit-a", BuildType: "unit"}, "aa/a", "pa")
+	// commit-big: large and independent, but older than commit-c/commit-d -- must lose its slot
+	// to "changes" unless "changes" is excluded from the candidate pool.
+	for i := 0; i < 20; i++ {
+		saveItemForTest(t, store, Request{Commit: "commit-big", BuildType: "unit"}, fmt.Sprintf("bb/big-%d", i), fmt.Sprintf("pb%d", i))
+	}
+	saveItemForTest(t, store, Request{Commit: "commit-c", BuildType: "unit"}, "cc/c1", "pc1")
+	saveItemForTest(t, store, Request{Commit: "commit-c", BuildType: "unit"}, "cc/c2", "pc2")
+	saveItemForTest(t, store, Request{Commit: "commit-d", BuildType: "unit"}, "dd/d1", "pd1")
+	saveItemForTest(t, store, Request{Commit: "commit-d", BuildType: "unit"}, "dd/d2", "pd2")
+	// Written last, so it's the single most recently touched manifest for this build type --
+	// and about to be matched (and thus self-healed, keeping it "most recent") by the Restore
+	// call below.
+	saveItemForTest(t, store, Request{ChangesID: "pr#1", BuildType: "unit"}, "ee/changes-only", "pe")
+
+	var restored []string
+	sources, err := store.Restore(Request{ChangesID: "pr#1", BuildType: "unit"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"changes", "default"}, sources)
+
+	var bigFiles int
+	for _, p := range restored {
+		if strings.HasPrefix(p, "bb/big-") {
+			bigFiles++
+		}
+	}
+	require.Equal(t, 20, bigFiles, "commit-big's files must be reachable once \"changes\" is excluded from the candidate pool, not crowded out by it")
+}
+
 // TestRestorePaths_DoesNotSupplementNormallySizedResult confirms the heuristic doesn't kick in
 // (and doesn't add "default" to sources) when the resolved result isn't actually small relative
 // to the default source for the same build type.

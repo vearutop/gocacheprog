@@ -1328,6 +1328,7 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 	seen := map[string]struct{}{}
 	result := make([]string, 0)
 	sources := make([]string, 0, 4)
+	matched := map[string]struct{}{}
 
 	for _, candidate := range []struct {
 		name string
@@ -1357,6 +1358,7 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
 			}
 		}
+		matched[manifestPath] = struct{}{}
 		sources = append(sources, candidate.name)
 		for _, relPath := range paths {
 			if _, ok := seen[relPath]; ok {
@@ -1368,13 +1370,13 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 	}
 
 	if len(sources) > 0 {
-		if err := s.supplementSmallResultWithDefault(req.BuildType, &result, &sources, seen); err != nil {
+		if err := s.supplementSmallResultWithDefault(req.BuildType, &result, &sources, seen, matched); err != nil {
 			return nil, nil, err
 		}
 	}
 
 	if len(sources) == 0 {
-		def, err := s.defaultFallbackPaths(req.BuildType, seen)
+		def, err := s.defaultFallbackPaths(req.BuildType, seen, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1401,18 +1403,18 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 // persisted, ever-growing set.
 const defaultManifestSampleSize = 3
 
-// smallRestoreRatio: when a resolved commit/parent/changes/base result has fewer paths than this
-// fraction of the default source (see loadDefaultManifestPaths) for the same build type, treat it
-// as likely hollowed out by eviction (which has no awareness of which manifests still reference
-// an object) and supplement it with the default source's paths too, rather than silently serving
-// a shrunken result.
+// smallRestoreRatio: when a resolved commit/parent/changes/base result would grow by at least
+// this fraction if supplemented with the default source's genuinely novel paths (see
+// loadDefaultManifestPaths), treat it as likely hollowed out by eviction (which has no awareness
+// of which manifests still reference an object) and supplement it, rather than silently serving a
+// shrunken result.
 const smallRestoreRatio = 0.5
 
 // supplementSmallResultWithDefault tops up result/sources in place with the default source's
-// paths for buildType, if the result resolved so far looks abnormally small next to it (see
-// smallRestoreRatio). A no-op if there's no default source, or the result isn't small.
-func (s *Store) supplementSmallResultWithDefault(buildType string, result *[]string, sources *[]string, seen map[string]struct{}) error {
-	defaultPaths, err := s.loadDefaultManifestPaths(buildType)
+// paths for buildType, if doing so would grow the result by at least smallRestoreRatio. A no-op
+// if there's no default source, or the novel content it offers isn't substantial enough.
+func (s *Store) supplementSmallResultWithDefault(buildType string, result *[]string, sources *[]string, seen map[string]struct{}, exclude map[string]struct{}) error {
+	defaultPaths, err := s.loadDefaultManifestPaths(buildType, exclude)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -1421,19 +1423,24 @@ func (s *Store) supplementSmallResultWithDefault(buildType string, result *[]str
 		return err
 	}
 
-	small := len(defaultPaths) > 0 && float64(len(*result)) < float64(len(defaultPaths))*smallRestoreRatio
-
-	// novel counts how many of default's paths aren't already in the resolved result -- if small
-	// is true but novel is 0, the resolved manifest(s) already cover everything default has, so
-	// there's nothing healthier to borrow from and this check can't help. Logged unconditionally
-	// (not just when small) so a "why didn't this help" report can be diagnosed from the log
-	// alone instead of guessing.
+	// novel counts how many of default's paths aren't already in the resolved result. The
+	// decision below is based on novel, not raw len(defaultPaths): defaultPaths can otherwise be
+	// inflated by content already in result even after excluding the matched manifests' own
+	// files, e.g. one of the default candidates shares most of its content with what commit/
+	// changes/base already covers -- comparing against the contaminated raw count would silently
+	// decide nothing needs supplementing even when a lot of genuinely new content is available.
 	novel := 0
 	for _, relPath := range defaultPaths {
 		if _, ok := seen[relPath]; !ok {
 			novel++
 		}
 	}
+
+	totalIfSupplemented := len(*result) + novel
+	small := totalIfSupplemented > 0 && float64(len(*result)) < float64(totalIfSupplemented)*smallRestoreRatio
+
+	// Logged unconditionally (not just when small) so a "why didn't this help" report can be
+	// diagnosed from the log alone instead of guessing.
 	log.Printf("restore-cache: size check build_type=%q resolved=%d default=%d novel_in_default=%d small=%v", buildType, len(*result), len(defaultPaths), novel, small)
 
 	if !small {
@@ -1460,8 +1467,8 @@ func (s *Store) supplementSmallResultWithDefault(buildType string, result *[]str
 // manifest matched anything, it loads buildType's default source (see loadDefaultManifestPaths)
 // and returns whatever of its paths aren't already in seen. Returns (nil, nil) - not an error -
 // when no manifest exists at all yet for this build type.
-func (s *Store) defaultFallbackPaths(buildType string, seen map[string]struct{}) ([]string, error) {
-	paths, err := s.loadDefaultManifestPaths(buildType)
+func (s *Store) defaultFallbackPaths(buildType string, seen map[string]struct{}, exclude map[string]struct{}) ([]string, error) {
+	paths, err := s.loadDefaultManifestPaths(buildType, exclude)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -1484,13 +1491,18 @@ func (s *Store) defaultFallbackPaths(buildType string, seen map[string]struct{})
 }
 
 // loadDefaultManifestPaths unions the paths of buildType's defaultManifestSampleSize most
-// recently written manifests (any commit/changes/base scope), self-healing each along the way.
-// This is restorePaths' fallback source, both when nothing matched at all and when what matched
-// looks abnormally small (see supplementSmallResultWithDefault) -- more representative of "what a
-// healthy cache for this build type looks like" than picking a single newest manifest, since
-// recency and completeness aren't strongly correlated once many PRs/branches share a build type.
-// Returns os.ErrNotExist if no manifest exists yet for this build type at all.
-func (s *Store) loadDefaultManifestPaths(buildType string) ([]string, error) {
+// recently written manifests (any commit/changes/base scope other than those in exclude),
+// self-healing each along the way. This is restorePaths' fallback source, both when nothing
+// matched at all and when what matched looks abnormally small (see
+// supplementSmallResultWithDefault) -- more representative of "what a healthy cache for this
+// build type looks like" than picking a single newest manifest, since recency and completeness
+// aren't strongly correlated once many PRs/branches share a build type. exclude is the set of
+// manifest paths restorePaths already matched (commit/parent/changes/base): without excluding
+// them, they're near-certain to occupy sample slots themselves (they were just self-healed by
+// this very call, so they're always among the most recently written), leaving fewer independent
+// candidates to actually supplement with. Returns os.ErrNotExist if no manifest exists yet for
+// this build type at all.
+func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]struct{}) ([]string, error) {
 	scopeDir, err := manifestScopeDir(buildType)
 	if err != nil {
 		return nil, err
@@ -1507,6 +1519,9 @@ func (s *Store) loadDefaultManifestPaths(buildType string) ([]string, error) {
 	}
 	candidates := make([]candidate, 0, len(files))
 	for _, path := range files {
+		if _, skip := exclude[path]; skip {
+			continue
+		}
 		info, statErr := os.Stat(path)
 		if statErr != nil {
 			if os.IsNotExist(statErr) {
