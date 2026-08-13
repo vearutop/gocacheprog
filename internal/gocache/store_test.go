@@ -17,13 +17,13 @@ import (
 	"github.com/vearutop/gocacheprog/internal/recordpool"
 )
 
-// TestRestorePaths_SupplementsSmallChangesResultWithNewest covers the actual reported production
+// TestRestorePaths_SupplementsSmallChangesResultWithDefault covers the actual reported production
 // symptom: eviction has no awareness of which manifests still reference an object, so a
 // long-lived "changes" manifest can quietly hollow out over many eviction cycles (each Restore
 // self-heals it down further) while a newer commit's manifest for the same build type stays
-// intact. The resolved result should be supplemented with the newest manifest rather than
+// intact. The resolved result should be supplemented with the default source rather than
 // silently served small.
-func TestRestorePaths_SupplementsSmallChangesResultWithNewest(t *testing.T) {
+func TestRestorePaths_SupplementsSmallChangesResultWithDefault(t *testing.T) {
 	dir := t.TempDir()
 
 	store, err := NewStore(dir, WithCompression())
@@ -40,13 +40,13 @@ func TestRestorePaths_SupplementsSmallChangesResultWithNewest(t *testing.T) {
 		restored = append(restored, item.Path)
 	})
 	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"changes", "newest"}, sources)
+	require.ElementsMatch(t, []string{"changes", "default"}, sources)
 	require.ElementsMatch(t, []string{"ab/changes-only", "cd/newer-1", "cd/newer-2", "cd/newer-3"}, restored)
 }
 
 // TestRestorePaths_DoesNotSupplementNormallySizedResult confirms the heuristic doesn't kick in
-// (and doesn't add "newest" to sources) when the resolved result isn't actually small relative to
-// the newest manifest for the same build type.
+// (and doesn't add "default" to sources) when the resolved result isn't actually small relative
+// to the default source for the same build type.
 func TestRestorePaths_DoesNotSupplementNormallySizedResult(t *testing.T) {
 	dir := t.TempDir()
 
@@ -68,12 +68,12 @@ func TestRestorePaths_DoesNotSupplementNormallySizedResult(t *testing.T) {
 	require.ElementsMatch(t, []string{"ab/a-1", "ab/a-2"}, restored)
 }
 
-// TestRestorePaths_SupplementsSmallBaseResultWithNewest confirms the small-result heuristic is
-// source-agnostic: it compares the combined resolved result against the newest manifest
+// TestRestorePaths_SupplementsSmallBaseResultWithDefault confirms the small-result heuristic is
+// source-agnostic: it compares the combined resolved result against the default source
 // regardless of which of commit/parent/changes/base actually matched, so a small "base"-only
 // result gets supplemented exactly like a small "changes"-only one does above -- no per-source
 // duplication needed.
-func TestRestorePaths_SupplementsSmallBaseResultWithNewest(t *testing.T) {
+func TestRestorePaths_SupplementsSmallBaseResultWithDefault(t *testing.T) {
 	dir := t.TempDir()
 
 	store, err := NewStore(dir, WithCompression())
@@ -90,7 +90,7 @@ func TestRestorePaths_SupplementsSmallBaseResultWithNewest(t *testing.T) {
 		restored = append(restored, item.Path)
 	})
 	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"base", "newest"}, sources)
+	require.ElementsMatch(t, []string{"base", "default"}, sources)
 	require.ElementsMatch(t, []string{"ab/base-only", "cd/newer-1", "cd/newer-2", "cd/newer-3"}, restored)
 }
 
@@ -368,11 +368,11 @@ func TestCollectStaleManifests_RemovesOnlyManifestsOlderThanCutoff(t *testing.T)
 	require.NoError(t, err)
 }
 
-// TestStoreRestore_FallsBackToNewestManifestWhenNoSourceMatches covers a cold-start scenario:
+// TestStoreRestore_FallsBackToDefaultManifestWhenNoSourceMatches covers a cold-start scenario:
 // after a long pause with nothing relevant built on the target branch, or on a brand new build
-// type, none of commit/parent/changes/base has a manifest yet. Restore falls back to whatever
-// manifest for this build type was written most recently, from any unrelated commit or PR.
-func TestStoreRestore_FallsBackToNewestManifestWhenNoSourceMatches(t *testing.T) {
+// type, none of commit/parent/changes/base has a manifest yet. Restore falls back to the default
+// source (see loadDefaultManifestPaths) for this build type, from any unrelated commit or PR.
+func TestStoreRestore_FallsBackToDefaultManifestWhenNoSourceMatches(t *testing.T) {
 	dir := t.TempDir()
 
 	store, err := NewStore(dir, WithCompression())
@@ -385,13 +385,13 @@ func TestStoreRestore_FallsBackToNewestManifestWhenNoSourceMatches(t *testing.T)
 		restored = append(restored, item.Path)
 	})
 	require.NoError(t, err)
-	require.Equal(t, []string{"newest"}, sources)
+	require.Equal(t, []string{"default"}, sources)
 	require.Equal(t, []string{"ab/cache-entry-a"}, restored)
 }
 
-// TestStoreRestore_NewestFallbackDoesNotOverrideARealMatch guards against the fallback firing
+// TestStoreRestore_DefaultFallbackDoesNotOverrideARealMatch guards against the fallback firing
 // even when a normal source already matched - it must only ever apply when nothing else did.
-func TestStoreRestore_NewestFallbackDoesNotOverrideARealMatch(t *testing.T) {
+func TestStoreRestore_DefaultFallbackDoesNotOverrideARealMatch(t *testing.T) {
 	dir := t.TempDir()
 
 	store, err := NewStore(dir, WithCompression())
@@ -405,9 +405,9 @@ func TestStoreRestore_NewestFallbackDoesNotOverrideARealMatch(t *testing.T) {
 	require.Equal(t, []string{"base"}, sources)
 }
 
-// TestStoreRestore_NewestFallbackIsScopedToBuildType guards against leaking cache relevance
+// TestStoreRestore_DefaultFallbackIsScopedToBuildType guards against leaking cache relevance
 // across unrelated build types, which typically have different dependency footprints.
-func TestStoreRestore_NewestFallbackIsScopedToBuildType(t *testing.T) {
+func TestStoreRestore_DefaultFallbackIsScopedToBuildType(t *testing.T) {
 	dir := t.TempDir()
 
 	store, err := NewStore(dir, WithCompression())
@@ -424,9 +424,12 @@ func TestStoreRestore_NewestFallbackIsScopedToBuildType(t *testing.T) {
 	require.Empty(t, restored, "a manifest from a different build type must not be used as a fallback")
 }
 
-// TestStoreRestore_NewestFallbackPicksMostRecentlyWrittenManifest guards against picking an
-// arbitrary (rather than the most recently written) unrelated manifest when several exist.
-func TestStoreRestore_NewestFallbackPicksMostRecentlyWrittenManifest(t *testing.T) {
+// TestStoreRestore_DefaultFallbackUnionsMostRecentlyWrittenManifests confirms the default source
+// unions defaultManifestSampleSize of a build type's most recently written manifests rather than
+// just a single newest one -- a lone newest pick is fragile (e.g. a brand-new PR's first save
+// would count as "newest" despite being nowhere near representative), so unioning a handful is
+// more robust. With only two manifests here (fewer than the sample size), both are included.
+func TestStoreRestore_DefaultFallbackUnionsMostRecentlyWrittenManifests(t *testing.T) {
 	dir := t.TempDir()
 
 	store, err := NewStore(dir, WithCompression())
@@ -450,8 +453,41 @@ func TestStoreRestore_NewestFallbackPicksMostRecentlyWrittenManifest(t *testing.
 		restored = append(restored, item.Path)
 	})
 	require.NoError(t, err)
-	require.Equal(t, []string{"newest"}, sources)
-	require.Equal(t, []string{"cd/newer"}, restored)
+	require.Equal(t, []string{"default"}, sources)
+	require.ElementsMatch(t, []string{"ab/older", "cd/newer"}, restored)
+}
+
+// TestStoreRestore_DefaultFallbackExcludesManifestsOlderThanSampleSize confirms the union is
+// bounded: with more manifests than defaultManifestSampleSize, the oldest ones are left out
+// rather than the default source growing without limit.
+func TestStoreRestore_DefaultFallbackExcludesManifestsOlderThanSampleSize(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	require.Greater(t, defaultManifestSampleSize, 0)
+	commits := make([]string, defaultManifestSampleSize+1)
+	for i := range commits {
+		commits[i] = fmt.Sprintf("commit-%d", i)
+		saveItemForTest(t, store, Request{Commit: commits[i]}, fmt.Sprintf("ab/entry-%d", i), fmt.Sprintf("payload-%d", i))
+
+		manifestPath, err := store.commitManifestPath(commits[i], "")
+		require.NoError(t, err)
+		// Strictly increasing mtimes, oldest first, so commits[0] is the one sample size should
+		// exclude.
+		modTime := time.Now().Add(time.Duration(i) * time.Hour)
+		require.NoError(t, os.Chtimes(manifestPath, modTime, modTime))
+	}
+
+	var restored []string
+	sources, err := store.Restore(Request{ParentCommit: "missing-parent"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"default"}, sources)
+	require.NotContains(t, restored, "ab/entry-0", "the oldest manifest should be excluded once there are more than defaultManifestSampleSize candidates")
+	require.Len(t, restored, defaultManifestSampleSize)
 }
 
 func TestCollectFilesToSave_SkipsRestoredPaths(t *testing.T) {
@@ -1003,6 +1039,12 @@ func TestInspect_SupportsBaseCommitScope(t *testing.T) {
 
 	saveItemForTest(t, store, Request{Commit: "base-commit", BuildType: "unit"}, "ab/base-a", "payload-a")
 	saveItemForTest(t, store, Request{Commit: "base-commit", BuildType: "unit"}, "cd/base-b", "payload-b")
+
+	// A second, unrelated commit manifest for the same build type: proves base-commit really
+	// scopes to just its own manifest, rather than silently falling through to "every manifest
+	// for this build type" (which would count this too, and wouldn't have caught the bug where
+	// the aggregate-shortcut branch's guard forgot to also exclude BaseCommit).
+	saveItemForTest(t, store, Request{Commit: "other-commit", BuildType: "unit"}, "ef/other", "payload-c")
 
 	stats, err := store.Inspect(Request{BaseCommit: "base-commit", BuildType: "unit"})
 	require.NoError(t, err)
