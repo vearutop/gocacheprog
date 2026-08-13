@@ -68,6 +68,32 @@ func TestRestorePaths_DoesNotSupplementNormallySizedResult(t *testing.T) {
 	require.ElementsMatch(t, []string{"ab/a-1", "ab/a-2"}, restored)
 }
 
+// TestRestorePaths_SupplementsSmallBaseResultWithNewest confirms the small-result heuristic is
+// source-agnostic: it compares the combined resolved result against the newest manifest
+// regardless of which of commit/parent/changes/base actually matched, so a small "base"-only
+// result gets supplemented exactly like a small "changes"-only one does above -- no per-source
+// duplication needed.
+func TestRestorePaths_SupplementsSmallBaseResultWithNewest(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "base-commit", BuildType: "unit"}, "ab/base-only", "base-only-payload")
+
+	saveItemForTest(t, store, Request{Commit: "commit-newer", BuildType: "unit"}, "cd/newer-1", "p1")
+	saveItemForTest(t, store, Request{Commit: "commit-newer", BuildType: "unit"}, "cd/newer-2", "p2")
+	saveItemForTest(t, store, Request{Commit: "commit-newer", BuildType: "unit"}, "cd/newer-3", "p3")
+
+	var restored []string
+	sources, err := store.Restore(Request{BaseCommit: "base-commit", BuildType: "unit"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"base", "newest"}, sources)
+	require.ElementsMatch(t, []string{"ab/base-only", "cd/newer-1", "cd/newer-2", "cd/newer-3"}, restored)
+}
+
 func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 	dir := t.TempDir()
 

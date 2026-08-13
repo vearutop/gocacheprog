@@ -46,6 +46,7 @@ const (
 	headerStartedAt          = "X-Gocacheprog-Started-At"
 	headerPID                = "X-Gocacheprog-Pid"
 	headerCacheDir           = "X-Gocacheprog-Cache-Dir"
+	headerJobURL             = "X-Gocacheprog-Job-Url"
 	headerCommit             = "X-Gocacheprog-Commit"
 	headerParent             = "X-Gocacheprog-Parent"
 	headerChanges            = "X-Gocacheprog-Changes"
@@ -67,7 +68,10 @@ type SessionInfo struct {
 	StartedAt time.Time
 	PID       int
 	CacheDir  string
-	Params    SessionParams
+	// JobURL links back to the CI job this session is running in (e.g. a GitHub Actions run
+	// URL), for the status page to link straight to its log. Empty when not available.
+	JobURL string
+	Params SessionParams
 }
 
 type SessionParams interface {
@@ -210,6 +214,9 @@ func setSessionHeaders(req *http.Request, sessionInfo *SessionInfo) {
 	}
 	if sessionInfo.CacheDir != "" {
 		req.Header.Set(headerCacheDir, sessionInfo.CacheDir)
+	}
+	if sessionInfo.JobURL != "" {
+		req.Header.Set(headerJobURL, sessionInfo.JobURL)
 	}
 	if sessionInfo.Params != nil && sessionInfo.Params.SessionCommit() != "" {
 		req.Header.Set(headerCommit, sessionInfo.Params.SessionCommit())
