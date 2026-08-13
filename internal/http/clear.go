@@ -27,9 +27,10 @@ func (h *Handler) handleNativeAdminJSON(rw http.ResponseWriter, r *http.Request,
 
 	rawReq := parseGOCACHERequest(r)
 	resp, err := run(gocache.Request{
-		Commit:    rawReq.Commit,
-		ChangesID: rawReq.ChangesID,
-		BuildType: rawReq.BuildType,
+		Commit:     rawReq.Commit,
+		ChangesID:  rawReq.ChangesID,
+		BuildType:  rawReq.BuildType,
+		BaseCommit: rawReq.BaseCommit,
 	})
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)

@@ -1413,7 +1413,23 @@ func (s *Store) supplementSmallResultWithNewest(buildType string, result *[]stri
 		return err
 	}
 
-	if len(newestPaths) == 0 || float64(len(*result)) >= float64(len(newestPaths))*smallRestoreRatio {
+	small := len(newestPaths) > 0 && float64(len(*result)) < float64(len(newestPaths))*smallRestoreRatio
+
+	// novel counts how many of newest's paths aren't already in the resolved result -- if small
+	// is true but novel is 0, the resolved manifest(s) and "newest" are the same file (e.g. an
+	// actively-pushed PR's own manifest is also the most recently written one for this build
+	// type), so there's nothing healthier to borrow from and this check can't help. Logged
+	// unconditionally (not just when small) so a "why didn't this help" report can be diagnosed
+	// from the log alone instead of guessing.
+	novel := 0
+	for _, relPath := range newestPaths {
+		if _, ok := seen[relPath]; !ok {
+			novel++
+		}
+	}
+	log.Printf("restore-cache: size check build_type=%q resolved=%d newest=%d newest_manifest=%q novel_in_newest=%d small=%v", buildType, len(*result), len(newestPaths), manifestPath, novel, small)
+
+	if !small {
 		return nil
 	}
 
@@ -2084,7 +2100,7 @@ func (s *Store) targetManifestPaths(req Request) ([]string, error) {
 		return listManifestFiles(filepath.Join(s.dir, "manifests", scopeDir))
 	}
 
-	targets := make([]string, 0, 2)
+	targets := make([]string, 0, 3)
 	if strings.TrimSpace(req.Commit) != "" {
 		manifestPath, err := s.commitManifestPath(req.Commit, req.BuildType)
 		if err != nil {
@@ -2094,6 +2110,13 @@ func (s *Store) targetManifestPaths(req Request) ([]string, error) {
 	}
 	if strings.TrimSpace(req.ChangesID) != "" {
 		manifestPath, err := s.changesManifestPath(req.ChangesID, req.BuildType)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, manifestPath)
+	}
+	if strings.TrimSpace(req.BaseCommit) != "" {
+		manifestPath, err := s.commitManifestPath(req.BaseCommit, req.BuildType)
 		if err != nil {
 			return nil, err
 		}

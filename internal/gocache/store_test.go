@@ -990,6 +990,26 @@ func TestInspect_SummarizesScope(t *testing.T) {
 	require.Equal(t, int64(195), stats.MaxBandCompressedBytes)
 }
 
+// TestInspect_SupportsBaseCommitScope is a regression test for a real gap: targetManifestPaths
+// (shared by Inspect and Clear) never handled req.BaseCommit at all, even though Request has the
+// field and restorePaths treats it as an equal-weight source -- there was no way to inspect a
+// base commit's manifest size via the HTTP /inspect endpoint to check whether it's been hollowed
+// out by eviction.
+func TestInspect_SupportsBaseCommitScope(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir)
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "base-commit", BuildType: "unit"}, "ab/base-a", "payload-a")
+	saveItemForTest(t, store, Request{Commit: "base-commit", BuildType: "unit"}, "cd/base-b", "payload-b")
+
+	stats, err := store.Inspect(Request{BaseCommit: "base-commit", BuildType: "unit"})
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.ManifestsCount)
+	require.Equal(t, 2, stats.FilesCount)
+}
+
 func TestStoreStartup_PrunesExpiredEntriesByMaxAge(t *testing.T) {
 	dir := t.TempDir()
 

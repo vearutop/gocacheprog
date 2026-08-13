@@ -61,3 +61,13 @@ func TestClientSessionsSnapshot_PrunesIdleSessions(t *testing.T) {
 	h.clientSessionsMu.Unlock()
 	require.False(t, stillTracked, "a session idle for more than sessionRetention should be pruned from the map")
 }
+
+// TestJobURLWithPR covers GitHub's own convention: a run URL with ?pr=<number> makes GitHub's UI
+// show a "part of #<number>" link back to the PR, the same param it appends itself when you
+// navigate to a run from a PR's checks tab.
+func TestJobURLWithPR(t *testing.T) {
+	require.Equal(t, "", jobURLWithPR("", "acme/widgets#456"))
+	require.Equal(t, "https://x/runs/1", jobURLWithPR("https://x/runs/1", "deadbeef"))
+	require.Equal(t, "https://x/runs/1?pr=456", jobURLWithPR("https://x/runs/1", "acme/widgets#456"))
+	require.Equal(t, "https://x/runs/1?foo=bar&pr=456", jobURLWithPR("https://x/runs/1?foo=bar", "acme/widgets#456"))
+}
