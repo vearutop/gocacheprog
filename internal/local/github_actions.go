@@ -552,6 +552,7 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
+		JobURL:    GithubActionsJobURL(),
 		Params: ProxyParams{
 			Commit:     commit,
 			ChangesID:  changesID,
@@ -682,6 +683,7 @@ func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit
 		StartedAt: initStartedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
+		JobURL:    GithubActionsJobURL(),
 		Params: ProxyParams{
 			Commit:     commit,
 			ChangesID:  changesID,
@@ -753,6 +755,25 @@ func elapsedSinceInit() (elapsed time.Duration, ok bool) {
 	return time.Since(initStartedAt), true
 }
 
+// GithubActionsJobURL returns a link back to the current GitHub Actions run, if running under
+// one, so a session on the remote server's status page can link straight to its job log instead
+// of an operator having to go hunting for which run a given commit/changes-id/build-type came
+// from. GITHUB_SERVER_URL/GITHUB_REPOSITORY/GITHUB_RUN_ID are set by GitHub Actions itself on
+// every job (https://docs.github.com/en/actions/learn-github-actions/variables); empty outside
+// GitHub Actions, or if any of them is unset. Points at the run rather than a specific job within
+// it: resolving a job's own URL needs its numeric job ID, which isn't exposed as an env var and
+// would need an extra API call to look up.
+func GithubActionsJobURL() string {
+	serverURL := os.Getenv("GITHUB_SERVER_URL")
+	repo := os.Getenv("GITHUB_REPOSITORY")
+	runID := os.Getenv("GITHUB_RUN_ID")
+	if serverURL == "" || repo == "" || runID == "" {
+		return ""
+	}
+
+	return serverURL + "/" + repo + "/actions/runs/" + runID
+}
+
 func doneShimMode() error {
 	socket := os.Getenv(envGHASocket)
 	auth := os.Getenv(envGHAAuth)
@@ -817,6 +838,7 @@ func doneGocacheMode() error {
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
+		JobURL:    GithubActionsJobURL(),
 		Params: ProxyParams{
 			Commit:     commit,
 			ChangesID:  changesID,
@@ -973,6 +995,7 @@ func doneLocalGocacheFallbackUpload(cacheDir, buildType string) {
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
+		JobURL:    GithubActionsJobURL(),
 		Params: ProxyParams{
 			Commit:     commit,
 			ChangesID:  changesID,

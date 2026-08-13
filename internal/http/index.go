@@ -45,7 +45,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:.5rem;b
 {{range .Sessions}}<tr>
 <td>{{if eq .Status "done"}}<span class="done">done</span>{{else if eq .Status "in progress"}}<span class="active">in progress</span>{{else}}<span class="idle">idle</span>{{end}}</td>
 <td>{{.Version}}</td>
-<td>{{.Ref}}</td>
+<td>{{if .JobURL}}<a href="{{.JobURL}}" target="_blank" rel="noopener noreferrer">{{.Ref}}</a>{{else}}{{.Ref}}{{end}}</td>
 <td>{{.BuildType}}</td>
 <td>{{.PreloadSize}}</td>
 <td>{{.PreloadTime}}</td>
@@ -83,6 +83,7 @@ type sessionRow struct {
 	Status       string
 	Version      string
 	Ref          string
+	JobURL       string
 	BuildType    string
 	PreloadSize  string
 	PreloadTime  string
@@ -135,6 +136,7 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 			Status:       cs.Status,
 			Version:      cs.Version,
 			Ref:          cs.Ref,
+			JobURL:       cs.JobURL,
 			BuildType:    cs.BuildType,
 			PreloadSize:  byteSize(cs.PreloadBytes),
 			PreloadTime:  cs.PreloadTime.Round(time.Millisecond).String(),

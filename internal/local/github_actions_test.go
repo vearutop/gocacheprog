@@ -13,6 +13,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGithubActionsJobURL(t *testing.T) {
+	t.Setenv("GITHUB_SERVER_URL", "https://github.com")
+	t.Setenv("GITHUB_REPOSITORY", "acme/widgets")
+	t.Setenv("GITHUB_RUN_ID", "12345")
+	require.Equal(t, "https://github.com/acme/widgets/actions/runs/12345", GithubActionsJobURL())
+
+	t.Setenv("GITHUB_RUN_ID", "")
+	require.Equal(t, "", GithubActionsJobURL())
+}
+
 func TestParseGithubActionsDSN(t *testing.T) {
 	cfg, err := parseGithubActionsDSN("https://gocache.example.com?auth=secret&cache_dir=./build-cache&preload_size=42&build_type=unit&mode=gocache&canonicalize_timestamps=.&skip_preload=true")
 	require.NoError(t, err)

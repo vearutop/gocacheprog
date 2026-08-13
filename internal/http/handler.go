@@ -57,6 +57,7 @@ type clientSession struct {
 	ChangesID     string
 	Commit        string
 	BuildType     string
+	JobURL        string
 	PreloadBytes  int64
 	PreloadTime   time.Duration
 	FinalizeBytes int64
@@ -209,6 +210,9 @@ func (h *Handler) touchSession(r *http.Request) {
 	if v := r.Header.Get(headerBuildType); v != "" {
 		cs.BuildType = v
 	}
+	if v := r.Header.Get(headerJobURL); v != "" {
+		cs.JobURL = v
+	}
 }
 
 // recordSessionPreload attributes a completed preload/restore-cache transfer (whichever the
@@ -297,6 +301,7 @@ func (h *Handler) clientSessionsSnapshot() []clientSessionView {
 			Status:        status,
 			Version:       cs.Version,
 			Ref:           ref,
+			JobURL:        cs.JobURL,
 			BuildType:     cs.BuildType,
 			PreloadBytes:  cs.PreloadBytes,
 			PreloadTime:   cs.PreloadTime,
@@ -316,6 +321,7 @@ type clientSessionView struct {
 	Status        string
 	Version       string
 	Ref           string
+	JobURL        string
 	BuildType     string
 	PreloadBytes  int64
 	PreloadTime   time.Duration

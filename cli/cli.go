@@ -198,6 +198,7 @@ func Main(options ...func(o *Options)) error {
 			StartedAt: sessionStartedAt,
 			PID:       os.Getpid(),
 			CacheDir:  *dir,
+			JobURL:    local.GithubActionsJobURL(),
 			Params:    *params,
 		})
 		if err != nil {
@@ -325,6 +326,7 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 		StartedAt: startedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
+		JobURL:    local.GithubActionsJobURL(),
 		Params:    *params,
 	})
 	if err != nil {
@@ -463,6 +465,7 @@ func newUpstreamClient(remoteURL, authToken, cacheDir string, params local.Proxy
 		StartedAt: sessionStartedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
+		JobURL:    local.GithubActionsJobURL(),
 		Params:    params,
 	})
 }

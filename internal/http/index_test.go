@@ -120,6 +120,41 @@ func TestIndex_ShowsInProgressClientSession(t *testing.T) {
 	require.False(t, strings.Contains(body, "session-abc"))
 }
 
+func TestIndex_RefLinksToJobURLWhenAvailable(t *testing.T) {
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandler(localStore, "")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{
+		SessionID: "session-with-job",
+		JobURL:    "https://github.com/acme/widgets/actions/runs/12345",
+		Params: local.ProxyParams{
+			ChangesID: "repo/pr-456",
+		},
+	})
+	require.NoError(t, err)
+
+	item := cache.ResponseItem{ActionID: "a1", OutputID: "o1", Size: 5, WireSize: 5}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString("hello")), nil
+	})
+	require.NoError(t, client.Put(cache.Response{Items: []cache.ResponseItem{item}}))
+
+	req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	res, err := nethttp.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, res.Body.Close()) }()
+	b, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	body := string(b)
+
+	require.True(t, strings.Contains(body, `<a href="https://github.com/acme/widgets/actions/runs/12345" target="_blank" rel="noopener noreferrer">repo/pr-456</a>`))
+}
+
 func TestIndex_SessionMarkedDone(t *testing.T) {
 	localStore, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
