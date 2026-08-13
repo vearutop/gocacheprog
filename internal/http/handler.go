@@ -60,6 +60,7 @@ type clientSession struct {
 	JobURL        string
 	PreloadBytes  int64
 	PreloadTime   time.Duration
+	PreloadSource string
 	FinalizeBytes int64
 	FinalizeTime  time.Duration
 	Done          bool
@@ -217,7 +218,9 @@ func (h *Handler) touchSession(r *http.Request) {
 
 // recordSessionPreload attributes a completed preload/restore-cache transfer (whichever the
 // session's mode actually uses to pull the cache down at job start) to its session, if any.
-func (h *Handler) recordSessionPreload(r *http.Request, wireBytes int64, dur time.Duration) {
+// sources records which manifest(s) resolved this pull (e.g. "changes,default"), so a small or
+// unhealthy-looking preload can be diagnosed from the status page without needing server logs.
+func (h *Handler) recordSessionPreload(r *http.Request, wireBytes int64, dur time.Duration, sources string) {
 	sid := r.Header.Get(headerSessionID)
 	if sid == "" {
 		return
@@ -229,6 +232,9 @@ func (h *Handler) recordSessionPreload(r *http.Request, wireBytes int64, dur tim
 	if cs := h.clientSessions[sid]; cs != nil {
 		cs.PreloadBytes += wireBytes
 		cs.PreloadTime += dur
+		if sources != "" {
+			cs.PreloadSource = sources
+		}
 	}
 }
 
@@ -305,6 +311,7 @@ func (h *Handler) clientSessionsSnapshot() []clientSessionView {
 			BuildType:     cs.BuildType,
 			PreloadBytes:  cs.PreloadBytes,
 			PreloadTime:   cs.PreloadTime,
+			PreloadSource: cs.PreloadSource,
 			FinalizeBytes: cs.FinalizeBytes,
 			FinalizeTime:  cs.FinalizeTime,
 			SessionTime:   end.Sub(cs.FirstSeen),
@@ -325,6 +332,7 @@ type clientSessionView struct {
 	BuildType     string
 	PreloadBytes  int64
 	PreloadTime   time.Duration
+	PreloadSource string
 	FinalizeBytes int64
 	FinalizeTime  time.Duration
 	SessionTime   time.Duration

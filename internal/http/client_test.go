@@ -295,9 +295,17 @@ func TestClient_ExistingPaths(t *testing.T) {
 	client, err := http.NewClient(srv.URL, "")
 	require.NoError(t, err)
 
-	existing, err := client.ExistingPaths([]string{"ab/present", "cd/missing"})
+	existing, err := client.ExistingPaths(gocache.Request{Commit: "commit123", BuildType: "unit"}, []string{"ab/present", "cd/missing"})
 	require.NoError(t, err)
 	require.Equal(t, []string{"ab/present"}, existing)
+
+	// A path reported as "existing" is one the caller will skip re-uploading -- it must still
+	// end up in this commit/build-type's own manifest, or a later restore for the same commit
+	// won't find it even though the object is sitting right there on the server.
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "co", "commit123")
+	commitBody, err := os.ReadFile(commitManifestPath)
+	require.NoError(t, err)
+	require.Equal(t, "ab/present\n", string(commitBody))
 }
 
 func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {

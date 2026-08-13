@@ -43,13 +43,14 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:.5rem;b
 {{end}}
 <h2>Client sessions</h2>
 <table>
-<tr><th>status</th><th>version</th><th>ref</th><th>build type</th><th>preload size</th><th>preload time</th><th>finalize size</th><th>finalize time</th><th>session time</th></tr>
+<tr><th>status</th><th>version</th><th>ref</th><th>build type</th><th>preload size</th><th>preload source</th><th>preload time</th><th>finalize size</th><th>finalize time</th><th>session time</th></tr>
 {{range .Sessions}}<tr>
 <td>{{if eq .Status "done"}}<span class="done">done</span>{{else if eq .Status "in progress"}}<span class="active">in progress</span>{{else}}<span class="idle">idle</span>{{end}}</td>
 <td>{{.Version}}</td>
 <td>{{if .JobURL}}<a href="{{.JobURL}}" target="_blank" rel="noopener noreferrer">{{.Ref}}</a>{{else}}{{.Ref}}{{end}}</td>
 <td>{{.BuildType}}</td>
 <td>{{.PreloadSize}}</td>
+<td>{{.PreloadSource}}</td>
 <td>{{.PreloadTime}}</td>
 <td>{{.FinalizeSize}}</td>
 <td>{{.FinalizeTime}}</td>
@@ -82,16 +83,17 @@ type panicInfo struct {
 }
 
 type sessionRow struct {
-	Status       string
-	Version      string
-	Ref          string
-	JobURL       string
-	BuildType    string
-	PreloadSize  string
-	PreloadTime  string
-	FinalizeSize string
-	FinalizeTime string
-	SessionTime  string
+	Status        string
+	Version       string
+	Ref           string
+	JobURL        string
+	BuildType     string
+	PreloadSize   string
+	PreloadSource string
+	PreloadTime   string
+	FinalizeSize  string
+	FinalizeTime  string
+	SessionTime   string
 }
 
 // prNumberFromRef extracts a PR number from ref if it looks like a changes-id in this codebase's
@@ -171,16 +173,17 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 	var sessions []sessionRow
 	for _, cs := range h.clientSessionsSnapshot() {
 		sessions = append(sessions, sessionRow{
-			Status:       cs.Status,
-			Version:      cs.Version,
-			Ref:          cs.Ref,
-			JobURL:       jobURLWithPR(cs.JobURL, cs.Ref),
-			BuildType:    cs.BuildType,
-			PreloadSize:  byteSize(cs.PreloadBytes),
-			PreloadTime:  cs.PreloadTime.Round(time.Millisecond).String(),
-			FinalizeSize: byteSize(cs.FinalizeBytes),
-			FinalizeTime: cs.FinalizeTime.Round(time.Millisecond).String(),
-			SessionTime:  cs.SessionTime.Round(time.Second).String(),
+			Status:        cs.Status,
+			Version:       cs.Version,
+			Ref:           cs.Ref,
+			JobURL:        jobURLWithPR(cs.JobURL, cs.Ref),
+			BuildType:     cs.BuildType,
+			PreloadSize:   byteSize(cs.PreloadBytes),
+			PreloadSource: cs.PreloadSource,
+			PreloadTime:   cs.PreloadTime.Round(time.Millisecond).String(),
+			FinalizeSize:  byteSize(cs.FinalizeBytes),
+			FinalizeTime:  cs.FinalizeTime.Round(time.Millisecond).String(),
+			SessionTime:   cs.SessionTime.Round(time.Second).String(),
 		})
 	}
 
