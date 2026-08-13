@@ -38,6 +38,15 @@ var validScopedKeyName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 const maxManifestKeyLen = 100
 
+// manifestExt marks manifest files as zstd-compressed content, distinguishing them from the
+// plain-text upload session files that share the same reader (see loadManifest/readManifestPaths).
+const manifestExt = ".zst"
+
+// manifestPrefixLen is how many leading characters of a commit/base manifest's key shard its
+// directory. "changes" manifests aren't sharded at all -- a changes-id is almost always
+// "org/repo#pr", so nearly every one would land in the same bucket anyway.
+const manifestPrefixLen = 1
+
 type Request struct {
 	Commit            string
 	ChangesID         string
@@ -358,7 +367,7 @@ func (fi *FileItem) CompressedBodyReader() (io.ReadCloser, error) {
 		return nil, err
 	}
 
-	buf := zstd.EncodeTo(make([]byte, 0, len(data)/2), data)
+	buf := cache.EncodeZstd(make([]byte, 0, len(data)/2), data)
 	fi.WireSize = int64(len(buf))
 	fi.IsCompressed = true
 
@@ -1347,14 +1356,10 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 			return nil, nil, err
 		}
 		if changed {
-			body := strings.Join(paths, "\n")
-			if body != "" {
-				body += "\n"
-			}
 			// Self-heal write-back is opportunistic housekeeping (dedup/prune stale entries);
 			// paths already loaded are good regardless, so a failure here (e.g. disk full)
 			// shouldn't fail the restore.
-			if err := s.writeManifest(manifestPath, body); err != nil {
+			if err := s.writeManifest(manifestPath, joinManifestBody(paths)); err != nil {
 				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
 			}
 		}
@@ -1550,12 +1555,8 @@ func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]st
 			return nil, err
 		}
 		if changed {
-			body := strings.Join(paths, "\n")
-			if body != "" {
-				body += "\n"
-			}
 			// See restorePaths: self-heal write-back failing shouldn't fail the restore.
-			if err := s.writeManifest(c.path, body); err != nil {
+			if err := s.writeManifest(c.path, joinManifestBody(paths)); err != nil {
 				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", c.path, err.Error())
 			}
 		}
@@ -1597,18 +1598,23 @@ func (s *Store) loadChangesManifest(changesID string, buildType string) ([]strin
 	return paths, changed, manifestPath, err
 }
 
+// loadManifest reads and self-heals a manifest at an exact path, transparently decompressing
+// content stored under the manifest layout (see manifestExt); anything else (upload session
+// files, which are always plain text) is read as-is.
 func (s *Store) loadManifest(manifestPath string) ([]string, bool, error) {
-	f, err := os.Open(manifestPath) //nolint:gosec // path is derived from configured storage dir.
+	data, err := os.ReadFile(manifestPath) //nolint:gosec // path is derived from configured storage dir.
 	if err != nil {
 		return nil, false, err
 	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			log.Printf("close manifest %s: %s", manifestPath, closeErr.Error())
-		}
-	}()
 
-	scanner := bufio.NewScanner(f)
+	if strings.HasSuffix(manifestPath, manifestExt) {
+		data, err = cache.DecodeZstd(nil, data)
+		if err != nil {
+			return nil, false, fmt.Errorf("decode manifest %s: %w", manifestPath, err)
+		}
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	res := make([]string, 0)
@@ -2076,8 +2082,8 @@ func (s *Store) commitManifestPath(commit string, buildType string) (string, err
 	}
 
 	prefix := commit
-	if len(prefix) > 2 {
-		prefix = prefix[:2]
+	if len(prefix) > manifestPrefixLen {
+		prefix = prefix[:manifestPrefixLen]
 	}
 
 	scopeDir, err := manifestScopeDir(buildType)
@@ -2085,11 +2091,27 @@ func (s *Store) commitManifestPath(commit string, buildType string) (string, err
 		return "", err
 	}
 
-	return filepath.Join(s.dir, "manifests", scopeDir, prefix, commit), nil
+	return filepath.Join(s.dir, "manifests", scopeDir, prefix, commit+manifestExt), nil
 }
 
+// changesManifestPath is flat -- unlike commits, a changes-id is almost always "org/repo#pr", so
+// sharding by its first character(s) buys nothing (nearly everything collapses into one or two
+// buckets anyway); see manifestExt.
 func (s *Store) changesManifestPath(changesID string, buildType string) (string, error) {
-	return s.scopedChangesPath(changesID, buildType, "changes")
+	changesID = strings.TrimSpace(changesID)
+	if changesID == "" {
+		return "", fmt.Errorf("invalid changes-id: %q", changesID)
+	}
+	if len(changesID) > maxManifestKeyLen {
+		return "", fmt.Errorf("changes-id too long: %d > %d", len(changesID), maxManifestKeyLen)
+	}
+
+	scopeDir, err := manifestScopeDir(buildType)
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(s.dir, "manifests", scopeDir, "changes", url.QueryEscape(changesID)+manifestExt), nil
 }
 
 func (s *Store) uploadSessionPath(uploadID string) (string, error) {
@@ -2151,29 +2173,6 @@ func (s *Store) targetManifestPaths(req Request) ([]string, error) {
 	return targets, nil
 }
 
-func (s *Store) scopedChangesPath(changesID string, buildType string, kind string) (string, error) {
-	changesID = strings.TrimSpace(changesID)
-	if changesID == "" {
-		return "", fmt.Errorf("invalid changes-id: %q", changesID)
-	}
-	if len(changesID) > maxManifestKeyLen {
-		return "", fmt.Errorf("changes-id too long: %d > %d", len(changesID), maxManifestKeyLen)
-	}
-
-	escaped := url.QueryEscape(changesID)
-	prefix := escaped
-	if len(prefix) > 2 {
-		prefix = prefix[:2]
-	}
-
-	scopeDir, err := manifestScopeDir(buildType)
-	if err != nil {
-		return "", err
-	}
-
-	return filepath.Join(s.dir, "manifests", scopeDir, kind, prefix, escaped), nil
-}
-
 func manifestScopeDir(buildType string) (string, error) {
 	buildType = strings.TrimSpace(buildType)
 	if buildType == "" {
@@ -2221,18 +2220,24 @@ func listManifestFiles(root string) ([]string, error) {
 	return files, nil
 }
 
+// readManifestPaths reads manifestPath's deduped, cleaned relative paths, transparently
+// decompressing content stored under the manifest layout (see manifestExt); anything else
+// (upload session files, which are always plain text) is read as-is. Used by /inspect, /clear,
+// and the object-liveness scan (scanManifestRefs).
 func readManifestPaths(manifestPath string) ([]string, error) {
-	f, err := os.Open(manifestPath) //nolint:gosec // path is derived from configured storage dir.
+	data, err := os.ReadFile(manifestPath) //nolint:gosec // path is derived from configured storage dir.
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			log.Printf("close manifest %s: %s", manifestPath, closeErr.Error())
-		}
-	}()
 
-	scanner := bufio.NewScanner(f)
+	if strings.HasSuffix(manifestPath, manifestExt) {
+		data, err = cache.DecodeZstd(nil, data)
+		if err != nil {
+			return nil, fmt.Errorf("decode manifest %s: %w", manifestPath, err)
+		}
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	res := make([]string, 0)
@@ -2284,11 +2289,19 @@ func (s *Store) scanManifestRefs(skip map[string]struct{}) (map[string]struct{},
 	return refs, nil
 }
 
+// writeManifest persists body to manifestPath, zstd-compressing it first when manifestPath is a
+// manifest (see manifestExt) rather than a plain-text upload session file.
 func (s *Store) writeManifest(manifestPath string, body string) error {
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o750); err != nil {
 		return fmt.Errorf("create manifest dir: %w", err)
 	}
-	if err := os.WriteFile(manifestPath+".tmp", []byte(body), 0o600); err != nil {
+
+	data := []byte(body)
+	if strings.HasSuffix(manifestPath, manifestExt) {
+		data = cache.EncodeZstd(make([]byte, 0, len(data)/2), data)
+	}
+
+	if err := os.WriteFile(manifestPath+".tmp", data, 0o600); err != nil {
 		return fmt.Errorf("write manifest: %w", s.handleWriteErr(err))
 	}
 	if err := os.Rename(manifestPath+".tmp", manifestPath); err != nil {
@@ -2297,33 +2310,52 @@ func (s *Store) writeManifest(manifestPath string, body string) error {
 	return nil
 }
 
+// joinManifestBody renders paths as a manifest file's newline-separated body.
+func joinManifestBody(paths []string) string {
+	body := strings.Join(paths, "\n")
+	if body != "" {
+		body += "\n"
+	}
+	return body
+}
+
+// unionManifestPaths dedups and concatenates any number of path lists, preserving first-seen
+// order and dropping blanks.
+func unionManifestPaths(lists ...[]string) []string {
+	size := 0
+	for _, l := range lists {
+		size += len(l)
+	}
+
+	seen := make(map[string]struct{}, size)
+	merged := make([]string, 0, size)
+	for _, l := range lists {
+		for _, relPath := range l {
+			relPath = strings.TrimSpace(relPath)
+			if relPath == "" {
+				continue
+			}
+			if _, ok := seen[relPath]; ok {
+				continue
+			}
+			seen[relPath] = struct{}{}
+			merged = append(merged, relPath)
+		}
+	}
+
+	return merged
+}
+
+// mergeManifest merges paths into manifestPath's existing content and writes the result back.
 func (s *Store) mergeManifest(manifestPath string, paths []string) error {
 	existing, _, err := s.loadManifest(manifestPath)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
-	seen := make(map[string]struct{}, len(existing)+len(paths))
-	merged := make([]string, 0, len(existing)+len(paths))
+	merged := unionManifestPaths(existing, paths)
 
-	for _, relPath := range append(existing, paths...) {
-		relPath = strings.TrimSpace(relPath)
-		if relPath == "" {
-			continue
-		}
-		if _, ok := seen[relPath]; ok {
-			continue
-		}
-		seen[relPath] = struct{}{}
-		merged = append(merged, relPath)
-	}
-
-	body := strings.Join(merged, "\n")
-	if body != "" {
-		body += "\n"
-	}
-
-	return s.writeManifest(manifestPath, body)
+	return s.writeManifest(manifestPath, joinManifestBody(merged))
 }
 
 func (s *Store) indexPath() string {

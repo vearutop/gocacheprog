@@ -22,6 +22,20 @@ import (
 	"github.com/vearutop/gocacheprog/internal/local"
 )
 
+// readManifestBodyForTest reads a gocache manifest file and decompresses it -- manifests are
+// zstd-compressed under the current layout (see gocache.Store's manifestExt).
+func readManifestBodyForTest(t *testing.T, path string) string {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	decoded, err := cache.DecodeZstd(nil, data)
+	require.NoError(t, err)
+
+	return string(decoded)
+}
+
 func TestNewClient(t *testing.T) {
 	localStore, err := local.NewStore("./testdata")
 	require.NoError(t, err)
@@ -226,16 +240,11 @@ func TestClient_SaveCache_ChunksAndFinalizes(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3, stats.Files)
 
-	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "co", "commit123")
-	changesManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "changes", "re", "repo%2Fpr-123")
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "c", "commit123.zst")
+	changesManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "changes", "repo%2Fpr-123.zst")
 
-	commitBody, err := os.ReadFile(commitManifestPath)
-	require.NoError(t, err)
-	require.Equal(t, "ab/a\nab/b\nab/c\n", string(commitBody))
-
-	changesBody, err := os.ReadFile(changesManifestPath)
-	require.NoError(t, err)
-	require.Equal(t, "ab/a\nab/b\nab/c\n", string(changesBody))
+	require.Equal(t, "ab/a\nab/b\nab/c\n", readManifestBodyForTest(t, commitManifestPath))
+	require.Equal(t, "ab/a\nab/b\nab/c\n", readManifestBodyForTest(t, changesManifestPath))
 }
 
 func TestClient_SaveCache_SkipsFilesExceedingServerMaxFileBytesWithoutClientFlag(t *testing.T) {
@@ -269,10 +278,8 @@ func TestClient_SaveCache_SkipsFilesExceedingServerMaxFileBytesWithoutClientFlag
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Files)
 
-	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "co", "commit123")
-	commitBody, err := os.ReadFile(commitManifestPath)
-	require.NoError(t, err)
-	require.Equal(t, "ab/small\n", string(commitBody))
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "c", "commit123.zst")
+	require.Equal(t, "ab/small\n", readManifestBodyForTest(t, commitManifestPath))
 }
 
 func TestClient_ExistingPaths(t *testing.T) {
@@ -302,10 +309,8 @@ func TestClient_ExistingPaths(t *testing.T) {
 	// A path reported as "existing" is one the caller will skip re-uploading -- it must still
 	// end up in this commit/build-type's own manifest, or a later restore for the same commit
 	// won't find it even though the object is sitting right there on the server.
-	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "co", "commit123")
-	commitBody, err := os.ReadFile(commitManifestPath)
-	require.NoError(t, err)
-	require.Equal(t, "ab/present\n", string(commitBody))
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "c", "commit123.zst")
+	require.Equal(t, "ab/present\n", readManifestBodyForTest(t, commitManifestPath))
 }
 
 func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {
@@ -426,10 +431,8 @@ func TestSaveCacheChunk_OversizedItemFollowedByAnotherDoesNotDeadlock(t *testing
 	require.NoError(t, finalizeResp.Body.Close())
 	require.Equal(t, nethttp.StatusNoContent, finalizeResp.StatusCode)
 
-	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "default", "co", "commit123")
-	commitBody, err := os.ReadFile(commitManifestPath)
-	require.NoError(t, err)
-	require.Equal(t, "ab/normal\n", string(commitBody))
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "default", "c", "commit123.zst")
+	require.Equal(t, "ab/normal\n", readManifestBodyForTest(t, commitManifestPath))
 
 	require.NoFileExists(t, filepath.Join(serverDir, "native", "objects", "ab", "oversized"))
 	require.FileExists(t, filepath.Join(serverDir, "native", "objects", "ab", "normal"))

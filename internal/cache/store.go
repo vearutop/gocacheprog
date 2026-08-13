@@ -10,10 +10,56 @@ import (
 	"log"
 	"math"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
+
+// zstdEncoder mirrors the settings zstd.EncodeTo uses internally, but is held by a plain,
+// permanent package reference instead of zstd.EncodeTo's own weak.Pointer cache. A GC running
+// between calls can evict that weak pointer, silently rebuilding the encoder (which spins up
+// runtime.NumCPU worker goroutines) on the next call -- ruinous for a tight loop of many small
+// compressions, like save-cache's per-item path, where it turned a sub-second test into ~20s.
+// (*zstd.Encoder).EncodeAll is documented safe for concurrent use, so one shared instance is
+// enough; no pool needed.
+var zstdEncoder = func() *zstd.Encoder {
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderConcurrency(runtime.NumCPU()),
+		zstd.WithWindowSize(1<<20),
+		zstd.WithLowerEncoderMem(true),
+		zstd.WithZeroFrames(true),
+	)
+	if err != nil {
+		panic("cache: init zstd encoder: " + err.Error())
+	}
+	return enc
+}()
+
+// EncodeZstd appends the zstd-compressed encoding of src to dst using the shared zstdEncoder.
+func EncodeZstd(dst, src []byte) []byte {
+	return zstdEncoder.EncodeAll(src, dst)
+}
+
+// zstdDecoder mirrors zstdEncoder's own reasoning on the decode side: zstd.DecodeTo caches its
+// decoder behind the same kind of weak.Pointer, so a shared, permanently-referenced *zstd.Decoder
+// avoids the same GC-driven rebuild risk for callers that decode many small manifests/objects in
+// a tight loop. (*zstd.Decoder).DecodeAll is documented safe for concurrent use.
+var zstdDecoder = func() *zstd.Decoder {
+	dec, err := zstd.NewReader(nil,
+		zstd.WithDecoderConcurrency(runtime.NumCPU()),
+		zstd.WithDecoderLowmem(true),
+	)
+	if err != nil {
+		panic("cache: init zstd decoder: " + err.Error())
+	}
+	return dec
+}()
+
+// DecodeZstd appends the decoded contents of src to dst using the shared zstdDecoder.
+func DecodeZstd(dst, src []byte) ([]byte, error) {
+	return zstdDecoder.DecodeAll(src, dst)
+}
 
 const MinCompressionSize = 200 // 200 bytes brings ratio of ~1.5x.
 
@@ -207,8 +253,7 @@ func (ri *ResponseItem) CompressedBodyReader() (io.ReadCloser, error) {
 		return nil, readErr
 	}
 
-	buf := make([]byte, 0, len(data)/2)
-	buf = zstd.EncodeTo(buf, data)
+	buf := EncodeZstd(make([]byte, 0, len(data)/2), data)
 
 	ri.WireSize = int64(len(buf))
 	ri.IsCompressed = true
