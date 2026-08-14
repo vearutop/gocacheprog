@@ -497,16 +497,20 @@ func TestStoreMaxFileBytes_SkipsPutAndServe(t *testing.T) {
 
 func TestStoreEvictsLeastRecentlyUsedWhenSizeLimitExceeded(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir, WithCompression(), WithMaxDiskBytes(10), WithEvictionDelay(10*time.Millisecond))
+	// 250, not 10: eviction now clears down to a margin below the limit (see
+	// evictionMarginFraction), not exactly to it, so the limit must leave enough room below it
+	// for the two survivors (200 bytes) plus their margin, or the test would over-evict a
+	// second item purely from margin/item-size rounding rather than genuine LRU behavior.
+	store, err := NewStore(dir, WithCompression(), WithMaxDiskBytes(250), WithEvictionDelay(10*time.Millisecond))
 	require.NoError(t, err)
 
 	now := time.Now()
 	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
-		testItem("actionId1", "outputId1", "12345", &now),
+		testItem("actionId1", "outputId1", strings.Repeat("1", 100), &now),
 	}}))
 	time.Sleep(2 * time.Millisecond)
 	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
-		testItem("actionId2", "outputId2", "67890", &now),
+		testItem("actionId2", "outputId2", strings.Repeat("2", 100), &now),
 	}}))
 
 	require.NoError(t, store.Get(cache.Request{ActionIDs: []string{"actionId1"}}, func(resp cache.ResponseItem) {}))
@@ -518,13 +522,13 @@ func TestStoreEvictsLeastRecentlyUsedWhenSizeLimitExceeded(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 
 	require.NoError(t, store.Put(cache.Response{Items: []cache.ResponseItem{
-		testItem("actionId3", "outputId3", "abcde", &now),
+		testItem("actionId3", "outputId3", strings.Repeat("3", 100), &now),
 	}}))
 
 	require.Eventually(t, func() bool {
 		store.mu.Lock()
 		defer store.mu.Unlock()
-		return store.currentDiskBytes == int64(10) && len(store.index) == 2
+		return store.currentDiskBytes == int64(200) && len(store.index) == 2
 	}, time.Second, 10*time.Millisecond)
 
 	var got []string

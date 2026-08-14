@@ -136,10 +136,17 @@ func (h *Handler) diskBudgetStores() []diskBudgetStore {
 	return stores
 }
 
+// evictionMarginFraction is the fraction of combinedMaxDiskBytes eviction clears below the
+// limit, so the combined total has room to grow before the next write needs evicting again --
+// this runs after every request, so settling exactly at the limit would mean re-evicting on
+// almost every subsequent write once the stores fill up. Same reasoning as
+// gocache/local.Store's own evictionMarginFraction and evictOldestUntilFits's client-side trim.
+const evictionMarginFraction = 10
+
 // enforceCombinedBudget evicts from whichever store currently holds the most bytes until combined
-// usage across store and gocacheStore is back under combinedMaxDiskBytes, or nothing more can be
-// evicted anywhere. Called after every request so a burst of writes can't outrun it the way a
-// timer-based sweep could.
+// usage across store and gocacheStore is back under a margin below combinedMaxDiskBytes, or
+// nothing more can be evicted anywhere. Called after every request so a burst of writes can't
+// outrun it the way a timer-based sweep could.
 func (h *Handler) enforceCombinedBudget() {
 	if h.combinedMaxDiskBytes <= 0 {
 		return
@@ -150,12 +157,14 @@ func (h *Handler) enforceCombinedBudget() {
 		return
 	}
 
+	target := h.combinedMaxDiskBytes - h.combinedMaxDiskBytes/evictionMarginFraction
+
 	for {
 		var total int64
 		for _, s := range stores {
 			total += s.DiskBytes()
 		}
-		if total <= h.combinedMaxDiskBytes {
+		if total <= target {
 			return
 		}
 

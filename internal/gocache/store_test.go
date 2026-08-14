@@ -1199,3 +1199,125 @@ func TestStoreSave_SchedulesAgeEviction(t *testing.T) {
 		return !ok
 	}, time.Second, 10*time.Millisecond)
 }
+
+// TestMoreEvictable_PrefersOlderBucketRegardlessOfSize covers the primary ordering: an object in
+// an older recency bucket is always more evictable than one in a newer bucket, no matter how
+// much bigger the newer one is -- bucketing must never let a large-but-fresh object jump ahead
+// of a genuinely stale one.
+func TestMoreEvictable_PrefersOlderBucketRegardlessOfSize(t *testing.T) {
+	bucket := time.Hour
+	older := indexEntry{AccessTimeMicro: time.Now().Add(-3 * time.Hour).UnixMicro()}
+	newer := indexEntry{AccessTimeMicro: time.Now().UnixMicro()}
+
+	require.True(t, moreEvictable(older, 10, newer, 10_000_000, bucket))
+	require.False(t, moreEvictable(newer, 10_000_000, older, 10, bucket))
+}
+
+// TestMoreEvictable_PrefersLargerWithinSameBucket covers the actual point of this session's
+// change: within the same recency bucket, the larger object is more evictable, since evicting it
+// frees the same or more space for the same single cache miss that a small object's eviction
+// would also cost.
+func TestMoreEvictable_PrefersLargerWithinSameBucket(t *testing.T) {
+	bucket := time.Hour
+
+	// Explicit bucket-aligned offsets (not "a few minutes before now"): two relative offsets
+	// from time.Now() can straddle an hour boundary depending on wall-clock alignment when the
+	// test happens to run, landing in different buckets non-deterministically.
+	bucketMicro := bucket.Microseconds()
+	bucketStart := (time.Now().UnixMicro() / bucketMicro) * bucketMicro
+	small := indexEntry{AccessTimeMicro: bucketStart + int64(10*time.Minute/time.Microsecond)}
+	big := indexEntry{AccessTimeMicro: bucketStart + int64(50*time.Minute/time.Microsecond)} // more recent, same bucket
+
+	require.True(t, moreEvictable(big, 1_000_000, small, 100, bucket), "larger object in the same bucket should be preferred even though it's more recent")
+	require.False(t, moreEvictable(small, 100, big, 1_000_000, bucket))
+}
+
+// TestMoreEvictable_ZeroBucketDisablesSizeBias covers the escape hatch: WithEvictionBucket(0)
+// must reproduce plain chronological LRU, ignoring size entirely.
+func TestMoreEvictable_ZeroBucketDisablesSizeBias(t *testing.T) {
+	now := time.Now()
+	older := indexEntry{AccessTimeMicro: now.Add(-time.Minute).UnixMicro()}
+	newer := indexEntry{AccessTimeMicro: now.UnixMicro()}
+
+	require.True(t, moreEvictable(older, 1, newer, 1_000_000, 0), "tiny older object must still be evicted before a huge newer one when bucketing is disabled")
+}
+
+// TestStoreEviction_PrefersLargerObjectWithinSameBucket is the end-to-end version of
+// TestMoreEvictable_PrefersLargerWithinSameBucket: budget-triggered eviction on a real Store
+// picks the larger of two same-bucket objects, not the strictly-oldest one.
+func TestStoreEviction_PrefersLargerObjectWithinSameBucket(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithMaxDiskBytes(500), WithEvictionBucket(time.Hour))
+	require.NoError(t, err)
+
+	// Explicitly bucket-aligned (matching moreEvictable's own floor-division), not just "a few
+	// minutes apart relative to now": two timestamps a fixed offset apart can straddle an hour
+	// boundary depending on wall-clock alignment when the test happens to run, landing in
+	// different buckets and making this flaky.
+	bucketMicro := time.Hour.Microseconds()
+	bucketStart := (time.Now().UnixMicro() / bucketMicro) * bucketMicro
+	saveWithAccessTimeForTest(t, store, "small-but-oldest", 10, time.UnixMicro(bucketStart+int64(10*time.Minute/time.Microsecond)))
+	saveWithAccessTimeForTest(t, store, "big-but-newer", 900, time.UnixMicro(bucketStart+int64(50*time.Minute/time.Microsecond)))
+
+	store.mu.Lock()
+	store.evictIfNeededLocked()
+	store.mu.Unlock()
+
+	store.mu.Lock()
+	_, smallStillPresent := store.index["small-but-oldest"]
+	_, bigStillPresent := store.index["big-but-newer"]
+	store.mu.Unlock()
+
+	require.True(t, smallStillPresent, "the smaller object should survive even though it's chronologically oldest")
+	require.False(t, bigStillPresent, "the larger object should be evicted first since both fall in the same recency bucket")
+}
+
+// TestStoreEviction_LeavesMarginBelowLimit covers the actual reported symptom: the status page
+// always read exactly at the disk-budget limit, because eviction stopped the instant it dropped
+// to or below maxDiskBytes -- meaning almost every subsequent write had to evict again. It
+// should settle with headroom below the limit instead (see evictionMarginFraction).
+func TestStoreEviction_LeavesMarginBelowLimit(t *testing.T) {
+	dir := t.TempDir()
+
+	const maxDiskBytes = 1000
+	store, err := NewStore(dir, WithMaxDiskBytes(maxDiskBytes))
+	require.NoError(t, err)
+
+	now := time.Now()
+	for i := 0; i < 5; i++ {
+		saveWithAccessTimeForTest(t, store, fmt.Sprintf("item-%d", i), 100, now.Add(time.Duration(i)*time.Minute))
+	}
+	require.Equal(t, int64(500), store.DiskBytes())
+
+	// One more push the total (600) over budget without any single item being anywhere near the
+	// limit itself, so the only thing that could stop eviction early is the margin target.
+	saveWithAccessTimeForTest(t, store, "item-5", 100, now.Add(5*time.Minute))
+
+	store.mu.Lock()
+	store.evictIfNeededLocked()
+	store.mu.Unlock()
+
+	target := int64(maxDiskBytes - maxDiskBytes/evictionMarginFraction)
+	require.LessOrEqual(t, store.DiskBytes(), target, "eviction should clear a margin below maxDiskBytes, not settle exactly at it")
+	require.Positive(t, store.DiskBytes(), "eviction shouldn't have needed to clear out everything")
+}
+
+// saveWithAccessTimeForTest saves a size-byte item and backdates its access time, for tests that
+// need explicit control over eviction ordering.
+func saveWithAccessTimeForTest(t *testing.T, store *Store, path string, size int, accessTime time.Time) {
+	t.Helper()
+
+	body := strings.Repeat("x", size)
+	item := FileItem{Path: path, Size: int64(size), WireSize: int64(size)}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader([]byte(body))), nil
+	})
+	require.NoError(t, store.SaveItem(item))
+
+	store.mu.Lock()
+	ie := store.index[path]
+	ie.AccessTimeMicro = accessTime.UnixMicro()
+	store.index[path] = ie
+	store.mu.Unlock()
+}

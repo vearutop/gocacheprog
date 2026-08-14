@@ -109,6 +109,7 @@ type Store struct {
 	maxAge         time.Duration
 	manifestMaxAge time.Duration
 	evictionDelay  time.Duration
+	evictionBucket time.Duration
 
 	mu                    sync.Mutex
 	index                 map[string]indexEntry
@@ -198,6 +199,15 @@ func WithEvictionDelay(evictionDelay time.Duration) StoreOption {
 	}
 }
 
+// WithEvictionBucket sets the recency window within which eviction prefers the larger object
+// over the strictly oldest one (see evictOneLocked). 0 disables bucketing (strict LRU, oldest
+// regardless of size).
+func WithEvictionBucket(evictionBucket time.Duration) StoreOption {
+	return func(s *Store) {
+		s.evictionBucket = evictionBucket
+	}
+}
+
 func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	dir, err := toAbsPath(dir)
 	if err != nil {
@@ -209,6 +219,7 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 		maxAge:         48 * time.Hour,
 		manifestMaxAge: 5 * 24 * time.Hour,
 		evictionDelay:  5 * time.Minute,
+		evictionBucket: time.Hour,
 		index:          make(map[string]indexEntry),
 	}
 	for _, opt := range opts {
@@ -1831,9 +1842,9 @@ func (s *Store) DiskBytes() int64 {
 	return s.currentDiskBytes
 }
 
-// EvictOne evicts a single least-recently-used entry regardless of maxDiskBytes, for use by an
-// external combined-budget enforcer spanning multiple stores. Reports whether anything was
-// evicted.
+// EvictOne evicts a single entry regardless of maxDiskBytes (see moreEvictable for the actual
+// selection), for use by an external combined-budget enforcer spanning multiple stores. Reports
+// whether anything was evicted.
 func (s *Store) EvictOne() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1862,24 +1873,37 @@ func (s *Store) evictIfNeededLocked() {
 		return
 	}
 
-	for s.currentDiskBytes > s.maxDiskBytes && s.evictOneLocked() {
+	// Evict down to a margin below the limit, not exactly to it: this runs after nearly every
+	// write, so settling right at maxDiskBytes means re-evicting on almost every subsequent
+	// write once the store fills up -- the same reasoning as evictOldestUntilFits's client-side
+	// trim (see evictionMarginFraction).
+	target := s.maxDiskBytes - s.maxDiskBytes/evictionMarginFraction
+	for s.currentDiskBytes > target && s.evictOneLocked() {
 	}
 }
 
-// evictOneLocked removes the single least-recently-used cache object regardless of maxDiskBytes
-// and reports whether one was evicted (false once the index is empty). Shared by the
-// budget-based loop above and evictOnDiskFullLocked below.
+// evictionMarginFraction is the fraction of maxDiskBytes eviction clears below the limit, so a
+// store that just got evicted has room to grow before it needs evicting again instead of
+// hovering right at the ceiling.
+const evictionMarginFraction = 10
+
+// evictOneLocked removes the single most evictable cache object (see moreEvictable) regardless
+// of maxDiskBytes, and reports whether one was evicted (false once the index is empty). Shared
+// by the budget-based loop above and evictOnDiskFullLocked below.
 func (s *Store) evictOneLocked() bool {
 	var (
 		evictPath string
 		evictIE   indexEntry
+		evictSize int64
 		found     bool
 	)
 
 	for relPath, ie := range s.index {
-		if !found || lruTimeMicro(ie) < lruTimeMicro(evictIE) {
+		size := s.entryStoredSize(ie)
+		if !found || moreEvictable(ie, size, evictIE, evictSize, s.evictionBucket) {
 			evictPath = relPath
 			evictIE = ie
+			evictSize = size
 			found = true
 		}
 	}
@@ -1898,11 +1922,11 @@ func (s *Store) evictOneLocked() bool {
 	return true
 }
 
-// diskFullEvictFraction is the share of the index force-evicted, oldest first, whenever a write
-// hits ENOSPC. maxDiskBytes accounting only tracks this Store's own cache objects, not manifests,
-// uploads, or whatever else shares the disk, so a full disk doesn't imply currentDiskBytes >
-// maxDiskBytes. Evicting an LRU slice regardless of budget gives the next write a chance to
-// succeed instead of every request failing until an operator notices.
+// diskFullEvictFraction is the share of the index force-evicted (see moreEvictable) whenever a
+// write hits ENOSPC. maxDiskBytes accounting only tracks this Store's own cache objects, not
+// manifests, uploads, or whatever else shares the disk, so a full disk doesn't imply
+// currentDiskBytes > maxDiskBytes. Evicting a slice regardless of budget gives the next write a
+// chance to succeed instead of every request failing until an operator notices.
 const diskFullEvictFraction = 10
 
 func (s *Store) evictOnDiskFullLocked() {
@@ -1983,6 +2007,26 @@ func lruTimeMicro(ie indexEntry) int64 {
 		return ie.AccessTimeMicro
 	}
 	return ie.ModTimeMicro
+}
+
+// moreEvictable reports whether a should be evicted before b. Rebuilding N evicted objects costs
+// roughly N cache misses regardless of their size, while evicting one large object is still a
+// single miss -- so within a bounded recency window (bucket) it's worth preferring the larger
+// object over the strictly oldest one. bucket <= 0 falls back to strict LRU (every entry is its
+// own bucket, so size never enters into it).
+func moreEvictable(a indexEntry, sizeA int64, b indexEntry, sizeB int64, bucket time.Duration) bool {
+	if bucket <= 0 {
+		return lruTimeMicro(a) < lruTimeMicro(b)
+	}
+
+	bucketMicro := bucket.Microseconds()
+	bucketA := lruTimeMicro(a) / bucketMicro
+	bucketB := lruTimeMicro(b) / bucketMicro
+	if bucketA != bucketB {
+		return bucketA < bucketB
+	}
+
+	return sizeA > sizeB
 }
 
 // writeAtomicSeq disambiguates concurrent writers' temp file names. Two writers can

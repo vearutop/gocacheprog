@@ -1307,9 +1307,19 @@ func (dc *Store) evictIfNeededLocked() {
 		return
 	}
 
-	for dc.currentDiskBytes > dc.maxDiskBytes && dc.evictOneLocked() {
+	// Evict down to a margin below the limit, not exactly to it: this runs after nearly every
+	// write, so settling right at maxDiskBytes means re-evicting on almost every subsequent
+	// write once the store fills up -- the same reasoning as evictOldestUntilFits's client-side
+	// trim (see evictionMarginFraction).
+	target := dc.maxDiskBytes - dc.maxDiskBytes/evictionMarginFraction
+	for dc.currentDiskBytes > target && dc.evictOneLocked() {
 	}
 }
+
+// evictionMarginFraction is the fraction of maxDiskBytes eviction clears below the limit, so a
+// store that just got evicted has room to grow before it needs evicting again instead of
+// hovering right at the ceiling.
+const evictionMarginFraction = 10
 
 // evictOneLocked removes the single least-recently-used cache object regardless of maxDiskBytes
 // and reports whether one was evicted (false once the index is empty). Shared by the
