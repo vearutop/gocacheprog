@@ -173,9 +173,9 @@ func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 	require.Equal(t, []string{"commit"}, sources)
 	require.Empty(t, restored)
 
-	manifestBody, err := os.ReadFile(manifestPath)
+	manifestBody, err := readManifestPaths(manifestPath)
 	require.NoError(t, err)
-	require.Equal(t, "", string(manifestBody))
+	require.Empty(t, manifestBody)
 }
 
 // TestStoreRestore_SurvivesSelfHealWriteFailure covers a disk-full-on-the-remote scenario: pruning
@@ -312,6 +312,26 @@ func saveItemForTest(t *testing.T, store *Store, req Request, path, body string)
 	require.NoError(t, store.Save(req, Batch{Items: []FileItem{item}}))
 }
 
+// saveItemsForTest bulk-saves paths via SaveItem, then merges them into req's manifest in one
+// call -- unlike calling saveItemForTest (Save) in a loop, this pays mergeManifest's self-heal
+// stat cost once for the whole batch instead of once per item, matching how production actually
+// saves a batch (many SaveItem calls, one closing MergeSavedPaths). A setup loop of thousands of
+// filler items only needs the end state, so there's no reason to pay per-item merge cost
+// O(items²) just to get there.
+func saveItemsForTest(t *testing.T, store *Store, req Request, paths []string, body string) {
+	t.Helper()
+
+	for _, path := range paths {
+		item := FileItem{Path: path, Size: int64(len(body)), WireSize: int64(len(body))}
+		item.SetBodyReader(func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte(body))), nil
+		})
+		require.NoError(t, store.SaveItem(item))
+	}
+
+	require.NoError(t, store.MergeSavedPaths(req, paths))
+}
+
 // TestPoolPromotion_PacksSmallRecordsAndRoundTrips covers dynamic promotion end to end: a size
 // stays plain files below the pool's breakeven, the item that crosses the threshold lands
 // straight in a freshly created page instead of one more plain file, and the read path
@@ -326,9 +346,11 @@ func TestPoolPromotion_PacksSmallRecordsAndRoundTrips(t *testing.T) {
 	body := strings.Repeat("x", 50)
 	// breakeven-1 plain files: the pool's internal count reaches breakeven-1, still below the
 	// promotion threshold.
+	fillerPaths := make([]string, 0, breakeven-1)
 	for i := 0; i < breakeven-1; i++ {
-		saveItemForTest(t, store, Request{Commit: "c"}, fmt.Sprintf("ab/item-%d", i), body)
+		fillerPaths = append(fillerPaths, fmt.Sprintf("ab/item-%d", i))
 	}
+	saveItemsForTest(t, store, Request{Commit: "c"}, fillerPaths, body)
 
 	pagePath := filepath.Join(dir, "records", recordpool.PageFileName(50, 1))
 	require.NoFileExists(t, pagePath)
@@ -374,9 +396,11 @@ func TestPool_PageRemovedWhenFullyEmptied(t *testing.T) {
 	// breakeven-1 plain files, then a handful more that land in the pool once promoted --
 	// exercises several slots in the same page, not just the one that triggered promotion.
 	const extraPooledItems = 5
+	fillerPaths := make([]string, 0, breakeven-1+extraPooledItems)
 	for i := 0; i < breakeven-1+extraPooledItems; i++ {
-		saveItemForTest(t, store, Request{Commit: "c2"}, fmt.Sprintf("ab/entry-%d", i), body)
+		fillerPaths = append(fillerPaths, fmt.Sprintf("ab/entry-%d", i))
 	}
+	saveItemsForTest(t, store, Request{Commit: "c2"}, fillerPaths, body)
 
 	pagePath := filepath.Join(dir, "records", recordpool.PageFileName(60, 1))
 	require.FileExists(t, pagePath)
@@ -894,13 +918,13 @@ func TestMergeSavedPaths_ChangesIDMerges(t *testing.T) {
 	changesManifestPath, err := store.changesManifestPath("repo/pr-123", "unit")
 	require.NoError(t, err)
 
-	commitBody, err := os.ReadFile(commitManifestPath)
+	commitBody, err := readManifestPaths(commitManifestPath)
 	require.NoError(t, err)
-	require.Equal(t, "A\nB\nC\nD\nE\n", string(commitBody))
+	require.Equal(t, []string{"A", "B", "C", "D", "E"}, commitBody)
 
-	changesBody, err := os.ReadFile(changesManifestPath)
+	changesBody, err := readManifestPaths(changesManifestPath)
 	require.NoError(t, err)
-	require.Equal(t, "A\nB\nC\nD\nE\n", string(changesBody))
+	require.Equal(t, []string{"A", "B", "C", "D", "E"}, changesBody)
 }
 
 func TestFinalizeUpload_MergesAccumulatedChunkPaths(t *testing.T) {
@@ -934,13 +958,13 @@ func TestFinalizeUpload_MergesAccumulatedChunkPaths(t *testing.T) {
 	uploadPath, err := store.uploadSessionPath("upload-1")
 	require.NoError(t, err)
 
-	commitBody, err := os.ReadFile(commitManifestPath)
+	commitBody, err := readManifestPaths(commitManifestPath)
 	require.NoError(t, err)
-	require.Equal(t, "A\nB\nC\n", string(commitBody))
+	require.Equal(t, []string{"A", "B", "C"}, commitBody)
 
-	changesBody, err := os.ReadFile(changesManifestPath)
+	changesBody, err := readManifestPaths(changesManifestPath)
 	require.NoError(t, err)
-	require.Equal(t, "A\nB\nC\n", string(changesBody))
+	require.Equal(t, []string{"A", "B", "C"}, changesBody)
 
 	_, err = os.Stat(uploadPath)
 	require.ErrorIs(t, err, os.ErrNotExist)

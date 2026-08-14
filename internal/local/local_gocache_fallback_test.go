@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vearutop/gocacheprog/internal/cache"
 	"github.com/vearutop/gocacheprog/internal/gocache"
 	cachehttp "github.com/vearutop/gocacheprog/internal/http"
 )
@@ -132,8 +133,10 @@ func TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas(t *testing.T) {
 	// Skipping the re-upload must not also mean the path silently drops out of this
 	// commit's manifest -- a later restore for commit123 needs to find it even though it
 	// was never re-uploaded in this session.
-	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "co", "commit123")
-	commitBody, err := os.ReadFile(commitManifestPath)
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "c", "commit123.zst")
+	commitData, err := os.ReadFile(commitManifestPath)
+	require.NoError(t, err)
+	commitBody, err := cache.DecodeZstd(nil, commitData)
 	require.NoError(t, err)
 	require.Contains(t, string(commitBody), "ab/shared-dep\n", "skipped-but-existing path must still be merged into the manifest")
 	require.Contains(t, string(commitBody), "cd/genuinely-new\n")
