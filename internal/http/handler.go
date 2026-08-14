@@ -37,6 +37,7 @@ type Handler struct {
 	lastPanicMessage     string
 	lastPanicStack       string
 	lastPanicAt          time.Time
+	sessionsCSVPath      string
 }
 
 // HandlerOption configures optional Handler behavior not covered by NewHandlerWithPreloadLimit's
@@ -48,6 +49,13 @@ type HandlerOption func(*Handler)
 // the most bytes until back under budget. n <= 0 disables combined enforcement (the default).
 func WithMaxDiskBytes(n int64) HandlerOption {
 	return func(h *Handler) { h.combinedMaxDiskBytes = n }
+}
+
+// WithSessionsCSV appends a row to path every time a session starts and every time it's marked
+// done (see appendSessionsCSV), for offline analysis of cache performance over time. Empty
+// (the default) disables it.
+func WithSessionsCSV(path string) HandlerOption {
+	return func(h *Handler) { h.sessionsCSVPath = path }
 }
 
 // clientSession tracks the most recent request seen from one client process (identified by its
@@ -194,7 +202,6 @@ func (h *Handler) touchSession(r *http.Request) {
 	now := time.Now()
 
 	h.clientSessionsMu.Lock()
-	defer h.clientSessionsMu.Unlock()
 
 	for id, cs := range h.clientSessions {
 		if sessionExpired(cs, now) {
@@ -202,10 +209,11 @@ func (h *Handler) touchSession(r *http.Request) {
 		}
 	}
 
-	cs := h.clientSessions[sid]
+	cs, isNew := h.clientSessions[sid], false
 	if cs == nil {
 		cs = &clientSession{FirstSeen: now}
 		h.clientSessions[sid] = cs
+		isNew = true
 	}
 	cs.LastSeen = now
 	if v := r.Header.Get(headerClientVersion); v != "" {
@@ -222,6 +230,16 @@ func (h *Handler) touchSession(r *http.Request) {
 	}
 	if v := r.Header.Get(headerJobURL); v != "" {
 		cs.JobURL = v
+	}
+
+	// Snapshotted (a plain struct copy) while still under the lock, then appended to
+	// sessions.csv after releasing it -- file I/O has no business blocking every other
+	// session's bookkeeping.
+	snapshot := *cs
+	h.clientSessionsMu.Unlock()
+
+	if isNew {
+		h.appendSessionsCSV("started", sid, snapshot)
 	}
 }
 
@@ -272,11 +290,18 @@ func (h *Handler) markSessionDone(r *http.Request) {
 	}
 
 	h.clientSessionsMu.Lock()
-	defer h.clientSessionsMu.Unlock()
-
-	if cs := h.clientSessions[sid]; cs != nil {
+	cs := h.clientSessions[sid]
+	var snapshot clientSession
+	found := cs != nil
+	if found {
 		cs.Done = true
 		cs.DoneAt = time.Now()
+		snapshot = *cs
+	}
+	h.clientSessionsMu.Unlock()
+
+	if found {
+		h.appendSessionsCSV("done", sid, snapshot)
 	}
 }
 
@@ -295,11 +320,6 @@ func (h *Handler) clientSessionsSnapshot() []clientSessionView {
 			continue
 		}
 
-		ref := cs.ChangesID
-		if ref == "" {
-			ref = cs.Commit
-		}
-
 		status := "idle"
 		if cs.Done {
 			status = "done"
@@ -315,9 +335,10 @@ func (h *Handler) clientSessionsSnapshot() []clientSessionView {
 		views = append(views, clientSessionView{
 			Status:        status,
 			Version:       cs.Version,
-			Ref:           ref,
+			Ref:           sessionRef(*cs),
 			JobURL:        cs.JobURL,
 			BuildType:     cs.BuildType,
+			StartedAt:     cs.FirstSeen,
 			PreloadBytes:  cs.PreloadBytes,
 			PreloadTime:   cs.PreloadTime,
 			PreloadSource: cs.PreloadSource,
@@ -339,6 +360,7 @@ type clientSessionView struct {
 	Ref           string
 	JobURL        string
 	BuildType     string
+	StartedAt     time.Time
 	PreloadBytes  int64
 	PreloadTime   time.Duration
 	PreloadSource string
@@ -346,6 +368,15 @@ type clientSessionView struct {
 	FinalizeTime  time.Duration
 	SessionTime   time.Duration
 	lastSeen      time.Time
+}
+
+// sessionRef is the identifying label shown for a session: its changes-id (PR/branch) if set,
+// else the raw commit.
+func sessionRef(cs clientSession) string {
+	if cs.ChangesID != "" {
+		return cs.ChangesID
+	}
+	return cs.Commit
 }
 
 // routes maps each authenticated endpoint to its handler method, so ServeHTTP is a single lookup
@@ -420,6 +451,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Path == "/" {
 		h.Index(rw, r)
+		return
+	}
+
+	// Basic-Auth-gated like "/", not Bearer-gated like the routes below: both are meant for a
+	// human hitting the URL directly (browser or curl -u), not the cache protocol client.
+	if r.URL.Path == "/sessions.csv" {
+		h.SessionsCSV(rw, r)
 		return
 	}
 
