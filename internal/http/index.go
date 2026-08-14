@@ -43,12 +43,13 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:.5rem;b
 {{end}}
 <h2>Client sessions</h2>
 <table>
-<tr><th>status</th><th>version</th><th>ref</th><th>build type</th><th>preload size</th><th>preload source</th><th>preload time</th><th>finalize size</th><th>finalize time</th><th>session time</th></tr>
+<tr><th>status</th><th>version</th><th>ref</th><th>build type</th><th>started at</th><th>preload size</th><th>preload source</th><th>preload time</th><th>finalize size</th><th>finalize time</th><th>session time</th></tr>
 {{range .Sessions}}<tr>
 <td>{{if eq .Status "done"}}<span class="done">done</span>{{else if eq .Status "in progress"}}<span class="active">in progress</span>{{else}}<span class="idle">idle</span>{{end}}</td>
 <td>{{.Version}}</td>
 <td>{{if .JobURL}}<a href="{{.JobURL}}" target="_blank" rel="noopener noreferrer">{{.Ref}}</a>{{else}}{{.Ref}}{{end}}</td>
 <td>{{.BuildType}}</td>
+<td>{{.StartedAt}}</td>
 <td>{{.PreloadSize}}</td>
 <td>{{.PreloadSource}}</td>
 <td>{{.PreloadTime}}</td>
@@ -88,6 +89,7 @@ type sessionRow struct {
 	Ref           string
 	JobURL        string
 	BuildType     string
+	StartedAt     string
 	PreloadSize   string
 	PreloadSource string
 	PreloadTime   string
@@ -178,6 +180,7 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 			Ref:           cs.Ref,
 			JobURL:        jobURLWithPR(cs.JobURL, cs.Ref),
 			BuildType:     cs.BuildType,
+			StartedAt:     cs.StartedAt.Format(time.RFC3339),
 			PreloadSize:   byteSize(cs.PreloadBytes),
 			PreloadSource: cs.PreloadSource,
 			PreloadTime:   cs.PreloadTime.Round(time.Millisecond).String(),

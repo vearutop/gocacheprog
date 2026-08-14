@@ -22,17 +22,33 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-func RunServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *Store, nativeStore *gocache.Store, authToken, fallbackAuthToken string, maxDiskBytes int64, preloadLimit int) error {
-	h := cachehttp.NewHandlerWithPreloadLimit(store, nativeStore, authToken, fallbackAuthToken, preloadLimit, cachehttp.WithMaxDiskBytes(maxDiskBytes))
+// ServerConfig holds RunServer's parameters.
+type ServerConfig struct {
+	HTTPListen        string
+	HTTPSListen       string
+	HTTPSHost         string
+	CertCacheDir      string
+	Store             *Store
+	NativeStore       *gocache.Store
+	AuthToken         string
+	FallbackAuthToken string
+	MaxDiskBytes      int64
+	PreloadLimit      int
+	SessionsCSVPath   string
+}
+
+func RunServer(cfg ServerConfig) error {
+	h := cachehttp.NewHandlerWithPreloadLimit(cfg.Store, cfg.NativeStore, cfg.AuthToken, cfg.FallbackAuthToken, cfg.PreloadLimit,
+		cachehttp.WithMaxDiskBytes(cfg.MaxDiskBytes), cachehttp.WithSessionsCSV(cfg.SessionsCSVPath))
 	printStats := func() {
-		store.PrintStats()
-		nativeStore.PrintStats()
+		cfg.Store.PrintStats()
+		cfg.NativeStore.PrintStats()
 	}
-	if httpsHost == "" {
-		return serveHTTP(httpListen, h, printStats)
+	if cfg.HTTPSHost == "" {
+		return serveHTTP(cfg.HTTPListen, h, printStats)
 	}
 
-	return serveHTTPAndHTTPS(httpListen, httpsListen, httpsHost, certCacheDir, h, printStats)
+	return serveHTTPAndHTTPS(cfg.HTTPListen, cfg.HTTPSListen, cfg.HTTPSHost, cfg.CertCacheDir, h, printStats)
 }
 
 func serveHTTP(listen string, h nethttp.Handler, printStats func()) error {

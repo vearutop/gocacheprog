@@ -257,10 +257,6 @@ func Main(options ...func(o *Options)) error {
 	return nil
 }
 
-func runServer(httpListen, httpsListen, httpsHost, certCacheDir string, store *local.Store, nativeStore *gocache.Store, authToken, fallbackAuthToken string, maxDiskBytes int64, preloadLimit int) error {
-	return local.RunServer(httpListen, httpsListen, httpsHost, certCacheDir, store, nativeStore, authToken, fallbackAuthToken, maxDiskBytes, preloadLimit)
-}
-
 func parseProxyParams() *local.ProxyParams {
 	params := &local.ProxyParams{}
 	flag.BoolVar(&params.Preload, "preload", false, "preload cache from remote server")
@@ -299,7 +295,19 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallback
 		}
 	}()
 
-	return runServer(httpListen, httpsListen, httpsHost, filepath.Join(dir, "autocert"), store, nativeStore, authToken, fallbackAuthToken, maxDiskBytes, preloadLimit)
+	return local.RunServer(local.ServerConfig{
+		HTTPListen:        httpListen,
+		HTTPSListen:       httpsListen,
+		HTTPSHost:         httpsHost,
+		CertCacheDir:      filepath.Join(dir, "autocert"),
+		Store:             store,
+		NativeStore:       nativeStore,
+		AuthToken:         authToken,
+		FallbackAuthToken: fallbackAuthToken,
+		MaxDiskBytes:      maxDiskBytes,
+		PreloadLimit:      preloadLimit,
+		SessionsCSVPath:   filepath.Join(dir, "sessions.csv"),
+	})
 }
 
 func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, restoreLimitBytes, saveCacheChunkBytes, jobStartUnixNanos int64, startedAt time.Time, params *local.ProxyParams) error {

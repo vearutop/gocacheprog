@@ -2,6 +2,7 @@ package http_test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"math/rand"
 	nethttp "net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/vearutop/gocacheprog/internal/cache"
@@ -259,4 +261,48 @@ func TestCombinedBudget_EvictsAcrossStores(t *testing.T) {
 
 	require.LessOrEqual(t, localStore.DiskBytes()+nativeStore.DiskBytes(), budget)
 	require.Zero(t, nativeStore.DiskBytes(), "the oversized native entry should have been evicted, not the small local one")
+}
+
+// TestCombinedBudget_LeavesMarginBelowLimit covers the actual reported symptom: the status page
+// combined-budget line always read exactly at the limit, because enforceCombinedBudget evicted
+// only down to the limit itself -- meaning almost every subsequent request had to evict again.
+// It should settle with headroom below the limit instead (see evictionMarginFraction).
+func TestCombinedBudget_LeavesMarginBelowLimit(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir)
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"))
+	require.NoError(t, err)
+
+	// Five 100-byte objects seeded directly (bypassing HTTP/the budget enforcer), so their exact
+	// size is known instead of guessing at wire-encoding overhead.
+	for i := 0; i < 5; i++ {
+		payload := bytes.Repeat([]byte{byte('a' + i)}, 100)
+		item := gocache.FileItem{Path: fmt.Sprintf("ab/item-%d", i), Size: int64(len(payload)), WireSize: int64(len(payload))}
+		item.SetBodyReader(func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(payload)), nil
+		})
+		require.NoError(t, nativeStore.SaveItem(item))
+		time.Sleep(time.Millisecond) // distinct mtimes, so LRU order is deterministic
+	}
+
+	budget := nativeStore.DiskBytes() + 50 // under budget so far, one more 100-byte item tips it over
+	target := budget - budget/10
+
+	h := http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2, http.WithMaxDiskBytes(budget))
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	item := cache.ResponseItem{ActionID: "a1", OutputID: "o1", Size: 5, WireSize: 5}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString("hello")), nil
+	})
+	require.NoError(t, client.Put(cache.Response{Items: []cache.ResponseItem{item}}))
+
+	total := localStore.DiskBytes() + nativeStore.DiskBytes()
+	require.LessOrEqual(t, total, target, "eviction should clear a margin below the budget, not settle exactly at it")
 }
