@@ -16,9 +16,9 @@ import (
 var sessionsCSVHeader = []string{
 	"event", "timestamp", "session_id", "started_at",
 	"status", "version", "ref", "build_type", "job_url",
-	"preload_bytes", "preload_time_ms", "preload_source",
-	"finalize_bytes", "finalize_time_ms",
-	"session_time_ms",
+	"preload_bytes", "preload_time_s", "preload_source",
+	"finalize_bytes", "finalize_time_s",
+	"session_time_s",
 }
 
 // appendSessionsCSV appends one row to h.sessionsCSVPath for a session lifecycle event
@@ -44,25 +44,32 @@ func (h *Handler) appendSessionsCSV(event, sid string, cs clientSession) {
 
 	row := []string{
 		event,
-		time.Now().UTC().Format(time.RFC3339),
+		strconv.FormatInt(time.Now().Unix(), 10),
 		sid,
-		cs.FirstSeen.UTC().Format(time.RFC3339),
+		strconv.FormatInt(cs.FirstSeen.Unix(), 10),
 		status,
 		cs.Version,
 		sessionRef(cs),
 		cs.BuildType,
 		cs.JobURL,
 		strconv.FormatInt(cs.PreloadBytes, 10),
-		strconv.FormatInt(cs.PreloadTime.Milliseconds(), 10),
+		formatSeconds(cs.PreloadTime),
 		cs.PreloadSource,
 		strconv.FormatInt(cs.FinalizeBytes, 10),
-		strconv.FormatInt(cs.FinalizeTime.Milliseconds(), 10),
-		strconv.FormatInt(sessionTime.Milliseconds(), 10),
+		formatSeconds(cs.FinalizeTime),
+		formatSeconds(sessionTime),
 	}
 
 	if err := appendCSVRow(h.sessionsCSVPath, row); err != nil {
 		log.Printf("append sessions.csv: %s", err.Error())
 	}
+}
+
+// formatSeconds renders d in plain fractional seconds (millisecond precision), not a
+// unit-suffixed Duration string, so a spreadsheet or analysis script can treat the column as a
+// plain number.
+func formatSeconds(d time.Duration) string {
+	return strconv.FormatFloat(d.Seconds(), 'f', 3, 64)
 }
 
 func appendCSVRow(path string, row []string) error {

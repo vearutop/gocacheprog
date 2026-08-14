@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -73,6 +74,21 @@ func TestSessionsCSV_RecordsStartedAndDoneEvents(t *testing.T) {
 	require.Equal(t, "done", col(done, "event"))
 	require.Equal(t, "session-csv-1", col(done, "session_id"))
 	require.Equal(t, "done", col(done, "status"))
+
+	// Plain units, not human-formatted strings: int unix timestamps and fractional seconds, so
+	// a spreadsheet or analysis script can treat every numeric column as a plain number.
+	_, err = strconv.ParseInt(col(started, "timestamp"), 10, 64)
+	require.NoError(t, err, "timestamp should be a plain unix timestamp")
+	_, err = strconv.ParseInt(col(started, "started_at"), 10, 64)
+	require.NoError(t, err, "started_at should be a plain unix timestamp")
+	_, err = strconv.ParseFloat(col(done, "session_time_s"), 64)
+	require.NoError(t, err, "session_time_s should be a plain number of seconds")
+	_, err = strconv.ParseFloat(col(done, "preload_time_s"), 64)
+	require.NoError(t, err, "preload_time_s should be a plain number of seconds")
+	_, err = strconv.ParseFloat(col(done, "finalize_time_s"), 64)
+	require.NoError(t, err, "finalize_time_s should be a plain number of seconds")
+	_, err = strconv.ParseInt(col(done, "preload_bytes"), 10, 64)
+	require.NoError(t, err, "preload_bytes should be a plain byte count")
 }
 
 // TestSessionsCSV_SurvivesAcrossHandlerRestarts covers the "survives restarts" requirement: a
