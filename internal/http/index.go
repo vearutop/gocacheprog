@@ -31,9 +31,6 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:.5rem;b
 <h1>gocacheprogd status</h1>
 <p>server version: {{.ServerVersion}}</p>
 {{if .CombinedBudget}}<p>combined disk budget: {{.CombinedBudget}}</p>{{else}}<p class="warn">no combined disk budget configured — eviction disabled</p>{{end}}
-<h2>Panics</h2>
-{{if .Panics.Count}}<p class="warn">count: {{.Panics.Count}} | last: {{.Panics.At}} — {{.Panics.Message}}</p>
-<pre>{{.Panics.Stack}}</pre>{{else}}<p>none recovered</p>{{end}}
 {{range .Sections}}
 <h2>{{.Title}}</h2>
 <table>
@@ -62,6 +59,9 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:.5rem;b
 <form method="post">
 <button type="submit">Run cleanup now</button>
 </form>
+{{if .Panics.Count}}<h2>Panics</h2>
+<p class="warn">count: {{.Panics.Count}} | last: {{.Panics.At}} — {{.Panics.Message}}</p>
+<pre>{{.Panics.Stack}}</pre>{{end}}
 </body>
 </html>
 `))
@@ -157,10 +157,14 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 
 	var sections []statSection
 	if s, ok := h.store.(statsProvider); ok {
-		sections = append(sections, toSection("Objects store", s.Stats()))
+		if stats := s.Stats(); stats["index"] != "0" {
+			sections = append(sections, toSection("Objects store", stats))
+		}
 	}
 	if h.gocacheStore != nil {
-		sections = append(sections, toSection("Native GOCACHE store", h.gocacheStore.Stats()))
+		if stats := h.gocacheStore.Stats(); stats["index"] != "0" {
+			sections = append(sections, toSection("Native GOCACHE store", stats))
+		}
 	}
 
 	var combinedBudget string

@@ -23,6 +23,15 @@ func TestIndex_BasicAuth(t *testing.T) {
 	localStore, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
 
+	// A non-empty store: the Objects store section is hidden entirely when its index is empty
+	// (see TestIndex_HidesEmptyStoreSections), so this test needs a saved item to check the
+	// section actually renders when there's something to show.
+	item := cache.ResponseItem{ActionID: "a1", OutputID: "o1", Size: 5, WireSize: 5}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString("hello")), nil
+	})
+	require.NoError(t, localStore.Put(cache.Response{Items: []cache.ResponseItem{item}}))
+
 	srv := httptest.NewServer(http.NewHandler(localStore, "secret-token"))
 	t.Cleanup(srv.Close)
 
@@ -50,6 +59,49 @@ func TestIndex_BasicAuth(t *testing.T) {
 	require.Equal(t, nethttp.StatusOK, code)
 	require.Contains(t, body, "server version")
 	require.Contains(t, body, "Objects store")
+}
+
+// TestIndex_HidesEmptyStoreSections covers the actual ask: a freshly started (or fully evicted)
+// store's section is just noise on the status page -- an "index: 0" table row nobody needs to
+// see -- so it should be omitted entirely rather than rendered empty.
+func TestIndex_HidesEmptyStoreSections(t *testing.T) {
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+	nativeStore, err := gocache.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	res, err := nethttp.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, res.Body.Close()) }()
+	b, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	body := string(b)
+
+	require.NotContains(t, body, "Objects store", "an empty local store's section should be hidden")
+	require.NotContains(t, body, "Native GOCACHE store", "an empty native store's section should be hidden")
+
+	// A saved item makes just that one store's section reappear.
+	item := cache.ResponseItem{ActionID: "a1", OutputID: "o1", Size: 5, WireSize: 5}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString("hello")), nil
+	})
+	require.NoError(t, localStore.Put(cache.Response{Items: []cache.ResponseItem{item}}))
+
+	res, err = nethttp.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, res.Body.Close()) }()
+	b, err = io.ReadAll(res.Body)
+	require.NoError(t, err)
+	body = string(b)
+
+	require.Contains(t, body, "Objects store")
+	require.NotContains(t, body, "Native GOCACHE store", "the native store is still empty")
 }
 
 func TestIndex_CleanupTriggersEvictionImmediately(t *testing.T) {

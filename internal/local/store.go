@@ -33,15 +33,14 @@ type Store struct {
 	manifestMaxAge time.Duration
 	evictionDelay  time.Duration
 
-	mu                    sync.Mutex
-	index                 map[string]indexEntry
-	outputRefs            map[string]int
-	outputSizes           map[string]int64
-	dirty                 bool
-	ready                 bool
-	currentDiskBytes      int64
-	evictionScheduled     bool
-	lastEvictionUnixMicro int64
+	mu                sync.Mutex
+	index             map[string]indexEntry
+	outputRefs        map[string]int
+	outputSizes       map[string]int64
+	dirty             bool
+	ready             bool
+	currentDiskBytes  int64
+	evictionScheduled bool
 
 	// pool packs small records (see recordpool.Pool) instead of one file per output, once a
 	// given size has demonstrably earned it. outputLocs is the in-memory index from OutputID to
@@ -1344,7 +1343,6 @@ func (dc *Store) evictOneLocked() bool {
 
 	delete(dc.index, evictActionID)
 	dc.releaseOutputRefLocked(evictEntry.OutputID)
-	dc.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
 	dc.dirty = true
 	log.Printf("evicted cache entry action_id=%s output_id=%s current_disk_bytes=%d max_disk_bytes=%d", evictActionID, evictEntry.OutputID, dc.currentDiskBytes, dc.maxDiskBytes)
 
@@ -1438,18 +1436,17 @@ func (dc *Store) Stats() map[string]string {
 	defer dc.mu.Unlock()
 
 	return map[string]string{
-		"hits":                  strconv.FormatInt(dc.hits, 10),
-		"misses":                strconv.FormatInt(dc.misses, 10),
-		"puts":                  strconv.FormatInt(dc.puts, 10),
-		"putsExist":             strconv.FormatInt(dc.putsExist, 10),
-		"putsCompleted":         strconv.FormatInt(dc.putsCompleted, 10),
-		"index":                 strconv.Itoa(len(dc.index)),
-		"diskBytes":             strconv.FormatInt(dc.currentDiskBytes, 10),
-		"maxDiskBytes":          strconv.FormatInt(dc.maxDiskBytes, 10),
-		"uniqueOutputFiles":     strconv.Itoa(len(dc.outputRefs)),
-		"evictionScheduled":     strconv.FormatBool(dc.evictionScheduled),
-		"lastEvictionUnixMicro": strconv.FormatInt(dc.lastEvictionUnixMicro, 10),
-		"errors":                strconv.FormatInt(dc.errors, 10),
+		"hits":              strconv.FormatInt(dc.hits, 10),
+		"misses":            strconv.FormatInt(dc.misses, 10),
+		"puts":              strconv.FormatInt(dc.puts, 10),
+		"putsExist":         strconv.FormatInt(dc.putsExist, 10),
+		"putsCompleted":     strconv.FormatInt(dc.putsCompleted, 10),
+		"index":             strconv.Itoa(len(dc.index)),
+		"diskBytes":         strconv.FormatInt(dc.currentDiskBytes, 10),
+		"maxDiskBytes":      strconv.FormatInt(dc.maxDiskBytes, 10),
+		"uniqueOutputFiles": strconv.Itoa(len(dc.outputRefs)),
+		"evictionScheduled": strconv.FormatBool(dc.evictionScheduled),
+		"errors":            strconv.FormatInt(dc.errors, 10),
 	}
 }
 

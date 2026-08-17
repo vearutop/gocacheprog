@@ -110,13 +110,12 @@ type Store struct {
 	evictionDelay  time.Duration
 	evictionBucket time.Duration
 
-	mu                    sync.Mutex
-	index                 map[string]indexEntry
-	dirty                 bool
-	ready                 bool
-	currentDiskBytes      int64
-	evictionScheduled     bool
-	lastEvictionUnixMicro int64
+	mu                sync.Mutex
+	index             map[string]indexEntry
+	dirty             bool
+	ready             bool
+	currentDiskBytes  int64
+	evictionScheduled bool
 
 	// pool packs small records (see recordpool.Pool) instead of one file per object, once a
 	// given size has demonstrably earned it. Rebuilt from s.index and its own directory at
@@ -125,7 +124,6 @@ type Store struct {
 
 	prevStats string
 	hits      int64
-	misses    int64
 	puts      int64
 	putsExist int64
 	errors    int64
@@ -1895,7 +1893,6 @@ func (s *Store) evictOneLocked() bool {
 
 	delete(s.index, evictPath)
 	s.currentDiskBytes -= s.entryStoredSize(evictIE)
-	s.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
 	s.dirty = true
 	if err := s.removeObjectLocked(evictPath, evictIE); err != nil {
 		log.Printf("remove native cache object %s: %v", evictPath, err)
@@ -2393,16 +2390,14 @@ func (s *Store) Stats() map[string]string {
 	defer s.mu.Unlock()
 
 	return map[string]string{
-		"hits":                  strconv.FormatInt(s.hits, 10),
-		"misses":                strconv.FormatInt(s.misses, 10),
-		"puts":                  strconv.FormatInt(s.puts, 10),
-		"putsExist":             strconv.FormatInt(s.putsExist, 10),
-		"index":                 strconv.Itoa(len(s.index)),
-		"diskBytes":             strconv.FormatInt(s.currentDiskBytes, 10),
-		"maxDiskBytes":          strconv.FormatInt(s.maxDiskBytes, 10),
-		"evictionScheduled":     strconv.FormatBool(s.evictionScheduled),
-		"lastEvictionUnixMicro": strconv.FormatInt(s.lastEvictionUnixMicro, 10),
-		"errors":                strconv.FormatInt(s.errors, 10),
+		"hits":              strconv.FormatInt(s.hits, 10),
+		"puts":              strconv.FormatInt(s.puts, 10),
+		"putsExist":         strconv.FormatInt(s.putsExist, 10),
+		"index":             strconv.Itoa(len(s.index)),
+		"diskBytes":         strconv.FormatInt(s.currentDiskBytes, 10),
+		"maxDiskBytes":      strconv.FormatInt(s.maxDiskBytes, 10),
+		"evictionScheduled": strconv.FormatBool(s.evictionScheduled),
+		"errors":            strconv.FormatInt(s.errors, 10),
 	}
 }
 
