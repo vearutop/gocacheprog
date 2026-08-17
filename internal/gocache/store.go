@@ -106,7 +106,6 @@ type Store struct {
 	compress       bool
 	maxDiskBytes   int64
 	maxFileBytes   int64
-	maxAge         time.Duration
 	manifestMaxAge time.Duration
 	evictionDelay  time.Duration
 	evictionBucket time.Duration
@@ -177,12 +176,6 @@ func (s *Store) MaxFileBytes() int64 {
 	return s.maxFileBytes
 }
 
-func WithMaxAge(maxAge time.Duration) StoreOption {
-	return func(s *Store) {
-		s.maxAge = maxAge
-	}
-}
-
 // WithManifestMaxAge sets how long a manifest file may go unwritten before it's deleted by
 // collectStaleManifests. Unlike cache objects, manifests are never touched again once their
 // commit/PR/changes stream goes cold (loadManifest's self-heal only runs when something actually
@@ -216,7 +209,6 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 
 	s := &Store{
 		dir:            dir,
-		maxAge:         48 * time.Hour,
 		manifestMaxAge: 5 * 24 * time.Hour,
 		evictionDelay:  5 * time.Minute,
 		evictionBucket: time.Hour,
@@ -1755,7 +1747,7 @@ func (s *Store) scheduleEvictionLocked() {
 	if s.evictionScheduled {
 		return
 	}
-	if s.maxAge <= 0 && s.manifestMaxAge <= 0 && (s.maxDiskBytes <= 0 || s.currentDiskBytes <= s.maxDiskBytes) {
+	if s.manifestMaxAge <= 0 && (s.maxDiskBytes <= 0 || s.currentDiskBytes <= s.maxDiskBytes) {
 		return
 	}
 
@@ -1852,23 +1844,13 @@ func (s *Store) EvictOne() bool {
 	return s.evictOneLocked()
 }
 
+// evictIfNeededLocked is purely budget-driven: cache objects live as long as there's room under
+// maxDiskBytes, evicted oldest-bucket-then-largest first (see moreEvictable) when there isn't.
+// There's deliberately no unconditional age cutoff here -- one existed previously, but it keyed
+// off write time (ModTimeMicro) rather than the access-time-aware lruTimeMicro the budget-based
+// eviction below uses, so it could delete a frequently-served object purely because it hadn't
+// been rewritten recently, even with plenty of disk headroom to spare.
 func (s *Store) evictIfNeededLocked() {
-	if s.maxAge > 0 {
-		cutoff := time.Now().UTC().Add(-s.maxAge).UnixMicro()
-		for relPath, ie := range s.index {
-			if ie.ModTimeMicro == 0 || ie.ModTimeMicro >= cutoff {
-				continue
-			}
-			delete(s.index, relPath)
-			s.currentDiskBytes -= s.entryStoredSize(ie)
-			s.lastEvictionUnixMicro = time.Now().UTC().UnixMicro()
-			s.dirty = true
-			if err := s.removeObjectLocked(relPath, ie); err != nil {
-				log.Printf("remove expired native cache object %s: %v", relPath, err)
-			}
-		}
-	}
-
 	if s.maxDiskBytes <= 0 {
 		return
 	}
