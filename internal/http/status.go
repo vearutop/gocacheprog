@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
-	"time"
 )
 
 type statsProvider interface {
@@ -49,33 +48,24 @@ func (h *Handler) Status(rw http.ResponseWriter, _ *http.Request) {
 	}
 }
 
+// augmentStatusStats reshapes a store's raw Stats() map for display (the "/" status page and the
+// "/status" JSON endpoint both funnel through this): "diskBytes" becomes a human-readable
+// "storage" figure, and "maxDiskBytes" is dropped entirely -- individual per-store budgets are
+// rarely set in server mode (see the combined-budget line instead), so showing a usually-zero
+// number was just noise.
 func augmentStatusStats(stats map[string]string) {
 	if stats == nil {
 		return
 	}
 
-	addHumanByteStat(stats, "diskBytes")
-	addHumanByteStat(stats, "maxDiskBytes")
-
-	if v := stats["lastEvictionUnixMicro"]; v != "" && v != "0" {
+	if v, ok := stats["diskBytes"]; ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			stats["lastEviction"] = time.UnixMicro(n).UTC().Format(time.RFC3339)
+			stats["storage"] = byteSize(n)
 		}
-	} else {
-		stats["lastEviction"] = ""
+		delete(stats, "diskBytes")
 	}
-}
 
-func addHumanByteStat(stats map[string]string, key string) {
-	v := stats[key]
-	if v == "" {
-		return
-	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return
-	}
-	stats[key+"Human"] = byteSize(n)
+	delete(stats, "maxDiskBytes")
 }
 
 func uint64ToInt64(v uint64) int64 {
