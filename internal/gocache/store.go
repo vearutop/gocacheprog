@@ -130,12 +130,11 @@ type Store struct {
 }
 
 type indexEntry struct {
-	Size            int64  `json:"n"`
-	Mode            uint32 `json:"p,omitempty"`
-	WireSize        int64  `json:"w,omitempty"`
-	Compressed      int64  `json:"c,omitempty"`
-	ModTimeMicro    int64  `json:"m,omitempty"`
-	AccessTimeMicro int64  `json:"a,omitempty"`
+	Size         int64  `json:"n"`
+	Mode         uint32 `json:"p,omitempty"`
+	WireSize     int64  `json:"w,omitempty"`
+	Compressed   int64  `json:"c,omitempty"`
+	ModTimeMicro int64  `json:"m,omitempty"`
 
 	// PoolPage == 0 means "plain file at objectPath(relPath)" -- today's behavior, untouched.
 	// The record size isn't stored here: it's always entryStoredSize(ie), so it can't drift out
@@ -771,27 +770,18 @@ func (s *Store) Restore(req Request, cb func(FileItem)) ([]string, error) {
 		return nil, err
 	}
 
-	nowUnixMicro := time.Now().UTC().UnixMicro()
 	entries := make([]restoreEntry, 0, len(paths))
 
+	// Deliberately read-only: a restore doesn't prove the object was actually used by the
+	// build that requested it (a manifest lists everything that build type might need, not
+	// everything this specific job's build touched), so it must not influence eviction -- see
+	// putOne's ModTimeMicro handling for why last-upload time is the only signal that does.
 	s.mu.Lock()
 	for _, relPath := range paths {
 		ie, ok := s.index[relPath]
 		if !ok {
 			continue
 		}
-
-		s.index[relPath] = indexEntry{
-			Size:            ie.Size,
-			Mode:            ie.Mode,
-			WireSize:        ie.WireSize,
-			Compressed:      ie.Compressed,
-			ModTimeMicro:    ie.ModTimeMicro,
-			AccessTimeMicro: nowUnixMicro,
-			PoolPage:        ie.PoolPage,
-			PoolSlot:        ie.PoolSlot,
-		}
-		s.dirty = true
 
 		entries = append(entries, restoreEntry{path: relPath, ie: ie})
 	}
@@ -1085,10 +1075,23 @@ func (s *Store) putOne(item FileItem) error {
 
 	modTime := time.Now().UTC()
 	ie := indexEntry{
-		Size:            item.Size,
-		Mode:            item.Mode,
-		ModTimeMicro:    modTime.UnixMicro(),
-		AccessTimeMicro: modTime.UnixMicro(),
+		Size: item.Size,
+		Mode: item.Mode,
+	}
+	if hasExisting {
+		// A re-save of a path that's already stored is always the same bytes as before --
+		// GOCACHE paths are content-addressed, so there's no such thing as "the content
+		// changed" for an existing path. Preserve the original upload time rather than
+		// resetting it: eviction (see moreEvictable) orders by ModTimeMicro specifically
+		// because a genuine re-upload only ever happens after eviction actually deleted the
+		// entry and some later job's cache miss forced it to rebuild and re-save from
+		// scratch -- real, demonstrated continued need. A redundant re-save of something that
+		// was never evicted (heavily-parallel CI constantly rebuilds the same unchanged
+		// dependency) proves nothing of the kind, and resetting the age here would make such
+		// objects look perpetually fresh regardless of whether they're still useful.
+		ie.ModTimeMicro = existing.ModTimeMicro
+	} else {
+		ie.ModTimeMicro = modTime.UnixMicro()
 	}
 
 	rd, err := bodyReaderForPut(item, s.compress, &ie)
@@ -1400,14 +1403,29 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 	return result, sources, nil
 }
 
-// defaultManifestSampleSize is how many of a build type's most-recently-written manifests get
-// unioned together as its "default" fallback source: a single newest manifest is fragile (a
-// brand-new PR that just saved its first few files counts as "newest" the moment it's touched,
-// even though it's nowhere near representative of a healthy cache for this build type, once many
-// PRs/branches share one build type). Unioning a handful smooths that out, while staying bounded
-// -- this is always freshly recomputed from whichever manifests currently exist, never a
-// persisted, ever-growing set.
-const defaultManifestSampleSize = 3
+// defaultManifestSampleSize is how many of a build type's most-representative manifests (see
+// loadDefaultManifestPaths) get unioned together as its "default" fallback source: a single
+// newest manifest is fragile (a brand-new PR that just saved its first few files counts as
+// "newest" the moment it's touched, even though it's nowhere near representative of a healthy
+// cache for this build type, once many PRs/branches share one build type). Unioning a handful
+// smooths that out, while staying bounded -- this is always freshly recomputed from whichever
+// manifests currently exist, never a persisted, ever-growing set.
+const defaultManifestSampleSize = 5
+
+// isPRManifestPath reports whether path is a changes (PR) manifest rather than a commit one, by
+// checking whether it lives under scopeRoot's "changes" subdirectory (see changesManifestPath).
+// A changes manifest only ever exists for a pull_request(_target) event -- every other GitHub
+// Actions event (a push to trunk) has no changes-id at all (see githubContext) and so only ever
+// writes a commit manifest.
+func isPRManifestPath(scopeRoot, path string) bool {
+	rel, err := filepath.Rel(scopeRoot, path)
+	if err != nil {
+		return false
+	}
+
+	first, _, _ := strings.Cut(filepath.ToSlash(rel), "/")
+	return first == "changes"
+}
 
 // smallRestoreRatio: when a resolved commit/parent/changes/base result would grow by at least
 // this fraction if supplemented with the default source's genuinely novel paths (see
@@ -1497,24 +1515,33 @@ func (s *Store) defaultFallbackPaths(buildType string, seen map[string]struct{},
 }
 
 // loadDefaultManifestPaths unions the paths of buildType's defaultManifestSampleSize most
-// recently written manifests (any commit/changes/base scope other than those in exclude),
+// representative manifests (any commit/changes/base scope other than those in exclude),
 // self-healing each along the way. This is restorePaths' fallback source, both when nothing
 // matched at all and when what matched looks abnormally small (see
 // supplementSmallResultWithDefault) -- more representative of "what a healthy cache for this
 // build type looks like" than picking a single newest manifest, since recency and completeness
-// aren't strongly correlated once many PRs/branches share a build type. exclude is the set of
-// manifest paths restorePaths already matched (commit/parent/changes/base): without excluding
-// them, they're near-certain to occupy sample slots themselves (they were just self-healed by
-// this very call, so they're always among the most recently written), leaving fewer independent
-// candidates to actually supplement with. Returns os.ErrNotExist if no manifest exists yet for
-// this build type at all.
+// aren't strongly correlated once many PRs/branches share a build type.
+//
+// Candidates are ranked trunk manifests first, then by recency within each group (see
+// isPRManifestPath): a trunk (non-PR) build's commit manifest is a one-shot, comprehensive
+// snapshot of everything that build type needed, while a changes (PR) manifest only ever
+// reflects one specific branch's own history and can be arbitrarily narrow -- a PR that's only
+// touched a handful of files might have a changes manifest covering a tiny fraction of the
+// build type's usual footprint. Recency is still the tiebreaker within each group: an ancient
+// trunk manifest isn't necessarily better than a fresh one.
+//
+// exclude is the set of manifest paths restorePaths already matched (commit/parent/changes/
+// base): without excluding them, they're near-certain to occupy sample slots themselves (they
+// were just self-healed by this very call), leaving fewer independent candidates to actually
+// supplement with. Returns os.ErrNotExist if no manifest exists yet for this build type at all.
 func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]struct{}) ([]string, error) {
 	scopeDir, err := manifestScopeDir(buildType)
 	if err != nil {
 		return nil, err
 	}
 
-	files, err := listManifestFiles(filepath.Join(s.dir, "manifests", scopeDir))
+	scopeRoot := filepath.Join(s.dir, "manifests", scopeDir)
+	files, err := listManifestFiles(scopeRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -1522,6 +1549,7 @@ func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]st
 	type candidate struct {
 		path    string
 		modTime time.Time
+		isPR    bool
 	}
 	candidates := make([]candidate, 0, len(files))
 	for _, path := range files {
@@ -1536,14 +1564,19 @@ func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]st
 
 			return nil, statErr
 		}
-		candidates = append(candidates, candidate{path: path, modTime: info.ModTime()})
+		candidates = append(candidates, candidate{path: path, modTime: info.ModTime(), isPR: isPRManifestPath(scopeRoot, path)})
 	}
 
 	if len(candidates) == 0 {
 		return nil, os.ErrNotExist
 	}
 
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].modTime.After(candidates[j].modTime) })
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].isPR != candidates[j].isPR {
+			return !candidates[i].isPR // trunk (non-PR) manifests sort first
+		}
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
 	if len(candidates) > defaultManifestSampleSize {
 		candidates = candidates[:defaultManifestSampleSize]
 	}
@@ -1843,11 +1876,11 @@ func (s *Store) EvictOne() bool {
 }
 
 // evictIfNeededLocked is purely budget-driven: cache objects live as long as there's room under
-// maxDiskBytes, evicted oldest-bucket-then-largest first (see moreEvictable) when there isn't.
-// There's deliberately no unconditional age cutoff here -- one existed previously, but it keyed
-// off write time (ModTimeMicro) rather than the access-time-aware lruTimeMicro the budget-based
-// eviction below uses, so it could delete a frequently-served object purely because it hadn't
-// been rewritten recently, even with plenty of disk headroom to spare.
+// maxDiskBytes, evicted oldest-bucket-then-largest first by last-upload time (see moreEvictable)
+// when there isn't. There's deliberately no unconditional age cutoff here -- one existed
+// previously, removed because it could delete an object purely for not having been re-uploaded
+// recently, even with plenty of disk headroom to spare and regardless of whether it was still in
+// active use.
 func (s *Store) evictIfNeededLocked() {
 	if s.maxDiskBytes <= 0 {
 		return
@@ -1981,26 +2014,26 @@ func (s *Store) reconcilePoolLocked() error {
 	return nil
 }
 
-func lruTimeMicro(ie indexEntry) int64 {
-	if ie.AccessTimeMicro != 0 {
-		return ie.AccessTimeMicro
-	}
-	return ie.ModTimeMicro
-}
-
-// moreEvictable reports whether a should be evicted before b. Rebuilding N evicted objects costs
-// roughly N cache misses regardless of their size, while evicting one large object is still a
-// single miss -- so within a bounded recency window (bucket) it's worth preferring the larger
-// object over the strictly oldest one. bucket <= 0 falls back to strict LRU (every entry is its
-// own bucket, so size never enters into it).
+// moreEvictable reports whether a should be evicted before b, ranking by ModTimeMicro -- the
+// timestamp of the object's last actual upload, never touched by a mere restore (see putOne and
+// Restore). Being listed in a restored manifest doesn't prove a build actually used an object
+// (a manifest lists everything that build type might need, not everything one specific job
+// touched), so it can't be trusted as a "still useful" signal; a genuine re-upload can only
+// happen after the previous copy was evicted and a later job's real cache miss forced it to
+// rebuild and re-save from scratch, which is real, demonstrated continued need.
+//
+// Rebuilding N evicted objects costs roughly N cache misses regardless of their size, while
+// evicting one large object is still a single miss -- so within a bounded recency window
+// (bucket) it's worth preferring the larger object over the strictly oldest one. bucket <= 0
+// falls back to strict LRU (every entry is its own bucket, so size never enters into it).
 func moreEvictable(a indexEntry, sizeA int64, b indexEntry, sizeB int64, bucket time.Duration) bool {
 	if bucket <= 0 {
-		return lruTimeMicro(a) < lruTimeMicro(b)
+		return a.ModTimeMicro < b.ModTimeMicro
 	}
 
 	bucketMicro := bucket.Microseconds()
-	bucketA := lruTimeMicro(a) / bucketMicro
-	bucketB := lruTimeMicro(b) / bucketMicro
+	bucketA := a.ModTimeMicro / bucketMicro
+	bucketB := b.ModTimeMicro / bucketMicro
 	if bucketA != bucketB {
 		return bucketA < bucketB
 	}

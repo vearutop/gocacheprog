@@ -561,6 +561,75 @@ func TestStoreRestore_DefaultFallbackExcludesManifestsOlderThanSampleSize(t *tes
 	require.Len(t, restored, defaultManifestSampleSize)
 }
 
+// TestStoreRestore_DefaultFallbackPrefersTrunkManifestsOverPR covers the actual production
+// problem: a PR's changes manifest only ever reflects that one branch's own narrow history, so
+// even though it can be far more recently written than any trunk commit's manifest, it shouldn't
+// crowd trunk manifests out of the default sample -- a trunk build is a one-shot, comprehensive
+// snapshot of what this build type actually needs, which is exactly what "default" is trying to
+// approximate.
+func TestStoreRestore_DefaultFallbackPrefersTrunkManifestsOverPR(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	require.GreaterOrEqual(t, defaultManifestSampleSize, 1)
+
+	old := time.Now().Add(-24 * time.Hour)
+	for i := 0; i < defaultManifestSampleSize; i++ {
+		commit := fmt.Sprintf("trunk-commit-%d", i)
+		saveItemForTest(t, store, Request{Commit: commit, BuildType: "unit"}, fmt.Sprintf("ab/trunk-%d", i), fmt.Sprintf("payload-%d", i))
+
+		manifestPath, err := store.commitManifestPath(commit, "unit")
+		require.NoError(t, err)
+		modTime := old.Add(time.Duration(i) * time.Minute)
+		require.NoError(t, os.Chtimes(manifestPath, modTime, modTime))
+	}
+
+	// Written much more recently than any trunk manifest above -- pure recency would pick these
+	// first, which is exactly the bug this preference fixes.
+	for i := 0; i < 2; i++ {
+		changesID := fmt.Sprintf("org/repo#%d", i)
+		saveItemForTest(t, store, Request{ChangesID: changesID, BuildType: "unit"}, fmt.Sprintf("cd/pr-%d", i), fmt.Sprintf("pr-payload-%d", i))
+	}
+
+	var restored []string
+	sources, err := store.Restore(Request{ParentCommit: "missing-parent", BuildType: "unit"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"default"}, sources)
+
+	for _, p := range restored {
+		require.False(t, strings.HasPrefix(p, "cd/pr-"), "a PR manifest should not displace any trunk manifest from the default sample while enough trunk candidates exist, got %v", restored)
+	}
+	require.Len(t, restored, defaultManifestSampleSize)
+}
+
+// TestStoreRestore_DefaultFallbackFillsRemainingSlotsWithPRWhenTrunkIsScarce covers the other
+// side: PR manifests are still eligible for the default sample, just deprioritized -- when there
+// aren't enough trunk manifests to fill it, PR manifests fill the remaining slots rather than
+// leaving them empty.
+func TestStoreRestore_DefaultFallbackFillsRemainingSlotsWithPRWhenTrunkIsScarce(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	require.Greater(t, defaultManifestSampleSize, 1, "test needs at least one slot left over after the single trunk manifest")
+
+	saveItemForTest(t, store, Request{Commit: "only-trunk-commit", BuildType: "unit"}, "ab/trunk-only", "payload")
+	saveItemForTest(t, store, Request{ChangesID: "org/repo#1", BuildType: "unit"}, "cd/pr-only", "pr-payload")
+
+	var restored []string
+	sources, err := store.Restore(Request{ParentCommit: "missing-parent", BuildType: "unit"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"default"}, sources)
+	require.ElementsMatch(t, []string{"ab/trunk-only", "cd/pr-only"}, restored)
+}
+
 func TestCollectFilesToSave_SkipsRestoredPaths(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1129,8 +1198,8 @@ func TestInspect_SupportsBaseCommitScope(t *testing.T) {
 // of a genuinely stale one.
 func TestMoreEvictable_PrefersOlderBucketRegardlessOfSize(t *testing.T) {
 	bucket := time.Hour
-	older := indexEntry{AccessTimeMicro: time.Now().Add(-3 * time.Hour).UnixMicro()}
-	newer := indexEntry{AccessTimeMicro: time.Now().UnixMicro()}
+	older := indexEntry{ModTimeMicro: time.Now().Add(-3 * time.Hour).UnixMicro()}
+	newer := indexEntry{ModTimeMicro: time.Now().UnixMicro()}
 
 	require.True(t, moreEvictable(older, 10, newer, 10_000_000, bucket))
 	require.False(t, moreEvictable(newer, 10_000_000, older, 10, bucket))
@@ -1148,8 +1217,8 @@ func TestMoreEvictable_PrefersLargerWithinSameBucket(t *testing.T) {
 	// test happens to run, landing in different buckets non-deterministically.
 	bucketMicro := bucket.Microseconds()
 	bucketStart := (time.Now().UnixMicro() / bucketMicro) * bucketMicro
-	small := indexEntry{AccessTimeMicro: bucketStart + int64(10*time.Minute/time.Microsecond)}
-	big := indexEntry{AccessTimeMicro: bucketStart + int64(50*time.Minute/time.Microsecond)} // more recent, same bucket
+	small := indexEntry{ModTimeMicro: bucketStart + int64(10*time.Minute/time.Microsecond)}
+	big := indexEntry{ModTimeMicro: bucketStart + int64(50*time.Minute/time.Microsecond)} // more recent, same bucket
 
 	require.True(t, moreEvictable(big, 1_000_000, small, 100, bucket), "larger object in the same bucket should be preferred even though it's more recent")
 	require.False(t, moreEvictable(small, 100, big, 1_000_000, bucket))
@@ -1159,8 +1228,8 @@ func TestMoreEvictable_PrefersLargerWithinSameBucket(t *testing.T) {
 // must reproduce plain chronological LRU, ignoring size entirely.
 func TestMoreEvictable_ZeroBucketDisablesSizeBias(t *testing.T) {
 	now := time.Now()
-	older := indexEntry{AccessTimeMicro: now.Add(-time.Minute).UnixMicro()}
-	newer := indexEntry{AccessTimeMicro: now.UnixMicro()}
+	older := indexEntry{ModTimeMicro: now.Add(-time.Minute).UnixMicro()}
+	newer := indexEntry{ModTimeMicro: now.UnixMicro()}
 
 	require.True(t, moreEvictable(older, 1, newer, 1_000_000, 0), "tiny older object must still be evicted before a huge newer one when bucketing is disabled")
 }
@@ -1180,8 +1249,8 @@ func TestStoreEviction_PrefersLargerObjectWithinSameBucket(t *testing.T) {
 	// different buckets and making this flaky.
 	bucketMicro := time.Hour.Microseconds()
 	bucketStart := (time.Now().UnixMicro() / bucketMicro) * bucketMicro
-	saveWithAccessTimeForTest(t, store, "small-but-oldest", 10, time.UnixMicro(bucketStart+int64(10*time.Minute/time.Microsecond)))
-	saveWithAccessTimeForTest(t, store, "big-but-newer", 900, time.UnixMicro(bucketStart+int64(50*time.Minute/time.Microsecond)))
+	saveWithModTimeForTest(t, store, "small-but-oldest", 10, time.UnixMicro(bucketStart+int64(10*time.Minute/time.Microsecond)))
+	saveWithModTimeForTest(t, store, "big-but-newer", 900, time.UnixMicro(bucketStart+int64(50*time.Minute/time.Microsecond)))
 
 	store.mu.Lock()
 	store.evictIfNeededLocked()
@@ -1194,6 +1263,55 @@ func TestStoreEviction_PrefersLargerObjectWithinSameBucket(t *testing.T) {
 
 	require.True(t, smallStillPresent, "the smaller object should survive even though it's chronologically oldest")
 	require.False(t, bigStillPresent, "the larger object should be evicted first since both fall in the same recency bucket")
+}
+
+// TestSaveItem_RedundantResaveDoesNotResetAge covers a real eviction-fairness bug: GOCACHE paths
+// are content-addressed, so re-saving a path that's already stored is always the same bytes --
+// never new content. Resetting its age on every redundant re-save (which happens constantly in
+// heavily-parallel CI, with many jobs rebuilding and re-saving the same unchanged dependency)
+// made such objects look perpetually "just used" to LRU eviction regardless of whether the
+// object was still genuinely needed, while genuinely-useful-but-less-redundantly-rebuilt objects
+// aged out sooner. Only a genuine re-upload after eviction (a real cache miss forcing a rebuild)
+// is real evidence of continued need -- see moreEvictable.
+func TestSaveItem_RedundantResaveDoesNotResetAge(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{}, "ab/item", "payload")
+
+	store.mu.Lock()
+	original := store.index["ab/item"]
+	store.mu.Unlock()
+	require.NotZero(t, original.ModTimeMicro)
+
+	// Backdate it so a reset would be unmistakable, then re-save the exact same content.
+	backdated := original
+	backdated.ModTimeMicro = time.Now().Add(-24 * time.Hour).UnixMicro()
+	store.mu.Lock()
+	store.index["ab/item"] = backdated
+	store.mu.Unlock()
+
+	saveItemForTest(t, store, Request{}, "ab/item", "payload")
+
+	store.mu.Lock()
+	afterResave := store.index["ab/item"]
+	store.mu.Unlock()
+	require.Equal(t, backdated.ModTimeMicro, afterResave.ModTimeMicro, "a redundant re-save must not reset ModTimeMicro")
+
+	// A restore doesn't prove the object was actually used by the build that requested it (a
+	// manifest lists everything that build type might need, not everything one job's build
+	// touched), so it must not touch the age either -- unlike the resave case, this isn't about
+	// preserving an old value, it's that Restore doesn't write to the index at all anymore.
+	require.NoError(t, store.MergeSavedPaths(Request{Commit: "commit123"}, []string{"ab/item"}))
+	_, err = store.Restore(Request{Commit: "commit123"}, func(item FileItem) {})
+	require.NoError(t, err)
+
+	store.mu.Lock()
+	afterRestore := store.index["ab/item"]
+	store.mu.Unlock()
+	require.Equal(t, backdated.ModTimeMicro, afterRestore.ModTimeMicro, "a restore must not touch the object's age")
 }
 
 // TestStoreEviction_LeavesMarginBelowLimit covers the actual reported symptom: the status page
@@ -1209,13 +1327,13 @@ func TestStoreEviction_LeavesMarginBelowLimit(t *testing.T) {
 
 	now := time.Now()
 	for i := 0; i < 5; i++ {
-		saveWithAccessTimeForTest(t, store, fmt.Sprintf("item-%d", i), 100, now.Add(time.Duration(i)*time.Minute))
+		saveWithModTimeForTest(t, store, fmt.Sprintf("item-%d", i), 100, now.Add(time.Duration(i)*time.Minute))
 	}
 	require.Equal(t, int64(500), store.DiskBytes())
 
 	// One more push the total (600) over budget without any single item being anywhere near the
 	// limit itself, so the only thing that could stop eviction early is the margin target.
-	saveWithAccessTimeForTest(t, store, "item-5", 100, now.Add(5*time.Minute))
+	saveWithModTimeForTest(t, store, "item-5", 100, now.Add(5*time.Minute))
 
 	store.mu.Lock()
 	store.evictIfNeededLocked()
@@ -1226,9 +1344,9 @@ func TestStoreEviction_LeavesMarginBelowLimit(t *testing.T) {
 	require.Positive(t, store.DiskBytes(), "eviction shouldn't have needed to clear out everything")
 }
 
-// saveWithAccessTimeForTest saves a size-byte item and backdates its access time, for tests that
+// saveWithModTimeForTest saves a size-byte item and backdates its upload time, for tests that
 // need explicit control over eviction ordering.
-func saveWithAccessTimeForTest(t *testing.T, store *Store, path string, size int, accessTime time.Time) {
+func saveWithModTimeForTest(t *testing.T, store *Store, path string, size int, modTime time.Time) {
 	t.Helper()
 
 	body := strings.Repeat("x", size)
@@ -1240,7 +1358,7 @@ func saveWithAccessTimeForTest(t *testing.T, store *Store, path string, size int
 
 	store.mu.Lock()
 	ie := store.index[path]
-	ie.AccessTimeMicro = accessTime.UnixMicro()
+	ie.ModTimeMicro = modTime.UnixMicro()
 	store.index[path] = ie
 	store.mu.Unlock()
 }
