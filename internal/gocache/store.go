@@ -122,6 +122,10 @@ type Store struct {
 	// startup (see reconcilePoolLocked); nothing pool-related is persisted separately.
 	pool *recordpool.Pool
 
+	// evictHeap mirrors s.index for eviction purposes (see evictionHeap); rebuilt from s.index at
+	// startup, kept in sync incrementally afterward. Nothing about it is persisted separately.
+	evictHeap *evictionHeap
+
 	prevStats string
 	hits      int64
 	puts      int64
@@ -249,6 +253,12 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 		}
 		s.currentDiskBytes += s.entryStoredSize(ie)
 	}
+
+	s.evictHeap = newEvictionHeap(s.evictionBucket)
+	for path, ie := range s.index {
+		s.evictHeap.push(path, s.entryStoredSize(ie), ie.ModTimeMicro)
+	}
+
 	s.evictIfNeededLocked()
 	s.ready = true
 
@@ -814,6 +824,7 @@ func (s *Store) Restore(req Request, cb func(FileItem)) ([]string, error) {
 
 // removeBrokenEntry drops a corrupted/truncated on-disk object from the index and deletes its
 // file, so a future restore skips it instead of repeatedly serving something a client can't use.
+// Deliberately doesn't touch evictHeap -- see its own doc comment on why that's safe to skip.
 func (s *Store) removeBrokenEntry(relPath string, ie indexEntry) {
 	s.mu.Lock()
 	if current, ok := s.index[relPath]; ok {
@@ -903,6 +914,8 @@ func (s *Store) Clear(req Request) (ClearStats, error) {
 
 		ie, ok := s.index[relPath]
 		if ok {
+			// Deliberately doesn't touch evictHeap -- see its own doc comment on why that's
+			// safe to skip.
 			delete(s.index, relPath)
 			s.currentDiskBytes -= s.entryStoredSize(ie)
 			s.dirty = true
@@ -1121,6 +1134,12 @@ func (s *Store) putOne(item FileItem) error {
 	}
 	s.currentDiskBytes += s.entryStoredSize(ie)
 	s.index[item.Path] = ie
+	if !hasExisting {
+		// A re-save's entry is already in evictHeap from its original save, still exactly
+		// correct (see evictHeap's doc comment on why a redundant re-save never needs one) --
+		// only a genuinely new path needs pushing.
+		s.evictHeap.push(item.Path, s.entryStoredSize(ie), ie.ModTimeMicro)
+	}
 	s.dirty = true
 	s.scheduleEvictionLocked()
 
@@ -1882,7 +1901,7 @@ func (s *Store) EvictOne() bool {
 // recently, even with plenty of disk headroom to spare and regardless of whether it was still in
 // active use.
 func (s *Store) evictIfNeededLocked() {
-	if s.maxDiskBytes <= 0 {
+	if s.maxDiskBytes <= 0 || s.currentDiskBytes <= s.maxDiskBytes {
 		return
 	}
 
@@ -1901,37 +1920,41 @@ func (s *Store) evictIfNeededLocked() {
 const evictionMarginFraction = 10
 
 // evictOneLocked removes the single most evictable cache object (see moreEvictable) regardless
-// of maxDiskBytes, and reports whether one was evicted (false once the index is empty). Shared
-// by the budget-based loop above and evictOnDiskFullLocked below.
+// of maxDiskBytes, and reports whether one was evicted (false once nothing evictable is left).
+// Shared by the budget-based loop above and evictOnDiskFullLocked below.
+//
+// Picks via evictHeap (O(log n) per attempt) rather than scanning s.index (O(n)): closing the
+// margin gap after a big save-cache burst can mean evicting thousands of entries in a row, and
+// repeating a full index scan that many times in one synchronous call was slow enough (at real
+// production scale, hundreds of thousands of entries) to starve other requests' access to s.mu
+// for many seconds -- long enough to blow through a save-cache chunk upload's response-header
+// timeout.
+//
+// Since evictHeap is push-only (see its own doc comment), what it pops can be stale -- deleted
+// outside of eviction (Clear, removeBrokenEntry), or superseded by a later genuine re-save (a
+// fresh, still-correct entry for the same path pushed separately). Validate each pop against the
+// live index and keep trying until a match is found or the heap is exhausted.
 func (s *Store) evictOneLocked() bool {
-	var (
-		evictPath string
-		evictIE   indexEntry
-		evictSize int64
-		found     bool
-	)
-
-	for relPath, ie := range s.index {
-		size := s.entryStoredSize(ie)
-		if !found || moreEvictable(ie, size, evictIE, evictSize, s.evictionBucket) {
-			evictPath = relPath
-			evictIE = ie
-			evictSize = size
-			found = true
+	for {
+		e, ok := s.evictHeap.pop()
+		if !ok {
+			return false
 		}
-	}
-	if !found {
-		return false
-	}
 
-	delete(s.index, evictPath)
-	s.currentDiskBytes -= s.entryStoredSize(evictIE)
-	s.dirty = true
-	if err := s.removeObjectLocked(evictPath, evictIE); err != nil {
-		log.Printf("remove native cache object %s: %v", evictPath, err)
-	}
+		ie, exists := s.index[e.path]
+		if !exists || ie.ModTimeMicro != e.modTimeMicro || s.entryStoredSize(ie) != e.size {
+			continue
+		}
 
-	return true
+		delete(s.index, e.path)
+		s.currentDiskBytes -= s.entryStoredSize(ie)
+		s.dirty = true
+		if err := s.removeObjectLocked(e.path, ie); err != nil {
+			log.Printf("remove native cache object %s: %v", e.path, err)
+		}
+
+		return true
+	}
 }
 
 // diskFullEvictFraction is the share of the index force-evicted (see moreEvictable) whenever a

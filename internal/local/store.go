@@ -1302,7 +1302,7 @@ func (dc *Store) EvictNow() {
 }
 
 func (dc *Store) evictIfNeededLocked() {
-	if dc.maxDiskBytes <= 0 {
+	if dc.maxDiskBytes <= 0 || dc.currentDiskBytes <= dc.maxDiskBytes {
 		return
 	}
 

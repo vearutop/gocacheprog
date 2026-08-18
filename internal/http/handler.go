@@ -151,10 +151,12 @@ func (h *Handler) diskBudgetStores() []diskBudgetStore {
 // gocache/local.Store's own evictionMarginFraction and evictOldestUntilFits's client-side trim.
 const evictionMarginFraction = 10
 
-// enforceCombinedBudget evicts from whichever store currently holds the most bytes until combined
-// usage across store and gocacheStore is back under a margin below combinedMaxDiskBytes, or
-// nothing more can be evicted anywhere. Called after every request so a burst of writes can't
-// outrun it the way a timer-based sweep could.
+// enforceCombinedBudget evicts from whichever store currently holds the most bytes, but only
+// once combined usage across store and gocacheStore actually exceeds combinedMaxDiskBytes --
+// growth up to that real limit is otherwise left alone. Once triggered, it evicts down to a
+// margin below the limit rather than stopping the instant it's back under, and keeps going until
+// that margin is reached or nothing more can be evicted anywhere. Called after every request so
+// a burst of writes can't outrun it the way a timer-based sweep could.
 func (h *Handler) enforceCombinedBudget() {
 	if h.combinedMaxDiskBytes <= 0 {
 		return
@@ -165,17 +167,21 @@ func (h *Handler) enforceCombinedBudget() {
 		return
 	}
 
+	total := func() int64 {
+		var t int64
+		for _, s := range stores {
+			t += s.DiskBytes()
+		}
+		return t
+	}
+
+	if total() <= h.combinedMaxDiskBytes {
+		return
+	}
+
 	target := h.combinedMaxDiskBytes - h.combinedMaxDiskBytes/evictionMarginFraction
 
-	for {
-		var total int64
-		for _, s := range stores {
-			total += s.DiskBytes()
-		}
-		if total <= target {
-			return
-		}
-
+	for total() > target {
 		sort.Slice(stores, func(i, j int) bool { return stores[i].DiskBytes() > stores[j].DiskBytes() })
 
 		evicted := false

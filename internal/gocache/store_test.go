@@ -1314,6 +1314,137 @@ func TestSaveItem_RedundantResaveDoesNotResetAge(t *testing.T) {
 	require.Equal(t, backdated.ModTimeMicro, afterRestore.ModTimeMicro, "a restore must not touch the object's age")
 }
 
+// TestStore_ClearLeavesEvictionAbleToSkipThePhantomAndPickARealVictim covers evictHeap's
+// push-only design directly: Clear deliberately doesn't remove the cleared object's heap entry
+// (see evictHeap's doc comment), so it becomes a stale "phantom" -- eviction must skip over it
+// (rather than erroring, or getting stuck) and still correctly evict a real, live entry.
+func TestStore_ClearLeavesEvictionAbleToSkipThePhantomAndPickARealVictim(t *testing.T) {
+	dir := t.TempDir()
+
+	const maxDiskBytes = 100
+	store, err := NewStore(dir, WithMaxDiskBytes(maxDiskBytes))
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "commit123", BuildType: "unit"}, "ab/cleared", "payload")
+	require.NoError(t, store.MergeSavedPaths(Request{Commit: "commit123", BuildType: "unit"}, []string{"ab/cleared"}))
+
+	_, err = store.Clear(Request{Commit: "commit123", BuildType: "unit"})
+	require.NoError(t, err)
+	store.mu.Lock()
+	_, stillIndexed := store.index["ab/cleared"]
+	store.mu.Unlock()
+	require.False(t, stillIndexed, "sanity check: Clear should have removed it from the index")
+
+	// Enough to push the store over budget on its own, forcing a real eviction; "ab/cleared"'s
+	// stale heap entry (older than this) would be popped first if evictOneLocked didn't skip it.
+	saveItemForTest(t, store, Request{}, "ab/live", strings.Repeat("x", 150))
+
+	store.mu.Lock()
+	store.evictIfNeededLocked()
+	_, liveStillPresent := store.index["ab/live"]
+	store.mu.Unlock()
+
+	require.False(t, liveStillPresent, "the only real entry left should be the one evicted")
+	require.Zero(t, store.DiskBytes())
+}
+
+// TestStore_RemoveBrokenEntryLeavesEvictionAbleToSkipThePhantom is
+// TestStore_ClearLeavesEvictionAbleToSkipThePhantomAndPickARealVictim's counterpart for the other
+// site that deliberately doesn't touch evictHeap.
+func TestStore_RemoveBrokenEntryLeavesEvictionAbleToSkipThePhantom(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "commit123", BuildType: "unit"}, "ab/entry", "payload")
+	require.NoError(t, store.MergeSavedPaths(Request{Commit: "commit123", BuildType: "unit"}, []string{"ab/entry"}))
+
+	require.NoError(t, os.Truncate(store.objectPath("ab/entry"), 0))
+
+	var restored []string
+	_, err = store.Restore(Request{Commit: "commit123", BuildType: "unit"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Empty(t, restored, "the truncated object should be skipped, not served")
+
+	// The broken entry's now-stale heap entry must not stop a later eviction pass over
+	// unrelated, live entries from working normally.
+	saveItemForTest(t, store, Request{}, "ab/live", "payload")
+	store.mu.Lock()
+	found := store.evictOneLocked()
+	_, liveStillPresent := store.index["ab/live"]
+	store.mu.Unlock()
+
+	require.True(t, found)
+	require.False(t, liveStillPresent, "the only real entry left should be the one evicted")
+}
+
+// TestNewStore_RebuildsEvictionHeapFromPersistedIndex covers evictHeap's other required
+// invariant: reopening a store with an already-populated index.json must rebuild the heap to
+// match, not start it empty (which would silently make every existing object unevictable until
+// individually re-saved).
+func TestNewStore_RebuildsEvictionHeapFromPersistedIndex(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+	for i := 0; i < 5; i++ {
+		saveItemForTest(t, store, Request{}, fmt.Sprintf("ab/item-%d", i), fmt.Sprintf("payload-%d", i))
+	}
+	require.NoError(t, store.Close())
+
+	reopened, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	// A fresh rebuild has no Clear/removeBrokenEntry history behind it, so this holds exactly
+	// (see evictHeap's doc comment on why those two are the only source of divergence).
+	require.Equal(t, len(reopened.index), reopened.evictHeap.Len())
+}
+
+// TestStoreEviction_HeapPicksCorrectVictimAtScale covers eviction correctness with enough
+// entries that a bug hiding behind the heap (a stale position, a skipped Fix) would plausibly
+// surface, not just the handful of entries the more targeted eviction-ordering tests use.
+func TestStoreEviction_HeapPicksCorrectVictimAtScale(t *testing.T) {
+	dir := t.TempDir()
+
+	// 2000 items * 40 bytes = 80,000 bytes, plus the one 4,000-byte outlier below = 84,000
+	// total -- comfortably over a 50,000-byte budget, so eviction has real work to do.
+	const maxDiskBytes = 50_000
+	store, err := NewStore(dir, WithMaxDiskBytes(maxDiskBytes))
+	require.NoError(t, err)
+
+	now := time.Now()
+	for i := 0; i < 2000; i++ {
+		saveWithModTimeForTest(t, store, fmt.Sprintf("item-%d", i), 40, now.Add(time.Duration(i)*time.Second))
+	}
+	// The one genuinely old-and-large entry: at least a couple of hours further back than
+	// everything above (which all land within about 33 minutes of each other), so it's in a
+	// strictly older recency bucket no matter where the bucket boundaries happen to fall -- must
+	// be evicted before any of them regardless of its size.
+	saveWithModTimeForTest(t, store, "ancient-and-large", 4000, now.Add(-3*time.Hour))
+
+	store.mu.Lock()
+	store.evictIfNeededLocked()
+	store.mu.Unlock()
+
+	store.mu.Lock()
+	_, ancientStillPresent := store.index["ancient-and-large"]
+	store.mu.Unlock()
+
+	require.False(t, ancientStillPresent, "the oldest-bucket entry must be evicted first regardless of size")
+	require.LessOrEqual(t, store.DiskBytes(), int64(maxDiskBytes-maxDiskBytes/evictionMarginFraction))
+
+	// The heap can never have fewer entries than the index (every live entry has at least one
+	// valid heap entry backing it), but it can have more: saveWithModTimeForTest's backdating
+	// leaves the original, now-superseded push behind as a harmless phantom (see its own
+	// comment) -- exact equality isn't the invariant here, "at least as many" is.
+	store.mu.Lock()
+	require.GreaterOrEqual(t, store.evictHeap.Len(), len(store.index))
+	store.mu.Unlock()
+}
+
 // TestStoreEviction_LeavesMarginBelowLimit covers the actual reported symptom: the status page
 // always read exactly at the disk-budget limit, because eviction stopped the instant it dropped
 // to or below maxDiskBytes -- meaning almost every subsequent write had to evict again. It
@@ -1326,14 +1457,15 @@ func TestStoreEviction_LeavesMarginBelowLimit(t *testing.T) {
 	require.NoError(t, err)
 
 	now := time.Now()
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 10; i++ {
 		saveWithModTimeForTest(t, store, fmt.Sprintf("item-%d", i), 100, now.Add(time.Duration(i)*time.Minute))
 	}
-	require.Equal(t, int64(500), store.DiskBytes())
+	require.Equal(t, int64(1000), store.DiskBytes())
 
-	// One more push the total (600) over budget without any single item being anywhere near the
-	// limit itself, so the only thing that could stop eviction early is the margin target.
-	saveWithModTimeForTest(t, store, "item-5", 100, now.Add(5*time.Minute))
+	// One more pushes the total (1100) past the real limit itself, so the only thing that could
+	// stop eviction early is the margin target -- not the earlier bug where it never checked the
+	// real limit at all and evicted the instant usage crossed the margin.
+	saveWithModTimeForTest(t, store, "item-10", 100, now.Add(10*time.Minute))
 
 	store.mu.Lock()
 	store.evictIfNeededLocked()
@@ -1342,6 +1474,31 @@ func TestStoreEviction_LeavesMarginBelowLimit(t *testing.T) {
 	target := int64(maxDiskBytes - maxDiskBytes/evictionMarginFraction)
 	require.LessOrEqual(t, store.DiskBytes(), target, "eviction should clear a margin below maxDiskBytes, not settle exactly at it")
 	require.Positive(t, store.DiskBytes(), "eviction shouldn't have needed to clear out everything")
+}
+
+// TestStoreEviction_NoEvictionBelowRealLimit covers the bug this fix corrects: eviction used to
+// trigger the instant usage crossed the margin (90% of maxDiskBytes) instead of maxDiskBytes
+// itself, so the margin never actually granted any headroom in practice.
+func TestStoreEviction_NoEvictionBelowRealLimit(t *testing.T) {
+	dir := t.TempDir()
+
+	const maxDiskBytes = 1000
+	store, err := NewStore(dir, WithMaxDiskBytes(maxDiskBytes))
+	require.NoError(t, err)
+
+	now := time.Now()
+	// 950 bytes: above the margin (900) but below maxDiskBytes itself.
+	for i := 0; i < 9; i++ {
+		saveWithModTimeForTest(t, store, fmt.Sprintf("item-%d", i), 100, now.Add(time.Duration(i)*time.Minute))
+	}
+	saveWithModTimeForTest(t, store, "item-9", 50, now.Add(9*time.Minute))
+	require.Equal(t, int64(950), store.DiskBytes())
+
+	store.mu.Lock()
+	store.evictIfNeededLocked()
+	store.mu.Unlock()
+
+	require.Equal(t, int64(950), store.DiskBytes(), "usage above the margin but below maxDiskBytes must not be evicted")
 }
 
 // saveWithModTimeForTest saves a size-byte item and backdates its upload time, for tests that
@@ -1360,5 +1517,12 @@ func saveWithModTimeForTest(t *testing.T, store *Store, path string, size int, m
 	ie := store.index[path]
 	ie.ModTimeMicro = modTime.UnixMicro()
 	store.index[path] = ie
+	// SaveItem already pushed a heap entry for path with its real (untouched-by-the-line-above)
+	// save time; evictHeap is push-only (see its doc comment), so backdating the index entry
+	// out-of-band like this needs a matching push too, or evictOneLocked would discard the
+	// original entry as stale (it won't match the now-backdated index) with nothing left behind
+	// for path -- a concern only for tests that reach into store.index directly like this one;
+	// putOne itself never lets the two diverge.
+	store.evictHeap.push(path, store.entryStoredSize(ie), ie.ModTimeMicro)
 	store.mu.Unlock()
 }
