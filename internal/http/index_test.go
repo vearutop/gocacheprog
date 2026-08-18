@@ -59,6 +59,7 @@ func TestIndex_BasicAuth(t *testing.T) {
 	require.Equal(t, nethttp.StatusOK, code)
 	require.Contains(t, body, "server version")
 	require.Contains(t, body, "Objects store")
+	require.Contains(t, body, "heap in use")
 }
 
 // TestIndex_HidesEmptyStoreSections covers the actual ask: a freshly started (or fully evicted)
@@ -339,7 +340,7 @@ func TestCombinedBudget_LeavesMarginBelowLimit(t *testing.T) {
 		time.Sleep(time.Millisecond) // distinct mtimes, so LRU order is deterministic
 	}
 
-	budget := nativeStore.DiskBytes() + 50 // under budget so far, one more 100-byte item tips it over
+	budget := nativeStore.DiskBytes() - 50 // already over budget, so the next write must evict
 	target := budget - budget/10
 
 	h := http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2, http.WithMaxDiskBytes(budget))
@@ -357,4 +358,39 @@ func TestCombinedBudget_LeavesMarginBelowLimit(t *testing.T) {
 
 	total := localStore.DiskBytes() + nativeStore.DiskBytes()
 	require.LessOrEqual(t, total, target, "eviction should clear a margin below the budget, not settle exactly at it")
+}
+
+// TestCombinedBudget_NoEvictionBelowRealLimit covers the bug this fix corrects: eviction used to
+// trigger the instant usage crossed the margin (90% of the budget) instead of the budget itself,
+// so the margin never actually granted any headroom in practice.
+func TestCombinedBudget_NoEvictionBelowRealLimit(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir)
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"))
+	require.NoError(t, err)
+
+	payload := bytes.Repeat([]byte{'a'}, 100)
+	item := gocache.FileItem{Path: "ab/item-0", Size: int64(len(payload)), WireSize: int64(len(payload))}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	})
+	require.NoError(t, nativeStore.SaveItem(item))
+
+	// Usage (100 bytes) is already above the margin (90 bytes) but still below the real budget
+	// (150 bytes), so nothing should be evicted.
+	budget := int64(150)
+
+	h := http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2, http.WithMaxDiskBytes(budget))
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	// A no-op request (empty Put) still runs enforceCombinedBudget via defer.
+	require.NoError(t, client.Put(cache.Response{}))
+
+	require.Equal(t, int64(100), nativeStore.DiskBytes(), "usage above the margin but below the real budget must not be evicted")
 }

@@ -578,13 +578,28 @@ cutoff. Within a store, which object goes first is ranked by the timestamp of it
   object's eviction would also cost. An object from an older window is always evicted before one
   from a newer window regardless of size — the size preference only breaks ties within a window.
 
+Picking the next entry to evict is O(log n) via a heap, not a full rescan of the index: closing
+the margin gap after a large burst can mean evicting thousands of entries in one synchronous
+call, and at real production scale (a couple hundred thousand entries isn't unusual) a full
+rescan per evicted entry was slow enough to starve other requests' access to the store's lock for
+many seconds — long enough to time out a save-cache chunk upload waiting for its response
+headers. The heap is insert-only: a path's eviction priority is set once, when it's first saved,
+and a redundant re-save never changes it (see above), so there's never anything to reorder in
+place, and a path removed outside of eviction (`/clear`, a corrupted object dropped at restore
+time) is simply left as a harmless stale entry rather than hunted down and removed — eviction
+validates what it pops against the live index and discards anything stale, which costs it nothing
+that finding and removing that entry eagerly wouldn't have cost anyway. That keeps the heap's
+memory overhead to just the entries themselves, no separate lookup index alongside it.
+
 ### Status page
 
 `GET /` serves an HTML status page gated by HTTP Basic Auth (any username, password is
-`-auth-token`) showing each store's stats (hidden entirely once a store is empty), the combined
-disk budget and current usage, and client sessions — status, version, ref (linked to the CI job
-when available), build type, start time, preload size/source/time, finalize size/time, and total
-session time. A "Panics" section appears at the bottom of the page only once something has
+`-auth-token`) showing the Go runtime's current heap usage (see the eviction heap's memory
+tradeoff above — this is the most direct way to watch its actual cost on a running server), each
+store's stats (hidden entirely once a store is empty), the combined disk budget and current
+usage, and client sessions — status, version, ref (linked to the CI job when available), build
+type, start time, preload size/source/time, finalize size/time, and total session time. A
+"Panics" section appears at the bottom of the page only once something has
 actually been recovered — a server that's never panicked shows no such section at all. A "Run
 cleanup now" button on the page triggers an immediate eviction pass without waiting for the next
 request.

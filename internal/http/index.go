@@ -4,6 +4,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:.5rem;b
 <body>
 <h1>gocacheprogd status</h1>
 <p>server version: {{.ServerVersion}}</p>
+<p>heap in use: {{.HeapInUse}}</p>
 {{if .CombinedBudget}}<p>combined disk budget: {{.CombinedBudget}}</p>{{else}}<p class="warn">no combined disk budget configured — eviction disabled</p>{{end}}
 {{range .Sections}}
 <h2>{{.Title}}</h2>
@@ -200,14 +202,19 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 		panics.At = panicAt.Format(time.RFC3339)
 	}
 
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
 	data := struct {
 		ServerVersion  string
+		HeapInUse      string
 		CombinedBudget string
 		Panics         panicInfo
 		Sections       []statSection
 		Sessions       []sessionRow
 	}{
 		ServerVersion:  version.Module("github.com/vearutop/gocacheprog").Version,
+		HeapInUse:      byteSize(uint64ToInt64(ms.HeapInuse)),
 		CombinedBudget: combinedBudget,
 		Panics:         panics,
 		Sections:       sections,
