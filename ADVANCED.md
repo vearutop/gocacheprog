@@ -102,8 +102,6 @@ Usage of ./bin/gocacheprog:
         set up caching for a GitHub Actions job from a single DSN; see internal/local/github_actions.go for the DSN format
   -gocache-manifest-max-age duration
         server mode: same as -manifest-max-age but for native GOCACHE manifests (default 120h0m0s)
-  -gocache-max-age duration
-        maximum age for native GOCACHE objects on the remote server; 0 disables age-based retirement (default 48h0m0s)
   -http string
         HTTP listen address or unix socket path
   -https string
@@ -384,13 +382,16 @@ Scopes:
 - `changes-id`
 - `build-type`
 
-Preload source resolution order is:
+Preload sources are unioned, not tried in strict precedence order — `commit`, `parent`, `changes`,
+and `base` each contribute whatever they match, and `default` (see below) tops the combined result
+up further:
 
 1. `commit`
 2. `parent`
 3. `changes`
 4. `base`
-5. `newest` (only when none of the above matched anything)
+5. `default` (fires when none of the above matched anything, or supplements when what they matched
+   looks abnormally small for this `build-type`)
 
 Interpretation:
 
@@ -402,16 +403,20 @@ Interpretation:
   - stable rolling label such as `owner/repo#123`
 - `base`
   - fallback relevance from target branch state
-- `newest`
-  - last resort: whichever manifest for this `build-type` was written most recently, from *any*
-    commit or PR. Covers a cold start where `commit`/`parent`/`changes`/`base` all come up empty -
-    a long pause with nothing relevant built on the target branch since, or the very first build
-    of a new `build-type` - so every PR isn't forced to start fully cold. In practice, cache
-    entries are usually still largely relevant across unrelated PRs of the same `build-type`, so
-    this beats an empty preload while waiting for the target branch to catch up. Scoped strictly
-    to the requested `build-type` - it never reaches across build types, which typically have
-    different dependency footprints. Never overrides a real match: it only fires when the other
-    four sources found nothing at all.
+- `default`
+  - a broader source, not a single manifest: the union of up to 5 of this `build-type`'s most
+    representative manifests, ranked trunk (non-PR) manifests first and by recency as the
+    tiebreaker within each group. A trunk push's commit manifest is a one-shot, comprehensive
+    snapshot of everything that `build-type` needed; a PR's `changes` manifest only ever reflects
+    that one branch's own narrow history and can cover a tiny fraction of the usual footprint even
+    when it happens to be the most recently written — so it's only pulled in to fill remaining
+    slots once trunk manifests run out, never used to displace one. Fires as a last resort when
+    `commit`/`parent`/`changes`/`base` found nothing at all (a cold start, a long pause with
+    nothing relevant built on the target branch, or the first build of a new `build-type`), and
+    also as a supplement whenever the combined result from those four sources looks unusually
+    small — eviction has no awareness of which manifests still reference an object, so a
+    long-lived manifest can quietly hollow out over time even though it matched. Scoped strictly
+    to the requested `build-type`; never overrides a real, adequately-sized match.
 
 ### `-changes-id`
 
@@ -548,27 +553,52 @@ and the native `GOCACHE` store:
 gocacheprog -http :8080 -max-disk-bytes 5000000000
 ```
 
-Whichever of the two stores currently holds the most bytes is evicted from first (LRU) until
-their combined usage is back under the limit. This runs synchronously after every request, so a
+Whichever of the two stores currently holds the most bytes is evicted from first, down to 90% of
+the limit rather than exactly to it — settling right at the limit would mean re-evicting on almost
+every subsequent write once a store fills up. This runs synchronously after every request, so a
 burst of writes can't outrun it the way a delayed background sweep could.
 
-Native `GOCACHE` storage also has an age-based retirement policy, defaulting to `48h`, independent
-of the disk-size budget above:
+Eviction is the *only* retirement mechanism for cache objects — there's no separate age-based
+cutoff. Within a store, which object goes first is ranked by the timestamp of its last actual
+*upload*, oldest first, with two refinements:
 
-```bash
-gocacheprog -http :8080 -gocache-max-age 48h
-```
-
-Set `-gocache-max-age 0` to disable age-based retirement. Age-based cleanup runs on a delayed
-background sweep rather than inline on `Put`, since it's not needed to bound disk usage the way
-the size-based budget is.
+- A restore/preload never counts as use: a manifest lists everything a `build-type` might need,
+  not everything one specific job's build actually touched, and preload is intentionally
+  over-inclusive since batch-fetching is cheap — so being downloaded proves nothing about whether
+  an object is still needed. Only a genuine re-upload does: that can only happen after the
+  previous copy was evicted and a later job's real cache miss forced it to rebuild and re-save
+  from scratch. A redundant re-save of a path that's already stored (GOCACHE paths are
+  content-addressed, so this is always identical content) leaves its existing timestamp alone
+  rather than resetting it — otherwise objects that many parallel jobs happen to keep
+  redundantly rebuilding would look perpetually fresh regardless of whether anyone still needs
+  them.
+- Within any hour-wide window of upload times, the larger object is evicted first rather than the
+  strictly oldest one: rebuilding N evicted objects costs roughly N cache misses regardless of
+  their size, so evicting one large object frees more space for the same single miss that a small
+  object's eviction would also cost. An object from an older window is always evicted before one
+  from a newer window regardless of size — the size preference only breaks ties within a window.
 
 ### Status page
 
 `GET /` serves an HTML status page gated by HTTP Basic Auth (any username, password is
-`-auth-token`) showing both stores' stats, the combined disk budget and current usage, and
-in-progress client sessions with their versions. A "Run cleanup now" button on the page triggers
-an immediate eviction pass without waiting for the next request.
+`-auth-token`) showing each store's stats (hidden entirely once a store is empty), the combined
+disk budget and current usage, and client sessions — status, version, ref (linked to the CI job
+when available), build type, start time, preload size/source/time, finalize size/time, and total
+session time. A "Panics" section appears at the bottom of the page only once something has
+actually been recovered — a server that's never panicked shows no such section at all. A "Run
+cleanup now" button on the page triggers an immediate eviction pass without waiting for the next
+request.
+
+If `-cache-dir` is set (server mode always sets one), every session-start and session-done event
+also appends a row to `<cache-dir>/sessions.csv` — plain-unit columns (unix timestamps, seconds,
+bytes) meant for pulling down and analyzing cache performance over time, not just eyeballing the
+live status page. The file is opened, appended to, and closed for each single row, so it's never
+held open, survives server restarts, and grows indefinitely with no rotation. Download it (same
+Basic Auth as the status page) via:
+
+```bash
+curl -u "x:secret-token" https://cache.example.com/sessions.csv -o sessions.csv
+```
 
 ## Authentication
 
@@ -662,16 +692,28 @@ Server mode exposes:
 
 It returns JSON with:
 
-- `store`
-  - hits, misses, puts, index size
-  - disk usage
+- `store` (hash-cache store) and `gocache` (native `GOCACHE` store, when enabled)
+  - hits, puts, index size — `store` also has `misses` (the native store has no per-key
+    get/miss concept, so it's omitted there)
+  - `storage`: a human-readable disk usage figure (the raw byte count isn't included — see the
+    status page's combined-budget line for the byte-precise total across both stores)
   - eviction state
 - `http`
   - preload counters and concurrency limit
 - `runtime`
   - heap in use
 
-Byte sizes are also humanized in the JSON.
+### `/sessions.csv`
+
+Basic-Auth-gated (same as the status page, not the Bearer token the endpoints above need) raw
+download of the CSV history behind the status page's client sessions table — one row per session
+start and per session done, plain-unit columns (unix timestamps, seconds, bytes) meant for pulling
+down and analyzing cache performance over time rather than just eyeballing the live page. See
+[Status page](#status-page) for the column list and persistence details.
+
+```bash
+curl -u "x:secret-token" https://cache.example.com/sessions.csv -o sessions.csv
+```
 
 ### Native cache admin endpoints
 
