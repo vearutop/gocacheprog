@@ -142,6 +142,58 @@ func TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas(t *testing.T) {
 	require.Contains(t, string(commitBody), "cd/genuinely-new\n")
 }
 
+// TestSaveFreshNativeCache_ManifestIncludesRestoredPathsNotJustNewOnes covers a real production
+// incident: a job restores N files from "changes"/"base"/"default" (nothing to do with this
+// exact commit yet), then its build only adds a handful of genuinely new ones -- but the
+// resulting "commit" manifest ended up with only the handful, never the N it restored, because
+// only the not-already-restored delta was ever reported back to MergeSavedPaths. A later rerun
+// of the very same commit then had to restore via "commit" and got next to nothing back, forcing
+// it to redundantly recompute (and re-discover, already on the server) most of what the first
+// run had already resolved.
+func TestSaveFreshNativeCache_ManifestIncludesRestoredPathsNotJustNewOnes(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := NewStore(serverDir, WithCompression())
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(cachehttp.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := cachehttp.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	changesReq := gocache.Request{ChangesID: "org/repo#1", BuildType: "unit"}
+	seedItem := gocache.FileItem{Path: "cd/from-changes", Size: int64(len("from changes history")), WireSize: int64(len("from changes history"))}
+	seedItem.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("from changes history")), nil
+	})
+	_, err = client.SaveCache(changesReq, gocache.Batch{Items: []gocache.FileItem{seedItem}})
+	require.NoError(t, err)
+
+	req := gocache.Request{Commit: "commit123", ChangesID: "org/repo#1", BuildType: "unit"}
+	cacheDir := t.TempDir()
+	_, err = RestoreNativeCache(cacheDir, client, req, time.Now())
+	require.NoError(t, err)
+	_, err = os.Stat(filepath.Join(cacheDir, "cd", "from-changes"))
+	require.NoError(t, err, "sanity check: the changes-scoped file must have actually been restored")
+
+	writeCacheFile(t, cacheDir, "ab/new-file", "genuinely new this job", time.Now())
+
+	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, time.Time{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Files, "only the genuinely new file should be uploaded")
+
+	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "c", "commit123.zst")
+	commitData, err := os.ReadFile(commitManifestPath)
+	require.NoError(t, err)
+	commitBody, err := cache.DecodeZstd(nil, commitData)
+	require.NoError(t, err)
+	require.Contains(t, string(commitBody), "cd/from-changes\n", "the restored-but-not-newly-uploaded path must still land in commit's own manifest")
+	require.Contains(t, string(commitBody), "ab/new-file\n")
+}
+
 func TestInitLocalGocacheMode_FallbackRemoteRestoresWhenCold(t *testing.T) {
 	srv := newFallbackTestServer(t)
 	seedClient, err := cachehttp.NewClient(srv.URL, "")

@@ -117,6 +117,15 @@ type Store struct {
 	currentDiskBytes  int64
 	evictionScheduled bool
 
+	// manifestMu serializes every manifest read-modify-write (mergeManifest, and the self-heal
+	// write-back in restorePaths/loadDefaultManifestPaths): without it, two concurrent requests
+	// touching the same manifest (e.g. two matrix jobs of the same commit finishing at nearly the
+	// same time) can each read, then write back based on their own stale read -- the second
+	// write silently discards whatever the first one added. Separate from mu, which guards the
+	// in-memory index: manifest work does file I/O and would otherwise hold that lock for far
+	// longer than the hot object-put path can afford.
+	manifestMu sync.Mutex
+
 	// pool packs small records (see recordpool.Pool) instead of one file per object, once a
 	// given size has demonstrably earned it. Rebuilt from s.index and its own directory at
 	// startup (see reconcilePoolLocked); nothing pool-related is persisted separately.
@@ -1371,8 +1380,13 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 		{name: "changes", load: func() ([]string, bool, string, error) { return s.loadChangesManifest(req.ChangesID, req.BuildType) }},
 		{name: "base", load: func() ([]string, bool, string, error) { return s.loadCommitManifest(req.BaseCommit, req.BuildType) }},
 	} {
+		// Locked end to end (see manifestMu's doc comment): the self-heal write below must land
+		// based on exactly what this load just read, or it can race a concurrent mergeManifest
+		// (e.g. a sibling matrix job's finalize) and silently discard whatever it just added.
+		s.manifestMu.Lock()
 		paths, changed, manifestPath, err := candidate.load()
 		if err != nil {
+			s.manifestMu.Unlock()
 			if os.IsNotExist(err) {
 				continue
 			}
@@ -1386,6 +1400,7 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
 			}
 		}
+		s.manifestMu.Unlock()
 		matched[manifestPath] = struct{}{}
 		sources = append(sources, candidate.name)
 		for _, relPath := range paths {
@@ -1603,8 +1618,11 @@ func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]st
 	seen := map[string]struct{}{}
 	var result []string
 	for _, c := range candidates {
+		// Locked end to end -- see the identical reasoning in restorePaths.
+		s.manifestMu.Lock()
 		paths, changed, err := s.loadManifest(c.path)
 		if err != nil {
+			s.manifestMu.Unlock()
 			return nil, err
 		}
 		if changed {
@@ -1613,6 +1631,7 @@ func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]st
 				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", c.path, err.Error())
 			}
 		}
+		s.manifestMu.Unlock()
 		for _, p := range paths {
 			if _, ok := seen[p]; ok {
 				continue
@@ -2426,7 +2445,12 @@ func unionManifestPaths(lists ...[]string) []string {
 }
 
 // mergeManifest merges paths into manifestPath's existing content and writes the result back.
+// Locked end to end (see manifestMu's doc comment): reading, then writing back a merge of that
+// exact read, is only safe if nothing else can write manifestPath in between.
 func (s *Store) mergeManifest(manifestPath string, paths []string) error {
+	s.manifestMu.Lock()
+	defer s.manifestMu.Unlock()
+
 	existing, _, err := s.loadManifest(manifestPath)
 	if err != nil && !os.IsNotExist(err) {
 		return err

@@ -170,37 +170,7 @@ func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache
 	}
 	batch.Items = fresh
 
-	// "New to this job's local GOCACHE" isn't the same as "new to the server": many parallel
-	// jobs rebuilding the same unchanged dependency from an empty local cache each produce the
-	// same content-addressed path. Check before paying to compress and upload objects the
-	// server already has -- errors here are non-fatal, same reasoning as everywhere else in
-	// this file: caching is an optimization, not a build dependency, so fall back to uploading
-	// everything rather than failing the job.
-	if len(batch.Items) > 0 {
-		paths := make([]string, len(batch.Items))
-		for i, item := range batch.Items {
-			paths[i] = item.Path
-		}
-
-		if existing, existErr := client.ExistingPaths(req, paths); existErr != nil {
-			log.Printf("save-cache: check existing objects failed, uploading everything: %s", existErr.Error())
-		} else if len(existing) > 0 {
-			existingSet := make(map[string]struct{}, len(existing))
-			for _, p := range existing {
-				existingSet[p] = struct{}{}
-			}
-
-			deduped := batch.Items[:0]
-			for _, item := range batch.Items {
-				if _, ok := existingSet[item.Path]; ok {
-					continue
-				}
-				deduped = append(deduped, item)
-			}
-			log.Printf("save-cache: skipping %d/%d objects the server already has", len(batch.Items)-len(deduped), len(batch.Items))
-			batch.Items = deduped
-		}
-	}
+	batch = reportExistingAndDedupe(client, req, restoredPaths, batch)
 
 	if len(batch.Items) == 0 {
 		log.Printf(
@@ -233,6 +203,61 @@ func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache
 		req.ParentCommit,
 	)
 	return stats, nil
+}
+
+// reportExistingAndDedupe checks which of restoredPaths and batch's paths the server already
+// has, and filters anything already-known out of batch so it isn't re-uploaded.
+//
+// restoredPaths ride along in this same call even though none of them are ever uploaded:
+// restoring them didn't record them against this exact commit/changes-id (Store.Restore is
+// deliberately read-only -- a restore doesn't prove they belong to this job's own manifest, only
+// that some source manifest had them). They're already known to the server by definition, so
+// this call trivially confirms that and, via the same merge ExistingPaths triggers server-side,
+// is what makes the commit/changes manifest end up as the complete list of everything this job's
+// cache actually needed -- restored or newly touched -- rather than just the delta it didn't
+// already have.
+//
+// Errors here are non-fatal, same reasoning as everywhere else in this file: caching is an
+// optimization, not a build dependency, so fall back to uploading everything rather than failing
+// the job.
+func reportExistingAndDedupe(client *cachehttp.Client, req gocache.Request, restoredPaths map[string]struct{}, batch gocache.Batch) gocache.Batch {
+	if len(batch.Items) == 0 && len(restoredPaths) == 0 {
+		return batch
+	}
+
+	paths := make([]string, 0, len(restoredPaths)+len(batch.Items))
+	for p := range restoredPaths {
+		paths = append(paths, p)
+	}
+	for _, item := range batch.Items {
+		paths = append(paths, item.Path)
+	}
+
+	existing, err := client.ExistingPaths(req, paths)
+	if err != nil {
+		log.Printf("save-cache: check existing objects failed, uploading everything: %s", err.Error())
+		return batch
+	}
+	if len(existing) == 0 {
+		return batch
+	}
+
+	existingSet := make(map[string]struct{}, len(existing))
+	for _, p := range existing {
+		existingSet[p] = struct{}{}
+	}
+
+	deduped := batch.Items[:0]
+	for _, item := range batch.Items {
+		if _, ok := existingSet[item.Path]; ok {
+			continue
+		}
+		deduped = append(deduped, item)
+	}
+	log.Printf("save-cache: skipping %d/%d objects the server already has", len(batch.Items)-len(deduped), len(batch.Items))
+	batch.Items = deduped
+
+	return batch
 }
 
 func humanBytesBinary(v int64) string {
