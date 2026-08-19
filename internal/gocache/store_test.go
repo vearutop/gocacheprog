@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -630,6 +631,46 @@ func TestStoreRestore_DefaultFallbackFillsRemainingSlotsWithPRWhenTrunkIsScarce(
 	require.ElementsMatch(t, []string{"ab/trunk-only", "cd/pr-only"}, restored)
 }
 
+// TestStoreRestore_SupplementSkipsDefaultWhenMissingChunkIsNearlyHalfAgain replicates a real
+// production incident: a build restored via its commit manifest, then had to redundantly
+// recompute nearly half again as many objects, which turned out to already exist on the server
+// under a different manifest for the same build type -- wasting real CI time. The cause is
+// smallRestoreRatio's formula: `resolved < novel` (see supplementSmallResultWithDefault), which
+// only supplements once default's novel content would *more than double* what's already
+// resolved. A gap just under that -- default holding nearly as much novel content as what
+// already matched -- is silently left unsupplemented.
+func TestStoreRestore_SupplementSkipsDefaultWhenMissingChunkIsNearlyHalfAgain(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	matched := make([]string, 0, 100)
+	for i := range 100 {
+		matched = append(matched, fmt.Sprintf("ab/matched-%d", i))
+	}
+	saveItemsForTest(t, store, Request{Commit: "commit123", BuildType: "unit"}, matched, "payload")
+
+	// Held by a different commit's manifest for the same build type, so it's only reachable via
+	// the "default" fallback -- not the commit source this request matches directly.
+	novel := make([]string, 0, 46)
+	for i := range 46 {
+		novel = append(novel, fmt.Sprintf("cd/novel-%d", i))
+	}
+	saveItemsForTest(t, store, Request{Commit: "other-commit", BuildType: "unit"}, novel, "payload")
+
+	sources, err := store.RestoreSources(Request{Commit: "commit123", BuildType: "unit"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"commit"}, sources, "46 novel objects against 100 already matched stays under the 1:1 threshold, so default is skipped")
+
+	var restored []string
+	_, err = store.Restore(Request{Commit: "commit123", BuildType: "unit"}, func(item FileItem) {
+		restored = append(restored, item.Path)
+	})
+	require.NoError(t, err)
+	require.Len(t, restored, 100, "the 46 objects available on the server under the other commit's manifest are never restored")
+}
+
 func TestCollectFilesToSave_SkipsRestoredPaths(t *testing.T) {
 	dir := t.TempDir()
 
@@ -994,6 +1035,152 @@ func TestMergeSavedPaths_ChangesIDMerges(t *testing.T) {
 	changesBody, err := readManifestPaths(changesManifestPath)
 	require.NoError(t, err)
 	require.Equal(t, []string{"A", "B", "C", "D", "E"}, changesBody)
+}
+
+// TestMergeSavedPaths_ConcurrentMergesDoNotLoseEntries replicates a real production incident: a
+// build type with many parallel CI jobs sharing one commit each finalize their own save-cache
+// upload by merging into the exact same manifest. mergeManifest used to read the manifest, then
+// write back a merge of that read with no lock around the two -- so two concurrent finalizes
+// could each read before the other wrote, and the second write would silently discard the
+// first's paths (identical to a lost update). Symptom in production: the server already had a
+// path's object (SaveCacheHas/ExistingPaths reported it), yet the next job's restore never got
+// it, because it was never in the manifest that survived.
+func TestMergeSavedPaths_ConcurrentMergesDoNotLoseEntries(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	req := Request{Commit: "commit123", BuildType: "unit"}
+
+	const jobs = 20
+	const pathsPerJob = 25
+
+	var wg sync.WaitGroup
+	for j := range jobs {
+		paths := make([]string, 0, pathsPerJob)
+		for i := range pathsPerJob {
+			paths = append(paths, fmt.Sprintf("job-%d/path-%d", j, i))
+		}
+		// Each path needs a real, live object -- mergeManifest's self-heal (loadManifest) drops
+		// any manifest line whose object doesn't exist, which would otherwise mask the race
+		// behind what looks like ordinary dead-entry pruning.
+		saveItemsForTest(t, store, Request{}, paths, "payload")
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, store.MergeSavedPaths(req, paths))
+		}()
+	}
+	wg.Wait()
+
+	manifestPath, err := store.commitManifestPath("commit123", "unit")
+	require.NoError(t, err)
+	merged, err := readManifestPaths(manifestPath)
+	require.NoError(t, err)
+	require.Len(t, merged, jobs*pathsPerJob, "every concurrent job's paths must survive the merge, none silently dropped by a lost update")
+}
+
+// TestGOCACHERoundTrip_SequentialRunsOfSameCommitAccumulate simulates a real reported production
+// sequence end to end, sequentially (no concurrency, matching the actual incident: sparse,
+// non-overlapping reruns of one commit), using the same operations the HTTP handlers use
+// (RestoreSources/Restore, ExistingPaths+MergeSavedPaths for the save-cache-has path, SaveItem+
+// MergeSavedPaths for the upload path):
+//
+//   - Round 1 restores whatever "changes"/"base" already had (seeded below, standing in for the
+//     PR's own prior history), then its local build needs pathsPerRound objects it didn't
+//     restore -- most of which (alreadyOnServerPerRound) turn out to already be known to the
+//     store under some unrelated older manifest, and get merged in via the save-cache-has path;
+//     the rest are genuinely new content, uploaded and merged via the save path.
+//   - Round 2 (a later, entirely separate rerun of the exact same commit) must restore round 1's
+//     complete accumulated footprint via the "commit" source alone -- this is the concrete
+//     "commit manifest should be the exactly precise list after round 1" expectation from the
+//     incident report.
+//   - Round 3 repeats the check after round 2's own additions.
+func TestGOCACHERoundTrip_SequentialRunsOfSameCommitAccumulate(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	const commit = "commit123"
+	const changesID = "org/repo#1"
+	const baseCommit = "base123"
+	const buildType = "unit"
+	req := Request{Commit: commit, ChangesID: changesID, BaseCommit: baseCommit, BuildType: buildType}
+
+	// Seed "changes" and "base" with the PR/trunk's prior history, as they'd realistically be
+	// before this commit's first run -- an empty-store first round isn't representative.
+	seeded := make([]string, 0, 2337)
+	for i := range 2337 {
+		seeded = append(seeded, fmt.Sprintf("seed/path-%d", i))
+	}
+	saveItemsForTest(t, store, Request{ChangesID: changesID, BuildType: buildType}, seeded[:1500], "seed-payload")
+	saveItemsForTest(t, store, Request{Commit: baseCommit, BuildType: buildType}, seeded[1500:], "seed-payload")
+
+	runRound := func(round int, wantRestoredAtLeast int) (restoredCount int) {
+		t.Helper()
+
+		sources, err := store.RestoreSources(req)
+		require.NoError(t, err)
+		require.NotEqual(t, []string{"none"}, sources, "round %d must match at least one source", round)
+
+		var restored []string
+		_, err = store.Restore(req, func(item FileItem) {
+			restored = append(restored, item.Path)
+		})
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, len(restored), wantRestoredAtLeast, "round %d restored fewer paths than the previous round's total accumulated footprint -- exactly the reported incident", round)
+
+		restoredSet := make(map[string]struct{}, len(restored))
+		for _, p := range restored {
+			restoredSet[p] = struct{}{}
+		}
+
+		// This round's local build needs pathsPerRound objects it didn't already restore --
+		// most already known to the store under some unrelated older manifest (simulating
+		// long-unrelated history sharing content-addressed objects), the rest genuinely new.
+		const pathsPerRound = 1144
+		const alreadyOnServerPerRound = 1074
+		candidates := make([]string, 0, pathsPerRound)
+		for i := range pathsPerRound {
+			candidates = append(candidates, fmt.Sprintf("round-%d/path-%d", round, i))
+		}
+		for i, p := range candidates[:alreadyOnServerPerRound] {
+			// Already known to the store under an unrelated scope -- not part of req's own
+			// manifests yet.
+			saveItemForTest(t, store, Request{}, p, fmt.Sprintf("unrelated-payload-%d", i))
+		}
+
+		existing := store.ExistingPaths(candidates)
+		require.Len(t, existing, alreadyOnServerPerRound, "sanity check: the store should already have exactly the seeded subset")
+		require.NoError(t, store.MergeSavedPaths(req, existing))
+
+		existingSet := make(map[string]struct{}, len(existing))
+		for _, p := range existing {
+			existingSet[p] = struct{}{}
+		}
+		var newlyUploaded []string
+		for _, p := range candidates {
+			if _, ok := existingSet[p]; ok {
+				continue
+			}
+			saveItemForTest(t, store, Request{}, p, "new-payload")
+			newlyUploaded = append(newlyUploaded, p)
+		}
+		require.NoError(t, store.MergeSavedPaths(req, newlyUploaded))
+
+		return len(restored)
+	}
+
+	round1Restored := runRound(1, 0)
+	round1Total := round1Restored + 1144 // everything round 1's local build touched, restored or not
+
+	round2Restored := runRound(2, round1Total)
+	round2Total := round2Restored + 1144
+
+	runRound(3, round2Total)
 }
 
 func TestFinalizeUpload_MergesAccumulatedChunkPaths(t *testing.T) {
