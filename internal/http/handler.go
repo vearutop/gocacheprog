@@ -1,6 +1,7 @@
 package http
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -75,6 +76,11 @@ type clientSession struct {
 	FirstSeen     time.Time
 	LastSeen      time.Time
 	DoneAt        time.Time
+	// Extra holds whatever markSessionDone's caller reported alongside going done (see
+	// MarkSessionDone), merged as additional top-level fields into this session's "done" line in
+	// sessions.jsonl -- e.g. -github-actions-done's save-cache skip counts and report_<name>
+	// file contents. Never shown on the status page, only in sessions.jsonl.
+	Extra map[string]any
 }
 
 // sessionIdleTimeout is how long a session is still shown as "in progress" after its last
@@ -288,8 +294,9 @@ func (h *Handler) recordSessionFinalize(r *http.Request, wireBytes int64, dur ti
 }
 
 // markSessionDone flags the request's session as finished, e.g. once -github-actions-done
-// completes. Done sessions are dropped from the status page after doneSessionRetention.
-func (h *Handler) markSessionDone(r *http.Request) {
+// completes. Done sessions are dropped from the status page after doneSessionRetention. extra
+// (see MarkSessionDone) is attached to the session before it's appended to sessions.jsonl.
+func (h *Handler) markSessionDone(r *http.Request, extra map[string]any) {
 	sid := r.Header.Get(headerSessionID)
 	if sid == "" {
 		return
@@ -302,6 +309,7 @@ func (h *Handler) markSessionDone(r *http.Request) {
 	if found {
 		cs.Done = true
 		cs.DoneAt = time.Now()
+		cs.Extra = extra
 		snapshot = *cs
 	}
 	h.clientSessionsMu.Unlock()
@@ -417,8 +425,21 @@ func (h *Handler) serveVersion(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveSessionDone accepts an optional JSON object body (see Client.MarkSessionDone) with extra
+// fields to attach to this session's sessions.jsonl "done" line. A missing/empty body is the
+// common case (most callers have nothing extra to report) and isn't an error.
 func (h *Handler) serveSessionDone(rw http.ResponseWriter, r *http.Request) {
-	h.markSessionDone(r)
+	defer closeRequestBody(r)
+
+	var extra map[string]any
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&extra); err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	h.markSessionDone(r, extra)
 	rw.WriteHeader(http.StatusNoContent)
 }
 

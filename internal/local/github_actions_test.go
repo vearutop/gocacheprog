@@ -100,6 +100,19 @@ func TestParseGithubActionsDSN_InvalidFallbackRemote(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestParseGithubActionsDSN_ReportFiles(t *testing.T) {
+	cfg, err := parseGithubActionsDSN("https://gocache.example.com?report_unit_total=file1.json&report_other_stats=file2.txt")
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"unit_total": "file1.json", "other_stats": "file2.txt"}, cfg.reportFiles)
+	require.Equal(t, "https://gocache.example.com", cfg.remoteURL, "report_ params must not leak into the resolved remote URL")
+}
+
+func TestParseGithubActionsDSN_NoReportFilesLeavesMapNil(t *testing.T) {
+	cfg, err := parseGithubActionsDSN("https://gocache.example.com")
+	require.NoError(t, err)
+	require.Nil(t, cfg.reportFiles)
+}
+
 func TestInitLocalGocacheMode_SetsGocacheAndModeEnv(t *testing.T) {
 	cacheDir := filepath.Join(t.TempDir(), "cache")
 	githubEnv := filepath.Join(t.TempDir(), "github_env")
@@ -384,6 +397,47 @@ func TestSumStatsSummaries_NoRoundTripTimeWhenNoneRecorded(t *testing.T) {
 
 	require.Empty(t, total.GetTotalTime)
 	require.NotContains(t, total.String(), "round_trip_time")
+}
+
+// TestReportFileValue covers the actual point of report_<name> files: JSON content is inlined
+// as that value, literally anything else (including malformed/incomplete JSON) is reported as
+// the raw string -- the file's own extension plays no part in the choice, only the content.
+func TestReportFileValue(t *testing.T) {
+	require.Equal(t, map[string]any{"foo": "bar"}, reportFileValue([]byte(`{"foo":"bar"}`)))
+	require.InEpsilon(t, float64(42), reportFileValue([]byte(`42`)), 0)
+	require.Equal(t, []any{"a", "b"}, reportFileValue([]byte(`["a","b"]`)))
+	require.Equal(t, "abcde", reportFileValue([]byte(`abcde`)))
+	require.Equal(t, `{"foo":`, reportFileValue([]byte(`{"foo":`)), "malformed JSON must fall back to the literal string, not error")
+}
+
+// TestCollectReportExtras covers the actual end-to-end point of the report_<name> DSN params:
+// reading back what -github-actions-init persisted in envGHAReportFiles and resolving each
+// named file's content, JSON-valid or not.
+func TestCollectReportExtras(t *testing.T) {
+	dir := t.TempDir()
+
+	jsonPath := filepath.Join(dir, "file1.json")
+	require.NoError(t, os.WriteFile(jsonPath, []byte(`{"foo":"bar"}`), 0o600))
+	literalPath := filepath.Join(dir, "file2.txt")
+	require.NoError(t, os.WriteFile(literalPath, []byte(`abcde`), 0o600))
+
+	filesJSON, err := json.Marshal(map[string]string{
+		"unit_total":  jsonPath,
+		"other_stats": literalPath,
+		"missing":     filepath.Join(dir, "does-not-exist"),
+	})
+	require.NoError(t, err)
+	t.Setenv(envGHAReportFiles, string(filesJSON))
+
+	extras := collectReportExtras()
+	require.Equal(t, map[string]any{"foo": "bar"}, extras["unit_total"])
+	require.Equal(t, "abcde", extras["other_stats"])
+	require.NotContains(t, extras, "missing", "an unreadable file should be skipped, not fail the whole collection")
+}
+
+func TestCollectReportExtras_NoEnvVarReturnsNil(t *testing.T) {
+	t.Setenv(envGHAReportFiles, "")
+	require.Nil(t, collectReportExtras())
 }
 
 func writeFile(t *testing.T, path, content string) {

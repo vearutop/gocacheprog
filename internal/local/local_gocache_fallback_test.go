@@ -74,7 +74,7 @@ func TestSaveFreshNativeCache_UploadsOnlyFreshNonExcludedFiles(t *testing.T) {
 	require.NoError(t, gocache.WriteRestoredPaths(cacheDir, []string{"cd/restored"}))
 
 	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
+	stats, _, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Files)
 
@@ -91,7 +91,7 @@ func TestSaveFreshNativeCache_NoFreshFilesIsNoop(t *testing.T) {
 	writeCacheFile(t, cacheDir, "ab/old", "stale", since.Add(-time.Hour))
 
 	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
+	stats, _, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
 	require.NoError(t, err)
 	require.Equal(t, 0, stats.Files)
 }
@@ -126,9 +126,10 @@ func TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas(t *testing.T) {
 	writeCacheFile(t, cacheDir, "cd/genuinely-new", "new content", since.Add(time.Minute))
 
 	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, nil)
+	stats, skipStats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Files, "only the genuinely new file should be uploaded")
+	require.Equal(t, SaveSkipStats{ExistingSkipped: 1, Considered: 2}, skipStats, "the skip stats returned to the caller must match what was actually skipped")
 
 	require.Equal(t, "0", nativeStore.Stats()["putsExist"], "the pre-existing object must never reach SaveItem")
 
@@ -164,9 +165,10 @@ func TestSaveFreshNativeCache_LogsSkippedLargeFiles(t *testing.T) {
 	defer log.SetOutput(origOutput)
 
 	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 10, time.Time{}, nil)
+	stats, skipStats, err := SaveFreshNativeCache(cacheDir, client, req, 10, time.Time{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Files, "only the file within -max-file-bytes should be uploaded")
+	require.Equal(t, gocache.SkippedLargeFiles{Count: 1, Bytes: 100}, skipStats.LargeSkipped, "the large-file skip stats returned to the caller must match the log line")
 
 	require.Contains(t, buf.String(), "1 large objects (100 B total) excluded")
 }
@@ -210,7 +212,7 @@ func TestSaveFreshNativeCache_ManifestIncludesRestoredPathsNotJustNewOnes(t *tes
 
 	writeCacheFile(t, cacheDir, "ab/new-file", "genuinely new this job", time.Now())
 
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, time.Time{}, nil)
+	stats, _, err := SaveFreshNativeCache(cacheDir, client, req, 0, time.Time{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Files, "only the genuinely new file should be uploaded")
 

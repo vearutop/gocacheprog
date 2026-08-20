@@ -367,7 +367,7 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 		since = marker
 	}
 
-	_, err = local.SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
+	_, _, err = local.SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
 	return err
 }
 

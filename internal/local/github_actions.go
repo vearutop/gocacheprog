@@ -5,7 +5,7 @@
 //
 // DSN format for -github-actions-init:
 //
-//	<remote-url>?auth=<token>&cache_dir=<dir>&preload_size=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>&max_cache_bytes=<bytes>
+//	<remote-url>?auth=<token>&cache_dir=<dir>&preload_size=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>&max_cache_bytes=<bytes>&report_<name>=<path>
 //
 // Only the remote URL is required; every query parameter is optional:
 //
@@ -36,6 +36,13 @@
 //     done so, uploads back on -github-actions-done only the files created since init (not the
 //     rest of cache_dir, which may hold unrelated build types); false (default) never touches a
 //     remote in local-gocache mode
+//   - report_<name>=<path>: gocache mode only; any number of these, each naming a local file
+//     to read on -github-actions-done and attach to that session's sessions.jsonl line under
+//     the key "<name>" -- if the file's content parses as JSON it's inlined as that value,
+//     otherwise it's reported as a literal string (the file's own extension plays no part in
+//     that choice). Read at done time, not init, since the file (e.g. a coverage summary) is
+//     typically produced during the job itself. A missing/unreadable file is logged and
+//     skipped, same as every other cache-is-optional failure path in this file.
 //
 // Commit, changes-id, and base-commit are derived automatically from GitHub Actions'
 // own environment instead of being passed in: pull_request(_target) events use
@@ -67,6 +74,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -108,6 +116,7 @@ const (
 	envGHAMaxCacheBytes = "GOCACHEPROG_GHA_MAX_CACHE_BYTES"
 	envGHALocalFallback = "GOCACHEPROG_GHA_LOCAL_FALLBACK"
 	envGHASessionID     = "GOCACHEPROG_GHA_SESSION_ID"
+	envGHAReportFiles   = "GOCACHEPROG_GHA_REPORT_FILES"
 )
 
 type githubActionsConfig struct {
@@ -121,6 +130,11 @@ type githubActionsConfig struct {
 	maxCacheBytes  int64
 	skipPreload    bool
 	fallbackRemote bool
+	// reportFiles maps a sessions.jsonl extra-field name to a local file path (see the "report_"
+	// DSN query params), read back and reported at -github-actions-done time -- not at init,
+	// since a report file (e.g. a coverage summary) is typically produced during the job itself
+	// and wouldn't exist yet when -github-actions-init runs.
+	reportFiles map[string]string
 }
 
 // GithubActionsInit sets up caching for a GitHub Actions job from a single DSN. See the
@@ -264,10 +278,30 @@ func parseGithubActionsDSN(dsn string) (githubActionsConfig, error) {
 		}
 	}
 
+	cfg.reportFiles = parseReportFileParams(q)
+
 	u.RawQuery = ""
 	cfg.remoteURL = u.String()
 
 	return cfg, nil
+}
+
+// parseReportFileParams extracts the DSN's report_<name>=<path> params (see the package doc
+// comment) into a name->path map, or nil if there are none.
+func parseReportFileParams(q url.Values) map[string]string {
+	var reportFiles map[string]string
+	for key, vals := range q {
+		name, ok := strings.CutPrefix(key, "report_")
+		if !ok || name == "" || len(vals) == 0 {
+			continue
+		}
+		if reportFiles == nil {
+			reportFiles = make(map[string]string)
+		}
+		reportFiles[name] = vals[0]
+	}
+
+	return reportFiles
 }
 
 var invalidBuildTypeChar = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
@@ -605,6 +639,14 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 		envGHASessionID:    sessionID,
 	}
 
+	if len(cfg.reportFiles) > 0 {
+		reportFilesJSON, err := json.Marshal(cfg.reportFiles)
+		if err != nil {
+			return fmt.Errorf("marshal report files: %w", err)
+		}
+		env[envGHAReportFiles] = string(reportFilesJSON)
+	}
+
 	log.Printf("github-actions-init: gocache mode ready, GOCACHE=%q", cacheDir)
 
 	return setGitHubEnv(env)
@@ -871,7 +913,7 @@ func doneGocacheMode() error {
 	}
 
 	log.Printf("github-actions-done: saving native GOCACHE from %s to %s", cacheDir, remoteURL)
-	saveStats, err := SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
+	saveStats, skipStats, err := SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
 	if err != nil {
 		// The build already finished by this point; a failed upload just means the next job
 		// pays for a cache miss, not a broken job (same swallow-and-log as
@@ -903,11 +945,65 @@ func doneGocacheMode() error {
 	}
 	log.Printf("github-actions-done: cache summary: %s", summary)
 
-	if err := client.MarkSessionDone(); err != nil {
+	extra := map[string]any{
+		// Same numbers as logSaveCacheSkips' "skipping N/M objects the server already has" log
+		// line, so a sessions.jsonl consumer doesn't have to scrape logs to get them.
+		"save_skipped_existing":    skipStats.ExistingSkipped,
+		"save_considered":          skipStats.Considered,
+		"save_skipped_large_count": skipStats.LargeSkipped.Count,
+		"save_skipped_large_bytes": skipStats.LargeSkipped.Bytes,
+	}
+	maps.Copy(extra, collectReportExtras())
+
+	if err := client.MarkSessionDone(extra); err != nil {
 		log.Printf("github-actions-done: WARNING: mark session done: %s", err.Error())
 	}
 
 	return nil
+}
+
+// collectReportExtras reads back the report_<name>=<path> files named at -github-actions-init
+// time (see envGHAReportFiles), keyed by the same names they'll appear under in this session's
+// sessions.jsonl line. A file that's missing or unreadable is logged and skipped -- same
+// "caching/reporting is optional, not a build dependency" reasoning as everywhere else in this
+// file -- rather than failing -github-actions-done over it.
+func collectReportExtras() map[string]any {
+	raw := os.Getenv(envGHAReportFiles)
+	if raw == "" {
+		return nil
+	}
+
+	var files map[string]string
+	if err := json.Unmarshal([]byte(raw), &files); err != nil {
+		log.Printf("github-actions-done: parse report files: %s", err.Error())
+		return nil
+	}
+
+	extras := make(map[string]any, len(files))
+	for name, path := range files {
+		data, err := os.ReadFile(path) //nolint:gosec // path comes from the -github-actions-init DSN, an operator-controlled input.
+		if err != nil {
+			log.Printf("github-actions-done: read report file %q for %q: %s", path, name, err.Error())
+			continue
+		}
+		extras[name] = reportFileValue(data)
+	}
+
+	return extras
+}
+
+// reportFileValue is a report file's sessions.jsonl representation: its content inlined as a
+// JSON value when it parses as JSON, or reported as a literal string otherwise -- the file's own
+// extension plays no part in that choice, only whether the content itself is valid JSON.
+func reportFileValue(data []byte) any {
+	if json.Valid(data) {
+		var v any
+		if err := json.Unmarshal(data, &v); err == nil {
+			return v
+		}
+	}
+
+	return string(data)
 }
 
 // doneLocalGocacheMode has no remote state to finalize in the common case: local-gocache mode's
@@ -1018,7 +1114,7 @@ func doneLocalGocacheFallbackUpload(cacheDir, buildType string) {
 
 	log.Printf("github-actions-done: fallback_remote was used at init, uploading %s files created since %s to %s", cacheDir, since.Format(time.RFC3339), remoteURL)
 
-	if _, err := SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, isLocalGocacheProtectedFile); err != nil {
+	if _, _, err := SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, isLocalGocacheProtectedFile); err != nil {
 		log.Printf("github-actions-done: fallback_remote upload: %s", err.Error())
 	}
 }

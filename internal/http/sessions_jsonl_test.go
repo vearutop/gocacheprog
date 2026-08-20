@@ -64,7 +64,7 @@ func TestSessionsJSONL_RecordsStartedAndDoneEvents(t *testing.T) {
 		return io.NopCloser(bytes.NewBufferString("hello")), nil
 	})
 	require.NoError(t, client.Put(cache.Response{Items: []cache.ResponseItem{item}}))
-	require.NoError(t, client.MarkSessionDone())
+	require.NoError(t, client.MarkSessionDone(nil))
 
 	records := readJSONLRecords(t, jsonlPath)
 	require.Len(t, records, 2, "started + done, got: %v", records)
@@ -95,6 +95,65 @@ func TestSessionsJSONL_RecordsStartedAndDoneEvents(t *testing.T) {
 	require.True(t, ok, "preload_bytes should be a plain byte count, got: %v", done["preload_bytes"])
 }
 
+// TestSessionsJSONL_MarkSessionDoneExtraFieldsAreMerged covers passing extra data through
+// MarkSessionDone (e.g. -github-actions-done's save-cache skip counts and report_<name> file
+// contents): it must land as additional top-level fields on the "done" line, both a nested JSON
+// value and a plain string.
+func TestSessionsJSONL_MarkSessionDoneExtraFieldsAreMerged(t *testing.T) {
+	dir := t.TempDir()
+	jsonlPath := filepath.Join(dir, "sessions.jsonl")
+
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, http.WithSessionsJSONL(jsonlPath))
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{SessionID: "session-extra-1"})
+	require.NoError(t, err)
+
+	require.NoError(t, client.MarkSessionDone(map[string]any{
+		"unit_total":  map[string]any{"foo": "bar"},
+		"other_stats": "abcde",
+	}))
+
+	records := readJSONLRecords(t, jsonlPath)
+	require.Len(t, records, 2, "started + done, got: %v", records)
+
+	done := records[1]
+	require.Equal(t, "done", done["event"])
+	require.Equal(t, map[string]any{"foo": "bar"}, done["unit_total"])
+	require.Equal(t, "abcde", done["other_stats"])
+}
+
+// TestSessionsJSONL_MarkSessionDoneExtraCannotOverrideFixedFields covers the safety rail: an
+// extra field colliding with one of sessions.jsonl's own fixed fields (like "event") must be
+// dropped, not silently corrupt the line.
+func TestSessionsJSONL_MarkSessionDoneExtraCannotOverrideFixedFields(t *testing.T) {
+	dir := t.TempDir()
+	jsonlPath := filepath.Join(dir, "sessions.jsonl")
+
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, http.WithSessionsJSONL(jsonlPath))
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{SessionID: "session-extra-2"})
+	require.NoError(t, err)
+
+	require.NoError(t, client.MarkSessionDone(map[string]any{"event": "hijacked", "session_id": "hijacked"}))
+
+	records := readJSONLRecords(t, jsonlPath)
+	require.Len(t, records, 2, "started + done, got: %v", records)
+
+	done := records[1]
+	require.Equal(t, "done", done["event"], "a reserved field name in extra must not override the real value")
+	require.Equal(t, "session-extra-2", done["session_id"])
+}
+
 // TestSessionsJSONL_SurvivesAcrossHandlerRestarts covers the "survives restarts" requirement: a
 // second Handler pointed at the same path must append after what an earlier one already wrote,
 // never truncating it.
@@ -112,7 +171,7 @@ func TestSessionsJSONL_SurvivesAcrossHandlerRestarts(t *testing.T) {
 	srv1 := httptest.NewServer(h1)
 	client1, err := http.NewClientWithSession(srv1.URL, "", &http.SessionInfo{SessionID: "session-a"})
 	require.NoError(t, err)
-	require.NoError(t, client1.MarkSessionDone())
+	require.NoError(t, client1.MarkSessionDone(nil))
 	srv1.Close()
 
 	// A brand new Handler/server, same jsonlPath -- simulating a process restart.
@@ -121,7 +180,7 @@ func TestSessionsJSONL_SurvivesAcrossHandlerRestarts(t *testing.T) {
 	t.Cleanup(srv2.Close)
 	client2, err := http.NewClientWithSession(srv2.URL, "", &http.SessionInfo{SessionID: "session-b"})
 	require.NoError(t, err)
-	require.NoError(t, client2.MarkSessionDone())
+	require.NoError(t, client2.MarkSessionDone(nil))
 
 	records := readJSONLRecords(t, jsonlPath)
 
@@ -162,7 +221,7 @@ func TestSessionsJSONL_DownloadRequiresBasicAuth(t *testing.T) {
 
 	client, err := http.NewClientWithSession(srv.URL, "secret-token", &http.SessionInfo{SessionID: "session-x"})
 	require.NoError(t, err)
-	require.NoError(t, client.MarkSessionDone())
+	require.NoError(t, client.MarkSessionDone(nil))
 
 	req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/sessions.jsonl", nil)
 	require.NoError(t, err)

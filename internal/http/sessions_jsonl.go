@@ -70,7 +70,7 @@ func (h *Handler) appendSessionsJSONL(event, sid string, cs clientSession) {
 		SessionTimeS:  roundSeconds(sessionTime),
 	}
 
-	if err := appendJSONLLine(h.sessionsJSONLPath, record); err != nil {
+	if err := appendJSONLLine(h.sessionsJSONLPath, record, cs.Extra); err != nil {
 		log.Printf("append sessions.jsonl: %s", err.Error())
 	}
 }
@@ -81,11 +81,33 @@ func roundSeconds(d time.Duration) float64 {
 	return math.Round(d.Seconds()*1000) / 1000
 }
 
-func appendJSONLLine(path string, v any) error {
+// appendJSONLLine appends v (marshaled to a JSON object) to path, merged with extra's keys as
+// additional top-level fields -- a key in extra that collides with one of v's own fields is
+// dropped rather than overwriting it, so a caller's report_<name> can never clobber a fixed
+// field like "event" or "session_id" out from under it.
+func appendJSONLLine(path string, v any, extra map[string]any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
+
+	if len(extra) > 0 {
+		var merged map[string]any
+		if err := json.Unmarshal(data, &merged); err != nil {
+			return err
+		}
+		for k, val := range extra {
+			if _, reserved := merged[k]; reserved {
+				continue
+			}
+			merged[k] = val
+		}
+		data, err = json.Marshal(merged)
+		if err != nil {
+			return err
+		}
+	}
+
 	data = append(data, '\n')
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // path is operator-configured, not request-derived.
