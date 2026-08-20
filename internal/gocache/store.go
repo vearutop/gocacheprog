@@ -1702,7 +1702,7 @@ func (s *Store) loadManifest(manifestPath string) ([]string, bool, error) {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
-	res := make([]string, 0)
+	candidates := make([]string, 0)
 	seen := map[string]struct{}{}
 	changed := false
 
@@ -1723,44 +1723,38 @@ func (s *Store) loadManifest(manifestPath string) ([]string, bool, error) {
 			continue
 		}
 		seen[relPath] = struct{}{}
-
-		if !s.objectExists(relPath) {
-			changed = true
-			continue
-		}
-
-		res = append(res, relPath)
+		candidates = append(candidates, relPath)
 	}
 
 	if err := scanner.Err(); err != nil {
 		return nil, false, fmt.Errorf("scan manifest %s: %w", manifestPath, err)
 	}
 
-	return res, changed, nil
-}
-
-// objectExists is objectExistsLocked's unlocked counterpart, for a caller that doesn't already
-// hold s.mu: it takes the lock only around the index map lookup, not around the os.Stat syscall
-// that follows for a non-pool entry. loadManifest calls this once per line, so for a large
-// manifest (tens of thousands of paths is routine in production) holding s.mu for the full
-// lookup+stat -- as objectExistsLocked does -- would serialize that many syscalls against every
-// other request needing s.mu (every SaveItem, eviction, etc.) for however long each stat takes;
-// restorePaths resolves entirely before Handler.RestoreCache sends any response header, so that
-// contention risked a client's response-header timeout, not just added latency.
-func (s *Store) objectExists(relPath string) bool {
+	// Trusts s.index membership alone -- no os.Stat -- for the same reason pool-backed entries
+	// already skip it (see objectExistsLocked): this store's objects are only ever created or
+	// removed by its own code (SaveItem, evictOneLocked, removeBrokenEntry), always together
+	// with the matching index entry under s.mu, so nothing outside the store is expected to
+	// touch the objects directory. That makes index membership already authoritative for "was
+	// this evicted," without re-verifying against disk. A path that's index-present but somehow
+	// still missing/truncated on disk (e.g. a crash mid-write) isn't silently served either --
+	// Restore's own per-entry stat-and-size check catches that at serve time (see Restore),
+	// which runs after Handler.RestoreCache has already sent its response header, so it's not on
+	// the header-timeout-risking path the way this per-line check used to be: a manifest with a
+	// hundred thousand or more paths is routine in production, and stat-ing every single one of
+	// them, one at a time, before any header could be sent, was slow enough by itself to blow a
+	// client's response-header timeout.
+	res := make([]string, 0, len(candidates))
 	s.mu.Lock()
-	ie, ok := s.index[relPath]
+	for _, relPath := range candidates {
+		if _, ok := s.index[relPath]; !ok {
+			changed = true
+			continue
+		}
+		res = append(res, relPath)
+	}
 	s.mu.Unlock()
 
-	if !ok {
-		return false
-	}
-	if ie.PoolPage != 0 {
-		return true
-	}
-
-	_, err := os.Stat(s.objectPath(relPath))
-	return err == nil
+	return res, changed, nil
 }
 
 func (s *Store) Close() error {

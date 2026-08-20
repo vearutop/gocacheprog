@@ -140,6 +140,12 @@ func TestRestorePaths_SupplementsSmallBaseResultWithDefault(t *testing.T) {
 	require.ElementsMatch(t, []string{"ab/base-only", "cd/newer-1", "cd/newer-2", "cd/newer-3"}, restored)
 }
 
+// TestStoreRestore_PrunesMissingManifestEntries covers loadManifest's self-heal: a manifest that
+// still lists a path the store itself has since removed (eviction, or any other index-level
+// removal) must have that entry dropped from the resolved result and, because that's what
+// "changed" is for, rewritten out of the manifest on disk too, rather than repeating the same
+// stale entry on every future restore. loadManifest trusts s.index membership alone for this
+// (see its doc comment) -- it's the removal from the index, not from disk, that it reacts to.
 func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 	dir := t.TempDir()
 
@@ -161,8 +167,11 @@ func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 
 	manifestPath, err := store.commitManifestPath("commit123", "")
 	require.NoError(t, err)
-	objectPath := store.objectPath(item.Path)
-	require.NoError(t, os.Remove(objectPath))
+
+	store.mu.Lock()
+	ie := store.index[item.Path]
+	store.mu.Unlock()
+	store.removeBrokenEntry(item.Path, ie)
 
 	var restored []string
 	sources, err := store.Restore(Request{Commit: "commit123"}, func(item FileItem) {
@@ -175,6 +184,98 @@ func TestStoreRestore_PrunesMissingManifestEntries(t *testing.T) {
 	manifestBody, err := readManifestPaths(manifestPath)
 	require.NoError(t, err)
 	require.Empty(t, manifestBody)
+}
+
+// TestStoreRestore_TrustsIndexWithoutStattingDisk is loadManifest's other half: a path that's
+// still genuinely present in the index must be trusted and served even if, hypothetically,
+// something removed its on-disk file behind the store's back -- loadManifest itself no longer
+// re-verifies against disk (only index membership matters to it). Restore's own serve-time
+// stat-and-size check is what actually protects a client from receiving that broken body; this
+// test is specifically about loadManifest/restorePaths not pre-emptively excluding it upfront.
+func TestStoreRestore_TrustsIndexWithoutStattingDisk(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	saveItemForTest(t, store, Request{Commit: "commit123"}, "ab/cache-entry-a", "payload")
+	require.NoError(t, os.Remove(store.objectPath("ab/cache-entry-a")))
+
+	paths, sources, err := store.restorePaths(Request{Commit: "commit123"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"commit"}, sources)
+	require.Equal(t, []string{"ab/cache-entry-a"}, paths, "still index-present, so loadManifest must not exclude it just because its on-disk file is gone")
+}
+
+// TestLoadManifest_ScaleOrderAndCorrectness covers loadManifest's index-membership liveness pass
+// at a scale where the old fully-sequential per-line os.Stat loop was slow enough, by itself, to
+// blow a client's response-header timeout on restore-cache (production manifests routinely hold
+// tens of thousands of paths). Beyond speed, output order must still match the manifest's own
+// line order, and every live/dead classification must still be exactly correct, including for
+// paths that share a bucket/prefix or interleave live and dead.
+func TestLoadManifest_ScaleOrderAndCorrectness(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir)
+	require.NoError(t, err)
+
+	const total = 5000
+	var wantLive []string
+	for i := range total {
+		path := fmt.Sprintf("ab/entry-%d", i)
+		saveItemForTest(t, store, Request{}, path, fmt.Sprintf("payload-%d", i))
+		// Every third entry is dropped from the index (the same way eviction/removeBrokenEntry
+		// would) after saving, so the manifest ends up with dead entries interleaved throughout,
+		// not clustered at the start or end.
+		if i%3 == 0 {
+			store.mu.Lock()
+			ie := store.index[path]
+			store.mu.Unlock()
+			store.removeBrokenEntry(path, ie)
+			continue
+		}
+		wantLive = append(wantLive, path)
+	}
+
+	manifestPath, err := store.commitManifestPath("commit123", "")
+	require.NoError(t, err)
+	allPaths := make([]string, total)
+	for i := range total {
+		allPaths[i] = fmt.Sprintf("ab/entry-%d", i)
+	}
+	require.NoError(t, store.writeManifest(manifestPath, joinManifestBody(allPaths)))
+
+	live, changed, err := store.loadManifest(manifestPath)
+	require.NoError(t, err)
+	require.True(t, changed, "index-removed entries must be detected as requiring self-heal")
+	require.Equal(t, wantLive, live, "surviving entries must come back in the manifest's original order, exactly the live ones")
+}
+
+// BenchmarkLoadManifest_AtScale quantifies loadManifest's actual cost at production scale (a
+// real manifest was observed at ~125,000 paths) -- run with
+// `go test -bench LoadManifest_AtScale -benchtime 1x ./internal/gocache`.
+func BenchmarkLoadManifest_AtScale(b *testing.B) {
+	dir := b.TempDir()
+
+	store, err := NewStore(dir)
+	require.NoError(b, err)
+
+	const total = 100_000
+	paths := make([]string, total)
+	for i := range total {
+		path := fmt.Sprintf("ab/entry-%d", i)
+		saveItemForTest(b, store, Request{}, path, fmt.Sprintf("payload-%d", i))
+		paths[i] = path
+	}
+
+	manifestPath, err := store.commitManifestPath("commit123", "")
+	require.NoError(b, err)
+	require.NoError(b, store.writeManifest(manifestPath, joinManifestBody(paths)))
+
+	for b.Loop() {
+		_, _, err := store.loadManifest(manifestPath)
+		require.NoError(b, err)
+	}
 }
 
 // TestStoreRestore_SurvivesSelfHealWriteFailure covers a disk-full-on-the-remote scenario: pruning
@@ -300,15 +401,15 @@ func TestStoreRestore_SkipsAndRemovesTruncatedPlainFileEntry(t *testing.T) {
 	require.Equal(t, []string{"cd/cache-entry-b"}, restored)
 }
 
-func saveItemForTest(t *testing.T, store *Store, req Request, path, body string) {
-	t.Helper()
+func saveItemForTest(tb testing.TB, store *Store, req Request, path, body string) {
+	tb.Helper()
 
 	item := FileItem{Path: path, Size: int64(len(body)), WireSize: int64(len(body))}
 	item.SetBodyReader(func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader([]byte(body))), nil
 	})
 
-	require.NoError(t, store.Save(req, Batch{Items: []FileItem{item}}))
+	require.NoError(tb, store.Save(req, Batch{Items: []FileItem{item}}))
 }
 
 // saveItemsForTest bulk-saves paths via SaveItem, then merges them into req's manifest in one
