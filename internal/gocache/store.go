@@ -117,14 +117,18 @@ type Store struct {
 	currentDiskBytes  int64
 	evictionScheduled bool
 
-	// manifestMu serializes every manifest read-modify-write (mergeManifest, and the self-heal
-	// write-back in restorePaths/loadDefaultManifestPaths): without it, two concurrent requests
-	// touching the same manifest (e.g. two matrix jobs of the same commit finishing at nearly the
-	// same time) can each read, then write back based on their own stale read -- the second
-	// write silently discards whatever the first one added. Separate from mu, which guards the
-	// in-memory index: manifest work does file I/O and would otherwise hold that lock for far
-	// longer than the hot object-put path can afford.
-	manifestMu sync.Mutex
+	// manifestLocksMu/manifestLocks back lockManifestPath: a mutex per manifest path (not one
+	// global mutex) serializing every manifest read-modify-write (mergeManifest, and the
+	// self-heal write-back in restorePaths/loadDefaultManifestPaths). Without per-path locking,
+	// two concurrent requests touching the same manifest (e.g. two matrix jobs of the same
+	// commit finishing at nearly the same time) can each read, then write back based on their
+	// own stale read -- the second write silently discards whatever the first one added. A
+	// single global mutex would also fix that, but at the cost of serializing every unrelated
+	// manifest (different commits, build types, repos) against every other one -- restore-cache
+	// resolves its response before sending any header (see Handler.RestoreCache), so contention
+	// here directly risks a client's response-header timeout, not just added latency.
+	manifestLocksMu sync.Mutex
+	manifestLocks   map[string]*sync.Mutex
 
 	// pool packs small records (see recordpool.Pool) instead of one file per object, once a
 	// given size has demonstrably earned it. Rebuilt from s.index and its own directory at
@@ -223,6 +227,7 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 		evictionDelay:  5 * time.Minute,
 		evictionBucket: time.Hour,
 		index:          make(map[string]indexEntry),
+		manifestLocks:  make(map[string]*sync.Mutex),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -1372,21 +1377,31 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 	matched := map[string]struct{}{}
 
 	for _, candidate := range []struct {
-		name string
-		load func() ([]string, bool, string, error)
+		name        string
+		resolvePath func() (string, error)
 	}{
-		{name: "commit", load: func() ([]string, bool, string, error) { return s.loadCommitManifest(req.Commit, req.BuildType) }},
-		{name: "parent", load: func() ([]string, bool, string, error) { return s.loadCommitManifest(req.ParentCommit, req.BuildType) }},
-		{name: "changes", load: func() ([]string, bool, string, error) { return s.loadChangesManifest(req.ChangesID, req.BuildType) }},
-		{name: "base", load: func() ([]string, bool, string, error) { return s.loadCommitManifest(req.BaseCommit, req.BuildType) }},
+		{name: "commit", resolvePath: func() (string, error) { return s.resolveCommitManifestPath(req.Commit, req.BuildType) }},
+		{name: "parent", resolvePath: func() (string, error) { return s.resolveCommitManifestPath(req.ParentCommit, req.BuildType) }},
+		{name: "changes", resolvePath: func() (string, error) { return s.resolveChangesManifestPath(req.ChangesID, req.BuildType) }},
+		{name: "base", resolvePath: func() (string, error) { return s.resolveCommitManifestPath(req.BaseCommit, req.BuildType) }},
 	} {
-		// Locked end to end (see manifestMu's doc comment): the self-heal write below must land
-		// based on exactly what this load just read, or it can race a concurrent mergeManifest
-		// (e.g. a sibling matrix job's finalize) and silently discard whatever it just added.
-		s.manifestMu.Lock()
-		paths, changed, manifestPath, err := candidate.load()
+		manifestPath, err := candidate.resolvePath()
 		if err != nil {
-			s.manifestMu.Unlock()
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, nil, err
+		}
+
+		// Locked per manifest path (see manifestLocks' doc comment), not globally -- the
+		// self-heal write below must land based on exactly what this read just saw, or it can
+		// race a concurrent mergeManifest (e.g. a sibling matrix job's finalize) and silently
+		// discard whatever it just added, but that only requires serializing against whoever
+		// else touches this exact manifest, not every other session on the server.
+		unlock := s.lockManifestPath(manifestPath)
+		paths, changed, err := s.loadManifest(manifestPath)
+		if err != nil {
+			unlock()
 			if os.IsNotExist(err) {
 				continue
 			}
@@ -1400,7 +1415,7 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", manifestPath, err.Error())
 			}
 		}
-		s.manifestMu.Unlock()
+		unlock()
 		matched[manifestPath] = struct{}{}
 		sources = append(sources, candidate.name)
 		for _, relPath := range paths {
@@ -1443,8 +1458,13 @@ func (s *Store) restorePaths(req Request) ([]string, []string, error) {
 // "newest" the moment it's touched, even though it's nowhere near representative of a healthy
 // cache for this build type, once many PRs/branches share one build type). Unioning a handful
 // smooths that out, while staying bounded -- this is always freshly recomputed from whichever
-// manifests currently exist, never a persisted, ever-growing set.
-const defaultManifestSampleSize = 5
+// manifests currently exist, never a persisted, ever-growing set. Kept small (rather than, say,
+// 5): a commit/changes manifest's own finalize includes everything restored alongside what's
+// newly touched (see native.SaveFreshNativeCache), so each individual manifest is far more
+// complete on its own than it used to be, and fewer of them need unioning to be representative --
+// each fewer sample is also one fewer manifest read (and per-path lock, see lockManifestPath) on
+// restorePaths' response-header-blocking path.
+const defaultManifestSampleSize = 2
 
 // isPRManifestPath reports whether path is a changes (PR) manifest rather than a commit one, by
 // checking whether it lives under scopeRoot's "changes" subdirectory (see changesManifestPath).
@@ -1618,11 +1638,11 @@ func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]st
 	seen := map[string]struct{}{}
 	var result []string
 	for _, c := range candidates {
-		// Locked end to end -- see the identical reasoning in restorePaths.
-		s.manifestMu.Lock()
+		// Locked per manifest path, not globally -- see the identical reasoning in restorePaths.
+		unlock := s.lockManifestPath(c.path)
 		paths, changed, err := s.loadManifest(c.path)
 		if err != nil {
-			s.manifestMu.Unlock()
+			unlock()
 			return nil, err
 		}
 		if changed {
@@ -1631,7 +1651,7 @@ func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]st
 				log.Printf("restore-cache: self-heal manifest %s: %s; serving in-memory result", c.path, err.Error())
 			}
 		}
-		s.manifestMu.Unlock()
+		unlock()
 		for _, p := range paths {
 			if _, ok := seen[p]; ok {
 				continue
@@ -1644,30 +1664,23 @@ func (s *Store) loadDefaultManifestPaths(buildType string, exclude map[string]st
 	return result, nil
 }
 
-func (s *Store) loadCommitManifest(commit string, buildType string) ([]string, bool, string, error) {
+// resolveCommitManifestPath resolves commit/buildType's manifest path without reading it, or
+// returns os.ErrNotExist if commit is blank -- split out from what used to be loadCommitManifest
+// so restorePaths can take out the correct per-manifest lock (see lockManifestPath) before ever
+// touching the file, instead of locking before it even knows which path it needs.
+func (s *Store) resolveCommitManifestPath(commit, buildType string) (string, error) {
 	if strings.TrimSpace(commit) == "" {
-		return nil, false, "", os.ErrNotExist
+		return "", os.ErrNotExist
 	}
-	manifestPath, err := s.commitManifestPath(commit, buildType)
-	if err != nil {
-		return nil, false, "", err
-	}
-
-	paths, changed, err := s.loadManifest(manifestPath)
-	return paths, changed, manifestPath, err
+	return s.commitManifestPath(commit, buildType)
 }
 
-func (s *Store) loadChangesManifest(changesID string, buildType string) ([]string, bool, string, error) {
+// resolveChangesManifestPath is resolveCommitManifestPath's changes-id counterpart.
+func (s *Store) resolveChangesManifestPath(changesID, buildType string) (string, error) {
 	if strings.TrimSpace(changesID) == "" {
-		return nil, false, "", os.ErrNotExist
+		return "", os.ErrNotExist
 	}
-	manifestPath, err := s.changesManifestPath(changesID, buildType)
-	if err != nil {
-		return nil, false, "", err
-	}
-
-	paths, changed, err := s.loadManifest(manifestPath)
-	return paths, changed, manifestPath, err
+	return s.changesManifestPath(changesID, buildType)
 }
 
 // loadManifest reads and self-heals a manifest at an exact path, transparently decompressing
@@ -2444,12 +2457,31 @@ func unionManifestPaths(lists ...[]string) []string {
 	return merged
 }
 
+// lockManifestPath returns an unlock function for the mutex guarding manifestPath specifically
+// (see manifestLocks' doc comment), lazily creating it on first use. Never removed afterward --
+// manifest paths are bounded by distinct commits/changes-ids/build-types ever seen, so the
+// leaked *sync.Mutex per path (not the manifest file itself, which manifestMaxAge still prunes
+// normally) stays a small, fixed cost not worth the extra complexity of reference-counted
+// cleanup.
+func (s *Store) lockManifestPath(manifestPath string) func() {
+	s.manifestLocksMu.Lock()
+	l, ok := s.manifestLocks[manifestPath]
+	if !ok {
+		l = &sync.Mutex{}
+		s.manifestLocks[manifestPath] = l
+	}
+	s.manifestLocksMu.Unlock()
+
+	l.Lock()
+	return l.Unlock
+}
+
 // mergeManifest merges paths into manifestPath's existing content and writes the result back.
-// Locked end to end (see manifestMu's doc comment): reading, then writing back a merge of that
+// Locked end to end (see manifestLocks' doc comment): reading, then writing back a merge of that
 // exact read, is only safe if nothing else can write manifestPath in between.
 func (s *Store) mergeManifest(manifestPath string, paths []string) error {
-	s.manifestMu.Lock()
-	defer s.manifestMu.Unlock()
+	unlock := s.lockManifestPath(manifestPath)
+	defer unlock()
 
 	existing, _, err := s.loadManifest(manifestPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -2518,17 +2550,28 @@ func ReadJobStartMarker(cacheDir string) (time.Time, error) {
 	return time.Unix(0, nanos).UTC(), nil
 }
 
-func CollectFreshFiles(cacheDir string, maxFileSize int64) (Batch, error) {
+// SkippedLargeFiles summarizes local files CollectFilesToSave excluded purely for exceeding
+// maxFileSize, so a caller can report on them (see native.SaveFreshNativeCache) instead of the
+// exclusion being invisible -- unlike a path skipped for being already-restored or server-known,
+// an oversized file never even gets a chance to be considered, which otherwise looks identical
+// in the numbers to there being nothing new to save.
+type SkippedLargeFiles struct {
+	Count int
+	Bytes int64
+}
+
+func CollectFreshFiles(cacheDir string, maxFileSize int64) (Batch, SkippedLargeFiles, error) {
 	restoredPaths, err := ReadRestoredPaths(cacheDir)
 	if err != nil && !os.IsNotExist(err) {
-		return Batch{}, err
+		return Batch{}, SkippedLargeFiles{}, err
 	}
 
 	return CollectFilesToSave(cacheDir, restoredPaths, maxFileSize)
 }
 
-func CollectFilesToSave(cacheDir string, restoredPaths map[string]struct{}, maxFileSize int64) (Batch, error) {
+func CollectFilesToSave(cacheDir string, restoredPaths map[string]struct{}, maxFileSize int64) (Batch, SkippedLargeFiles, error) {
 	batch := Batch{}
+	var skippedLarge SkippedLargeFiles
 
 	err := filepath.WalkDir(cacheDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -2552,6 +2595,8 @@ func CollectFilesToSave(cacheDir string, restoredPaths map[string]struct{}, maxF
 			return nil
 		}
 		if maxFileSize > 0 && info.Size() > maxFileSize {
+			skippedLarge.Count++
+			skippedLarge.Bytes += info.Size()
 			return nil
 		}
 		relPath, err := filepath.Rel(cacheDir, path)
@@ -2579,10 +2624,10 @@ func CollectFilesToSave(cacheDir string, restoredPaths map[string]struct{}, maxF
 		return nil
 	})
 	if err != nil {
-		return Batch{}, err
+		return Batch{}, SkippedLargeFiles{}, err
 	}
 
-	return batch, nil
+	return batch, skippedLarge, nil
 }
 
 func RestoreToDir(cacheDir string, item FileItem, body io.Reader) error {

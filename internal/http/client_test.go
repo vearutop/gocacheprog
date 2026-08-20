@@ -181,7 +181,7 @@ func TestClient_SaveAndRestoreNativeGOCACHE(t *testing.T) {
 	require.NoError(t, os.WriteFile(targetPath, []byte("native-cache-payload"), 0o600))
 	require.NoError(t, os.Chtimes(targetPath, now, now))
 
-	batch, err := gocache.CollectFreshFiles(cacheDir, 0)
+	batch, _, err := gocache.CollectFreshFiles(cacheDir, 0)
 	require.NoError(t, err)
 	require.Len(t, batch.Items, 1)
 
@@ -231,7 +231,7 @@ func TestClient_SaveCache_ChunksAndFinalizes(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "b"), []byte(strings.Repeat("b", 40)), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "c"), []byte(strings.Repeat("c", 40)), 0o600))
 
-	batch, err := gocache.CollectFreshFiles(cacheDir, 0)
+	batch, _, err := gocache.CollectFreshFiles(cacheDir, 0)
 	require.NoError(t, err)
 	require.Len(t, batch.Items, 3)
 
@@ -269,7 +269,7 @@ func TestClient_SaveCache_SkipsFilesExceedingServerMaxFileBytesWithoutClientFlag
 
 	// Client collects files with no local -max-file-bytes filtering (0, matching real CI usage),
 	// relying entirely on the server-advertised limit learned during save-cache-start.
-	batch, err := gocache.CollectFreshFiles(cacheDir, 0)
+	batch, _, err := gocache.CollectFreshFiles(cacheDir, 0)
 	require.NoError(t, err)
 	require.Len(t, batch.Items, 2)
 

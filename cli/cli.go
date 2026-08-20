@@ -304,7 +304,7 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallback
 		FallbackAuthToken: fallbackAuthToken,
 		MaxDiskBytes:      maxDiskBytes,
 		PreloadLimit:      preloadLimit,
-		SessionsCSVPath:   filepath.Join(dir, "sessions.csv"),
+		SessionsJSONLPath: filepath.Join(dir, "sessions.jsonl"),
 	})
 }
 

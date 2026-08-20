@@ -1,14 +1,14 @@
 package http_test
 
 import (
+	"bufio"
 	"bytes"
-	"encoding/csv"
+	"encoding/json"
 	"io"
 	nethttp "net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -18,23 +18,43 @@ import (
 	"github.com/vearutop/gocacheprog/internal/local"
 )
 
-// TestSessionsCSV_RecordsStartedAndDoneEvents covers the actual point of sessions.csv: a row
+// readJSONLRecords parses path as newline-delimited JSON objects, one map per line.
+func readJSONLRecords(t *testing.T, path string) []map[string]any {
+	t.Helper()
+
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, f.Close()) }()
+
+	var records []map[string]any
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var record map[string]any
+		require.NoError(t, json.Unmarshal(scanner.Bytes(), &record))
+		records = append(records, record)
+	}
+	require.NoError(t, scanner.Err())
+
+	return records
+}
+
+// TestSessionsJSONL_RecordsStartedAndDoneEvents covers the actual point of sessions.jsonl: a line
 // appended on session start and another on session done, surviving as a flat file an operator
 // can pull down and analyze later -- not just the in-memory status-page view, which resets on
 // restart.
-func TestSessionsCSV_RecordsStartedAndDoneEvents(t *testing.T) {
+func TestSessionsJSONL_RecordsStartedAndDoneEvents(t *testing.T) {
 	dir := t.TempDir()
-	csvPath := filepath.Join(dir, "sessions.csv")
+	jsonlPath := filepath.Join(dir, "sessions.jsonl")
 
 	localStore, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
 
-	h := http.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, http.WithSessionsCSV(csvPath))
+	h := http.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, http.WithSessionsJSONL(jsonlPath))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
 	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{
-		SessionID: "session-csv-1",
+		SessionID: "session-jsonl-1",
 		Params:    local.ProxyParams{ChangesID: "acme/widgets#1", BuildType: "unit"},
 	})
 	require.NoError(t, err)
@@ -46,57 +66,41 @@ func TestSessionsCSV_RecordsStartedAndDoneEvents(t *testing.T) {
 	require.NoError(t, client.Put(cache.Response{Items: []cache.ResponseItem{item}}))
 	require.NoError(t, client.MarkSessionDone())
 
-	f, err := os.Open(csvPath)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, f.Close()) }()
+	records := readJSONLRecords(t, jsonlPath)
+	require.Len(t, records, 2, "started + done, got: %v", records)
 
-	rows, err := csv.NewReader(f).ReadAll()
-	require.NoError(t, err)
-	require.Len(t, rows, 3, "header + started + done, got: %v", rows)
+	started, done := records[0], records[1]
+	require.Equal(t, "started", started["event"])
+	require.Equal(t, "session-jsonl-1", started["session_id"])
+	require.Equal(t, "acme/widgets#1", started["ref"])
+	require.Equal(t, "unit", started["build_type"])
 
-	header := rows[0]
-	col := func(row []string, name string) string {
-		for i, h := range header {
-			if h == name {
-				return row[i]
-			}
-		}
-		t.Fatalf("column %q not found in header %v", name, header)
-		return ""
-	}
+	require.Equal(t, "done", done["event"])
+	require.Equal(t, "session-jsonl-1", done["session_id"])
+	require.Equal(t, "done", done["status"])
 
-	started, done := rows[1], rows[2]
-	require.Equal(t, "started", col(started, "event"))
-	require.Equal(t, "session-csv-1", col(started, "session_id"))
-	require.Equal(t, "acme/widgets#1", col(started, "ref"))
-	require.Equal(t, "unit", col(started, "build_type"))
-
-	require.Equal(t, "done", col(done, "event"))
-	require.Equal(t, "session-csv-1", col(done, "session_id"))
-	require.Equal(t, "done", col(done, "status"))
-
-	// Plain units, not human-formatted strings: int unix timestamps and fractional seconds, so
-	// a spreadsheet or analysis script can treat every numeric column as a plain number.
-	_, err = strconv.ParseInt(col(started, "timestamp"), 10, 64)
-	require.NoError(t, err, "timestamp should be a plain unix timestamp")
-	_, err = strconv.ParseInt(col(started, "started_at"), 10, 64)
-	require.NoError(t, err, "started_at should be a plain unix timestamp")
-	_, err = strconv.ParseFloat(col(done, "session_time_s"), 64)
-	require.NoError(t, err, "session_time_s should be a plain number of seconds")
-	_, err = strconv.ParseFloat(col(done, "preload_time_s"), 64)
-	require.NoError(t, err, "preload_time_s should be a plain number of seconds")
-	_, err = strconv.ParseFloat(col(done, "finalize_time_s"), 64)
-	require.NoError(t, err, "finalize_time_s should be a plain number of seconds")
-	_, err = strconv.ParseInt(col(done, "preload_bytes"), 10, 64)
-	require.NoError(t, err, "preload_bytes should be a plain byte count")
+	// Plain JSON numbers, not human-formatted strings: unix timestamps and fractional seconds,
+	// so an analysis script can treat every numeric field as a plain number without parsing.
+	_, ok := started["timestamp"].(float64)
+	require.True(t, ok, "timestamp should be a plain unix timestamp, got: %v", started["timestamp"])
+	_, ok = started["started_at"].(float64)
+	require.True(t, ok, "started_at should be a plain unix timestamp, got: %v", started["started_at"])
+	_, ok = done["session_time_s"].(float64)
+	require.True(t, ok, "session_time_s should be a plain number of seconds, got: %v", done["session_time_s"])
+	_, ok = done["preload_time_s"].(float64)
+	require.True(t, ok, "preload_time_s should be a plain number of seconds, got: %v", done["preload_time_s"])
+	_, ok = done["finalize_time_s"].(float64)
+	require.True(t, ok, "finalize_time_s should be a plain number of seconds, got: %v", done["finalize_time_s"])
+	_, ok = done["preload_bytes"].(float64)
+	require.True(t, ok, "preload_bytes should be a plain byte count, got: %v", done["preload_bytes"])
 }
 
-// TestSessionsCSV_SurvivesAcrossHandlerRestarts covers the "survives restarts" requirement: a
+// TestSessionsJSONL_SurvivesAcrossHandlerRestarts covers the "survives restarts" requirement: a
 // second Handler pointed at the same path must append after what an earlier one already wrote,
 // never truncating it.
-func TestSessionsCSV_SurvivesAcrossHandlerRestarts(t *testing.T) {
+func TestSessionsJSONL_SurvivesAcrossHandlerRestarts(t *testing.T) {
 	dir := t.TempDir()
-	csvPath := filepath.Join(dir, "sessions.csv")
+	jsonlPath := filepath.Join(dir, "sessions.jsonl")
 
 	localStore, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
@@ -104,37 +108,34 @@ func TestSessionsCSV_SurvivesAcrossHandlerRestarts(t *testing.T) {
 	firstStoreDir := t.TempDir()
 	firstStore, err := local.NewStore(firstStoreDir)
 	require.NoError(t, err)
-	h1 := http.NewHandlerWithPreloadLimit(firstStore, nil, "", "", 2, http.WithSessionsCSV(csvPath))
+	h1 := http.NewHandlerWithPreloadLimit(firstStore, nil, "", "", 2, http.WithSessionsJSONL(jsonlPath))
 	srv1 := httptest.NewServer(h1)
 	client1, err := http.NewClientWithSession(srv1.URL, "", &http.SessionInfo{SessionID: "session-a"})
 	require.NoError(t, err)
 	require.NoError(t, client1.MarkSessionDone())
 	srv1.Close()
 
-	// A brand new Handler/server, same csvPath -- simulating a process restart.
-	h2 := http.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, http.WithSessionsCSV(csvPath))
+	// A brand new Handler/server, same jsonlPath -- simulating a process restart.
+	h2 := http.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, http.WithSessionsJSONL(jsonlPath))
 	srv2 := httptest.NewServer(h2)
 	t.Cleanup(srv2.Close)
 	client2, err := http.NewClientWithSession(srv2.URL, "", &http.SessionInfo{SessionID: "session-b"})
 	require.NoError(t, err)
 	require.NoError(t, client2.MarkSessionDone())
 
-	f, err := os.Open(csvPath)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, f.Close()) }()
-
-	rows, err := csv.NewReader(f).ReadAll()
-	require.NoError(t, err)
+	records := readJSONLRecords(t, jsonlPath)
 
 	var sessionIDs []string
-	for _, row := range rows[1:] {
-		sessionIDs = append(sessionIDs, row[2])
+	for _, record := range records {
+		sid, ok := record["session_id"].(string)
+		require.True(t, ok)
+		sessionIDs = append(sessionIDs, sid)
 	}
 	require.Contains(t, sessionIDs, "session-a", "rows from before the restart must survive")
 	require.Contains(t, sessionIDs, "session-b")
 }
 
-func TestSessionsCSV_DisabledByDefault(t *testing.T) {
+func TestSessionsJSONL_DisabledByDefault(t *testing.T) {
 	localStore, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
 
@@ -142,20 +143,20 @@ func TestSessionsCSV_DisabledByDefault(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	res, err := nethttp.Get(srv.URL + "/sessions.csv")
+	res, err := nethttp.Get(srv.URL + "/sessions.jsonl")
 	require.NoError(t, err)
 	defer func() { require.NoError(t, res.Body.Close()) }()
 	require.Equal(t, nethttp.StatusNotFound, res.StatusCode)
 }
 
-func TestSessionsCSV_DownloadRequiresBasicAuth(t *testing.T) {
+func TestSessionsJSONL_DownloadRequiresBasicAuth(t *testing.T) {
 	dir := t.TempDir()
-	csvPath := filepath.Join(dir, "sessions.csv")
+	jsonlPath := filepath.Join(dir, "sessions.jsonl")
 
 	localStore, err := local.NewStore(t.TempDir())
 	require.NoError(t, err)
 
-	h := http.NewHandlerWithPreloadLimit(localStore, nil, "secret-token", "", 2, http.WithSessionsCSV(csvPath))
+	h := http.NewHandlerWithPreloadLimit(localStore, nil, "secret-token", "", 2, http.WithSessionsJSONL(jsonlPath))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -163,7 +164,7 @@ func TestSessionsCSV_DownloadRequiresBasicAuth(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, client.MarkSessionDone())
 
-	req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/sessions.csv", nil)
+	req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/sessions.jsonl", nil)
 	require.NoError(t, err)
 	res, err := nethttp.DefaultClient.Do(req)
 	require.NoError(t, err)

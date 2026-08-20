@@ -404,7 +404,7 @@ Interpretation:
 - `base`
   - fallback relevance from target branch state
 - `default`
-  - a broader source, not a single manifest: the union of up to 5 of this `build-type`'s most
+  - a broader source, not a single manifest: the union of up to 2 of this `build-type`'s most
     representative manifests, ranked trunk (non-PR) manifests first and by recency as the
     tiebreaker within each group. A trunk push's commit manifest is a one-shot, comprehensive
     snapshot of everything that `build-type` needed; a PR's `changes` manifest only ever reflects
@@ -605,14 +605,16 @@ cleanup now" button on the page triggers an immediate eviction pass without wait
 request.
 
 If `-cache-dir` is set (server mode always sets one), every session-start and session-done event
-also appends a row to `<cache-dir>/sessions.csv` — plain-unit columns (unix timestamps, seconds,
-bytes) meant for pulling down and analyzing cache performance over time, not just eyeballing the
-live status page. The file is opened, appended to, and closed for each single row, so it's never
-held open, survives server restarts, and grows indefinitely with no rotation. Download it (same
-Basic Auth as the status page) via:
+also appends a line to `<cache-dir>/sessions.jsonl` — one JSON object per line, plain-unit fields
+(unix timestamps, seconds, bytes) meant for pulling down and analyzing cache performance over
+time, not just eyeballing the live status page. Unlike a fixed-column format, adding a new field
+later needs no coordination with old lines or existing readers — each line is self-describing.
+The file is opened, appended to, and closed for each single line, so it's never held open,
+survives server restarts, and grows indefinitely with no rotation. Download it (same Basic Auth
+as the status page) via:
 
 ```bash
-curl -u "x:secret-token" https://cache.example.com/sessions.csv -o sessions.csv
+curl -u "x:secret-token" https://cache.example.com/sessions.jsonl -o sessions.jsonl
 ```
 
 ## Authentication
@@ -718,16 +720,17 @@ It returns JSON with:
 - `runtime`
   - heap in use
 
-### `/sessions.csv`
+### `/sessions.jsonl`
 
 Basic-Auth-gated (same as the status page, not the Bearer token the endpoints above need) raw
-download of the CSV history behind the status page's client sessions table — one row per session
-start and per session done, plain-unit columns (unix timestamps, seconds, bytes) meant for pulling
-down and analyzing cache performance over time rather than just eyeballing the live page. See
-[Status page](#status-page) for the column list and persistence details.
+download of the JSONL history behind the status page's client sessions table — one JSON object
+per line, per session start and per session done, plain-unit fields (unix timestamps, seconds,
+bytes) meant for pulling down and analyzing cache performance over time rather than just
+eyeballing the live page. See [Status page](#status-page) for the field list and persistence
+details.
 
 ```bash
-curl -u "x:secret-token" https://cache.example.com/sessions.csv -o sessions.csv
+curl -u "x:secret-token" https://cache.example.com/sessions.jsonl -o sessions.jsonl
 ```
 
 ### Native cache admin endpoints

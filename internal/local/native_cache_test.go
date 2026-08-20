@@ -1,13 +1,46 @@
 package local
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vearutop/gocacheprog/internal/gocache"
 )
+
+// TestLogSaveCacheSkips covers all four combinations logSaveCacheSkips can see: neither category
+// skipped anything (silent, no log line at all), only the already-on-server skip, only the
+// large-file skip, and both at once landing on the same line -- the actual point of this
+// function, since either skip category alone looks identical to "there was nothing new to save"
+// without it.
+func TestLogSaveCacheSkips(t *testing.T) {
+	capture := func(f func()) string {
+		var buf bytes.Buffer
+		origOutput := log.Writer()
+		log.SetOutput(&buf)
+		defer log.SetOutput(origOutput)
+
+		f()
+		return buf.String()
+	}
+
+	require.Empty(t, capture(func() { logSaveCacheSkips(0, 10, gocache.SkippedLargeFiles{}) }), "neither skip category should log anything")
+
+	out := capture(func() { logSaveCacheSkips(3, 10, gocache.SkippedLargeFiles{}) })
+	require.Contains(t, out, "skipping 3/10 objects the server already has")
+	require.NotContains(t, out, "large objects")
+
+	out = capture(func() { logSaveCacheSkips(0, 10, gocache.SkippedLargeFiles{Count: 2, Bytes: 5 * 1024 * 1024}) })
+	require.NotContains(t, out, "already has")
+	require.Contains(t, out, "2 large objects (5.0 MiB total) excluded")
+
+	out = capture(func() { logSaveCacheSkips(3, 10, gocache.SkippedLargeFiles{Count: 2, Bytes: 5 * 1024 * 1024}) })
+	require.Contains(t, out, "skipping 3/10 objects the server already has, 2 large objects (5.0 MiB total) excluded", "both categories must land on the same line")
+}
 
 func TestHumanBytesPerSecondBinary(t *testing.T) {
 	require.Equal(t, "0 B/s", humanBytesPerSecondBinary(0, time.Second))

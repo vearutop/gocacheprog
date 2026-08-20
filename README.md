@@ -44,7 +44,7 @@ rm linux_amd64.tar.gz
 
 See [ADVANCED.md](ADVANCED.md#self-hosting-the-server) for running the server via Docker/Docker
 Compose, disk-budget eviction, manifest retirement, native `GOCACHE` storage quotas, and
-observability endpoints (`/status`, `/inspect`, `/clear`, `/sessions.csv`).
+observability endpoints (`/status`, `/inspect`, `/clear`, `/sessions.jsonl`).
 
 ## Quick Start
 

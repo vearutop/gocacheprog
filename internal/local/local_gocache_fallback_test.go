@@ -1,7 +1,9 @@
 package local
 
 import (
+	"bytes"
 	"io"
+	"log"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -142,6 +144,33 @@ func TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas(t *testing.T) {
 	require.Contains(t, string(commitBody), "cd/genuinely-new\n")
 }
 
+// TestSaveFreshNativeCache_LogsSkippedLargeFiles covers the actual reported gap: a file excluded
+// for exceeding -max-file-bytes is dropped before it's even considered a save candidate
+// (CollectFilesToSave), so it never showed up anywhere in the logs -- looking identical to
+// "there was nothing new to save" even though real content was silently left uncached. The log
+// line must call out both how many objects were excluded this way and their total size.
+func TestSaveFreshNativeCache_LogsSkippedLargeFiles(t *testing.T) {
+	srv := newFallbackTestServer(t)
+	client, err := cachehttp.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	cacheDir := t.TempDir()
+	writeCacheFile(t, cacheDir, "ab/small", "ok", time.Now())
+	writeCacheFile(t, cacheDir, "cd/too-big", strings.Repeat("x", 100), time.Now())
+
+	var buf bytes.Buffer
+	origOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOutput)
+
+	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
+	stats, err := SaveFreshNativeCache(cacheDir, client, req, 10, time.Time{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Files, "only the file within -max-file-bytes should be uploaded")
+
+	require.Contains(t, buf.String(), "1 large objects (100 B total) excluded")
+}
+
 // TestSaveFreshNativeCache_ManifestIncludesRestoredPathsNotJustNewOnes covers a real production
 // incident: a job restores N files from "changes"/"base"/"default" (nothing to do with this
 // exact commit yet), then its build only adds a handful of genuinely new ones -- but the
@@ -201,7 +230,7 @@ func TestInitLocalGocacheMode_FallbackRemoteRestoresWhenCold(t *testing.T) {
 
 	seedDir := t.TempDir()
 	writeCacheFile(t, seedDir, "ab/seed", "preexisting remote content", time.Now())
-	seedBatch, err := gocache.CollectFreshFiles(seedDir, 0)
+	seedBatch, _, err := gocache.CollectFreshFiles(seedDir, 0)
 	require.NoError(t, err)
 
 	req := gocache.Request{Commit: "commit123", BuildType: "owner-repo-unit"}
