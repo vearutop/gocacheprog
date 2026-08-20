@@ -1724,10 +1724,7 @@ func (s *Store) loadManifest(manifestPath string) ([]string, bool, error) {
 		}
 		seen[relPath] = struct{}{}
 
-		s.mu.Lock()
-		live := s.objectExistsLocked(relPath)
-		s.mu.Unlock()
-		if !live {
+		if !s.objectExists(relPath) {
 			changed = true
 			continue
 		}
@@ -1740,6 +1737,30 @@ func (s *Store) loadManifest(manifestPath string) ([]string, bool, error) {
 	}
 
 	return res, changed, nil
+}
+
+// objectExists is objectExistsLocked's unlocked counterpart, for a caller that doesn't already
+// hold s.mu: it takes the lock only around the index map lookup, not around the os.Stat syscall
+// that follows for a non-pool entry. loadManifest calls this once per line, so for a large
+// manifest (tens of thousands of paths is routine in production) holding s.mu for the full
+// lookup+stat -- as objectExistsLocked does -- would serialize that many syscalls against every
+// other request needing s.mu (every SaveItem, eviction, etc.) for however long each stat takes;
+// restorePaths resolves entirely before Handler.RestoreCache sends any response header, so that
+// contention risked a client's response-header timeout, not just added latency.
+func (s *Store) objectExists(relPath string) bool {
+	s.mu.Lock()
+	ie, ok := s.index[relPath]
+	s.mu.Unlock()
+
+	if !ok {
+		return false
+	}
+	if ie.PoolPage != 0 {
+		return true
+	}
+
+	_, err := os.Stat(s.objectPath(relPath))
+	return err == nil
 }
 
 func (s *Store) Close() error {
