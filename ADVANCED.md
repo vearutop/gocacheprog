@@ -310,6 +310,7 @@ How it works:
 - local restore preserves file contents and executable permission bits, but intentionally does not restore historical mtimes
 - `-max-file-bytes` can skip pathological large single cache files during both native restore and native save
 - `-restore-limit-bytes` caps total compressed native restore download after `-max-file-bytes` filtering; eligible files are ordered by timestamp descending, then size ascending, and only the leading prefix that fits is restored
+- the server can also set a default total-size budget per build type (see [Server settings](#server-settings) below), applied to both native `-restore-cache` and `GOCACHEPROG` `/preload` -- a client-supplied `-restore-limit-bytes` always takes precedence over it when present
 - restore writes local bookkeeping files so save can distinguish restored files from freshly created ones
 - save walks the local `GOCACHE` tree, skips files that were already restored in this job, skips helper bookkeeping files, compresses payloads client-side, and streams them to the server
 - the server stores compressed file objects and merges uploaded file paths into the relevant manifests; when the server also runs with `-max-file-bytes`, oversized objects are silently skipped on save and treated as misses on restore
@@ -772,6 +773,41 @@ Examples:
 - count and total size for files in the top 10% size band
 
 `/clear` removes matching manifests and deletes native cache objects only when they are no longer referenced by any remaining manifest.
+
+### Server settings
+
+`/settings/preload-limit-bytes` views or changes a per-build-type default total-size budget for
+preload/restore responses — the server-side counterpart to `-restore-limit-bytes`, for build
+types whose CI jobs don't (or can't) set a client-side limit of their own. Applied to both native
+`-restore-cache` and `GOCACHEPROG` `/preload`; a client-supplied `-restore-limit-bytes` always
+takes precedence over it when present (see [Native `GOCACHE` Batch Mode](#native-gocache-batch-mode) above). `/preload` has
+no client-side limit of its own at all today, so this is currently the only control over its
+total response size.
+
+`GET` returns the full current map of build type to byte budget as JSON:
+
+```bash
+curl -H "Authorization: Bearer secret-token" https://cache.example.com/settings/preload-limit-bytes
+```
+
+`POST` sets (or clears) one build type's budget — `bytes=0` (or omitting it) clears the override
+for that build type, matching the 0-means-disabled convention used everywhere else in this
+codebase:
+
+```bash
+curl -X POST -H "Authorization: Bearer secret-token" \
+  "https://cache.example.com/settings/preload-limit-bytes?build-type=owner-repo-unit&bytes=500000000"
+```
+
+Selection within the budget follows whichever mechanism already applies to that path — native
+`-restore-cache` orders by timestamp descending then size ascending (see above); `/preload`, with
+no existing client-side mechanism of its own to stay compatible with, simply drops the largest
+items first until what's left fits.
+
+Settings are held in memory and, if the server was started with a cache directory (server mode
+always sets one), persisted to `<cache-dir>/settings.json` on every change and reloaded from it
+once at startup — a change survives a restart. The file is a plain, open-ended JSON object, not
+specific to this one setting, so future server-side settings can land in it the same way.
 
 ### Integrity check endpoint
 

@@ -24,6 +24,12 @@ func (h *Handler) RestoreCache(rw http.ResponseWriter, r *http.Request) {
 
 	startedAt := time.Now()
 	req := parseGOCACHERequest(r)
+	if req.RestoreLimitBytes <= 0 {
+		// The client didn't ask for a budget of its own -- fall back to whatever the server has
+		// configured for this build type (see WithSettingsPath), if anything. A client-supplied
+		// value always wins when present; this is purely the default for when it isn't.
+		req.RestoreLimitBytes = h.preloadLimitBytesFor(req.BuildType)
+	}
 	sources, err := h.gocacheStore.RestoreSources(req)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)

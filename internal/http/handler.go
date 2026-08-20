@@ -39,6 +39,9 @@ type Handler struct {
 	lastPanicStack       string
 	lastPanicAt          time.Time
 	sessionsJSONLPath    string
+	settingsPath         string
+	settingsMu           sync.Mutex
+	settings             serverSettings
 }
 
 // HandlerOption configures optional Handler behavior not covered by NewHandlerWithPreloadLimit's
@@ -57,6 +60,14 @@ func WithMaxDiskBytes(n int64) HandlerOption {
 // Empty (the default) disables it.
 func WithSessionsJSONL(path string) HandlerOption {
 	return func(h *Handler) { h.sessionsJSONLPath = path }
+}
+
+// WithSettingsPath enables persisted, dynamically-updatable server settings (see serverSettings)
+// backed by path -- read once at startup, written on every change, surviving restarts. Empty
+// (the default) disables persistence only: settings can still be changed at runtime, they just
+// reset to defaults on the next restart since there's nowhere to write them.
+func WithSettingsPath(path string) HandlerOption {
+	return func(h *Handler) { h.settingsPath = path }
 }
 
 // clientSession tracks the most recent request seen from one client process (identified by its
@@ -127,6 +138,7 @@ func NewHandlerWithPreloadLimit(store cache.Store, gocacheStore *gocache.Store, 
 	for _, opt := range opts {
 		opt(h)
 	}
+	h.loadSettings()
 
 	return h
 }
@@ -398,24 +410,25 @@ func sessionRef(cs clientSession) string {
 // the same one-lookup dispatch) are the only paths with logic that doesn't fit a bare method
 // value; see serveVersion and serveSessionDone.
 var routes = map[string]func(*Handler, http.ResponseWriter, *http.Request){
-	"/version":             (*Handler).serveVersion,
-	"/status":              (*Handler).Status,
-	"/session-done":        (*Handler).serveSessionDone,
-	"/preload":             (*Handler).Preload,
-	"/cache-used":          (*Handler).CacheUsed,
-	"/restore-cache":       (*Handler).RestoreCache,
-	"/clear":               (*Handler).ClearCache,
-	"/inspect":             (*Handler).InspectCache,
-	"/integrity-check":     (*Handler).IntegrityCheck,
-	"/save-cache-has":      (*Handler).SaveCacheHas,
-	"/save-cache":          (*Handler).SaveCache,
-	"/save-cache-chunk":    (*Handler).SaveCacheChunk,
-	"/save-cache-start":    (*Handler).StartSaveCache,
-	"/save-cache-finalize": (*Handler).FinalizeSaveCache,
-	"/save-cache-abort":    (*Handler).AbortSaveCache,
-	"/put":                 (*Handler).Put,
-	"/get":                 (*Handler).Get,
-	"/head":                (*Handler).Head,
+	"/version":                      (*Handler).serveVersion,
+	"/status":                       (*Handler).Status,
+	"/session-done":                 (*Handler).serveSessionDone,
+	"/preload":                      (*Handler).Preload,
+	"/cache-used":                   (*Handler).CacheUsed,
+	"/restore-cache":                (*Handler).RestoreCache,
+	"/clear":                        (*Handler).ClearCache,
+	"/inspect":                      (*Handler).InspectCache,
+	"/integrity-check":              (*Handler).IntegrityCheck,
+	"/save-cache-has":               (*Handler).SaveCacheHas,
+	"/save-cache":                   (*Handler).SaveCache,
+	"/save-cache-chunk":             (*Handler).SaveCacheChunk,
+	"/save-cache-start":             (*Handler).StartSaveCache,
+	"/save-cache-finalize":          (*Handler).FinalizeSaveCache,
+	"/save-cache-abort":             (*Handler).AbortSaveCache,
+	"/put":                          (*Handler).Put,
+	"/get":                          (*Handler).Get,
+	"/head":                         (*Handler).Head,
+	"/settings/preload-limit-bytes": (*Handler).PreloadLimitBytesSettings,
 }
 
 func (h *Handler) serveVersion(rw http.ResponseWriter, r *http.Request) {

@@ -35,11 +35,12 @@ type ServerConfig struct {
 	MaxDiskBytes      int64
 	PreloadLimit      int
 	SessionsJSONLPath string
+	SettingsPath      string
 }
 
 func RunServer(cfg ServerConfig) error {
 	h := cachehttp.NewHandlerWithPreloadLimit(cfg.Store, cfg.NativeStore, cfg.AuthToken, cfg.FallbackAuthToken, cfg.PreloadLimit,
-		cachehttp.WithMaxDiskBytes(cfg.MaxDiskBytes), cachehttp.WithSessionsJSONL(cfg.SessionsJSONLPath))
+		cachehttp.WithMaxDiskBytes(cfg.MaxDiskBytes), cachehttp.WithSessionsJSONL(cfg.SessionsJSONLPath), cachehttp.WithSettingsPath(cfg.SettingsPath))
 	printStats := func() {
 		cfg.Store.PrintStats()
 		cfg.NativeStore.PrintStats()
