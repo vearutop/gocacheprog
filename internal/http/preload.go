@@ -98,6 +98,11 @@ func (h *Handler) Preload(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// This path has no client-supplied total-size budget of its own (unlike native GOCACHE mode's
+	// -restore-limit-bytes), so the server-side default (see WithSettingsPath) is the only
+	// control -- drop the largest items first until what's left fits.
+	resp.Items = trimToPreloadBudget(resp.Items, h.preloadLimitBytesFor(req.BuildType))
+
 	cl, err := resp.ContentLength()
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
