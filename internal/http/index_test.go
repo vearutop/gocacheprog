@@ -256,7 +256,7 @@ func TestIndex_SessionMarkedDone(t *testing.T) {
 	client, err := http.NewClientWithSession(srv.URL, "", &http.SessionInfo{SessionID: "session-xyz"})
 	require.NoError(t, err)
 
-	require.NoError(t, client.MarkSessionDone())
+	require.NoError(t, client.MarkSessionDone(nil))
 
 	req, err := nethttp.NewRequest(nethttp.MethodGet, srv.URL+"/", nil)
 	require.NoError(t, err)

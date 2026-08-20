@@ -34,12 +34,12 @@ type ServerConfig struct {
 	FallbackAuthToken string
 	MaxDiskBytes      int64
 	PreloadLimit      int
-	SessionsCSVPath   string
+	SessionsJSONLPath string
 }
 
 func RunServer(cfg ServerConfig) error {
 	h := cachehttp.NewHandlerWithPreloadLimit(cfg.Store, cfg.NativeStore, cfg.AuthToken, cfg.FallbackAuthToken, cfg.PreloadLimit,
-		cachehttp.WithMaxDiskBytes(cfg.MaxDiskBytes), cachehttp.WithSessionsCSV(cfg.SessionsCSVPath))
+		cachehttp.WithMaxDiskBytes(cfg.MaxDiskBytes), cachehttp.WithSessionsJSONL(cfg.SessionsJSONLPath))
 	printStats := func() {
 		cfg.Store.PrintStats()
 		cfg.NativeStore.PrintStats()

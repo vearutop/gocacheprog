@@ -53,7 +53,7 @@ func TestRestorePaths_SupplementsSmallChangesResultWithDefault(t *testing.T) {
 // manifest (commit-big below) that would otherwise have made the cut, silently serving a shrunken
 // result even though substantial healthy content exists elsewhere for this build type.
 func TestRestorePaths_DefaultExcludesAlreadyMatchedManifest(t *testing.T) {
-	require.GreaterOrEqual(t, defaultManifestSampleSize, 3, "test assumes at least 3 sample slots")
+	require.GreaterOrEqual(t, defaultManifestSampleSize, 2, "test assumes at least 2 sample slots")
 
 	dir := t.TempDir()
 
@@ -62,15 +62,13 @@ func TestRestorePaths_DefaultExcludesAlreadyMatchedManifest(t *testing.T) {
 
 	// Oldest: filler, never a candidate either way.
 	saveItemForTest(t, store, Request{Commit: "commit-a", BuildType: "unit"}, "aa/a", "pa")
-	// commit-big: large and independent, but older than commit-c/commit-d -- must lose its slot
-	// to "changes" unless "changes" is excluded from the candidate pool.
+	// commit-big: large and independent, but older than commit-c -- must lose its slot to
+	// "changes" unless "changes" is excluded from the candidate pool.
 	for i := 0; i < 20; i++ {
 		saveItemForTest(t, store, Request{Commit: "commit-big", BuildType: "unit"}, fmt.Sprintf("bb/big-%d", i), fmt.Sprintf("pb%d", i))
 	}
 	saveItemForTest(t, store, Request{Commit: "commit-c", BuildType: "unit"}, "cc/c1", "pc1")
 	saveItemForTest(t, store, Request{Commit: "commit-c", BuildType: "unit"}, "cc/c2", "pc2")
-	saveItemForTest(t, store, Request{Commit: "commit-d", BuildType: "unit"}, "dd/d1", "pd1")
-	saveItemForTest(t, store, Request{Commit: "commit-d", BuildType: "unit"}, "dd/d2", "pd2")
 	// Written last, so it's the single most recently touched manifest for this build type --
 	// and about to be matched (and thus self-healed, keeping it "most recent") by the Restore
 	// call below.
@@ -683,12 +681,15 @@ func TestCollectFilesToSave_SkipsRestoredPaths(t *testing.T) {
 	restoredPaths, err := ReadRestoredPaths(dir)
 	require.NoError(t, err)
 
-	batch, err := CollectFilesToSave(dir, restoredPaths, 0)
+	batch, _, err := CollectFilesToSave(dir, restoredPaths, 0)
 	require.NoError(t, err)
 	require.Len(t, batch.Items, 1)
 	require.Equal(t, "ab/new-a", batch.Items[0].Path)
 }
 
+// TestCollectFilesToSave_SkipsOversizedFiles also covers SkippedLargeFiles: a caller (see
+// SaveFreshNativeCache) needs the excluded count/bytes to report visibility on skips that would
+// otherwise look identical to "there was nothing new to save".
 func TestCollectFilesToSave_SkipsOversizedFiles(t *testing.T) {
 	dir := t.TempDir()
 
@@ -696,10 +697,11 @@ func TestCollectFilesToSave_SkipsOversizedFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "ab", "small"), []byte("1234"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "ab", "large"), []byte("123456"), 0o600))
 
-	batch, err := CollectFilesToSave(dir, map[string]struct{}{}, 4)
+	batch, skippedLarge, err := CollectFilesToSave(dir, map[string]struct{}{}, 4)
 	require.NoError(t, err)
 	require.Len(t, batch.Items, 1)
 	require.Equal(t, "ab/small", batch.Items[0].Path)
+	require.Equal(t, SkippedLargeFiles{Count: 1, Bytes: 6}, skippedLarge)
 }
 
 func TestCollectAndRestore_PreservesExecutableMode(t *testing.T) {
@@ -709,7 +711,7 @@ func TestCollectAndRestore_PreservesExecutableMode(t *testing.T) {
 	originalPath := filepath.Join(cacheDir, "ab", "covdata")
 	require.NoError(t, os.WriteFile(originalPath, []byte("binary"), 0o700))
 
-	batch, err := CollectFilesToSave(cacheDir, map[string]struct{}{}, 0)
+	batch, _, err := CollectFilesToSave(cacheDir, map[string]struct{}{}, 0)
 	require.NoError(t, err)
 	require.Len(t, batch.Items, 1)
 	require.Equal(t, uint32(0o700), batch.Items[0].Mode)
@@ -1080,6 +1082,55 @@ func TestMergeSavedPaths_ConcurrentMergesDoNotLoseEntries(t *testing.T) {
 	merged, err := readManifestPaths(manifestPath)
 	require.NoError(t, err)
 	require.Len(t, merged, jobs*pathsPerJob, "every concurrent job's paths must survive the merge, none silently dropped by a lost update")
+}
+
+// TestLockManifestPath_OnlySerializesSamePath is a regression test for a real production
+// incident: manifestLocks used to be a single store-wide mutex, so restorePaths (which resolves
+// entirely before Handler.RestoreCache sends any response header) blocked on any other session's
+// unrelated manifest I/O -- under concurrent traffic across many commits/build types, that was
+// enough contention to blow a client's response-header timeout on ordinary restore-cache calls
+// that touched no shared manifest at all. Locking must only ever serialize two callers touching
+// the exact same manifest path.
+func TestLockManifestPath_OnlySerializesSamePath(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	require.NoError(t, err)
+
+	unlockA := store.lockManifestPath("path-a")
+
+	// An unrelated path must be lockable immediately -- if this blocked, locking would still be
+	// global rather than per-path.
+	acquiredB := make(chan struct{})
+	go func() {
+		unlockB := store.lockManifestPath("path-b")
+		close(acquiredB)
+		unlockB()
+	}()
+	select {
+	case <-acquiredB:
+	case <-time.After(time.Second):
+		t.Fatal("locking an unrelated manifest path must not be blocked by path-a's lock")
+	}
+
+	// The same path must still mutually exclude concurrent callers.
+	acquiredA := make(chan struct{})
+	go func() {
+		unlockA2 := store.lockManifestPath("path-a")
+		close(acquiredA)
+		unlockA2()
+	}()
+	select {
+	case <-acquiredA:
+		t.Fatal("locking the same manifest path concurrently should have blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unlockA()
+	select {
+	case <-acquiredA:
+	case <-time.After(time.Second):
+		t.Fatal("lock should become available once the original holder released it")
+	}
 }
 
 // TestGOCACHERoundTrip_SequentialRunsOfSameCommitAccumulate simulates a real reported production

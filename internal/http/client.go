@@ -725,11 +725,28 @@ func (c *Client) postSaveCacheControl(req gocache.Request, uploadID, path, op st
 }
 
 // MarkSessionDone tells the server this client's session has finished, so the status page can
-// show it as done instead of leaving it to look abandoned once requests stop arriving.
-func (c *Client) MarkSessionDone() error {
-	r, err := http.NewRequest(http.MethodPost, c.baseURL+"/session-done", nil)
+// show it as done instead of leaving it to look abandoned once requests stop arriving. extra, if
+// non-empty, is merged into that session's "done" line in sessions.jsonl (see
+// Handler.appendSessionsJSONL) as additional top-level fields -- e.g. -github-actions-done's
+// save-cache skip counts and report_<name> file contents. A key colliding with one of
+// sessions.jsonl's own fixed fields (like "event" or "session_id") is silently dropped rather
+// than overwriting it.
+func (c *Client) MarkSessionDone(extra map[string]any) error {
+	var body io.Reader
+	if len(extra) > 0 {
+		data, err := json.Marshal(extra)
+		if err != nil {
+			return fmt.Errorf("marshal session-done extra: %w", err)
+		}
+		body = bytes.NewReader(data)
+	}
+
+	r, err := http.NewRequest(http.MethodPost, c.baseURL+"/session-done", body)
 	if err != nil {
 		return err
+	}
+	if body != nil {
+		r.Header.Set("Content-Type", "application/json")
 	}
 	c.setSessionAuthHeaders(r)
 

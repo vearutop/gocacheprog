@@ -1,7 +1,9 @@
 package local
 
 import (
+	"bytes"
 	"io"
+	"log"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -72,7 +74,7 @@ func TestSaveFreshNativeCache_UploadsOnlyFreshNonExcludedFiles(t *testing.T) {
 	require.NoError(t, gocache.WriteRestoredPaths(cacheDir, []string{"cd/restored"}))
 
 	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
+	stats, _, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Files)
 
@@ -89,7 +91,7 @@ func TestSaveFreshNativeCache_NoFreshFilesIsNoop(t *testing.T) {
 	writeCacheFile(t, cacheDir, "ab/old", "stale", since.Add(-time.Hour))
 
 	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
+	stats, _, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, isLocalGocacheProtectedFile)
 	require.NoError(t, err)
 	require.Equal(t, 0, stats.Files)
 }
@@ -124,9 +126,10 @@ func TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas(t *testing.T) {
 	writeCacheFile(t, cacheDir, "cd/genuinely-new", "new content", since.Add(time.Minute))
 
 	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, nil)
+	stats, skipStats, err := SaveFreshNativeCache(cacheDir, client, req, 0, since, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Files, "only the genuinely new file should be uploaded")
+	require.Equal(t, SaveSkipStats{ExistingSkipped: 1, Considered: 2}, skipStats, "the skip stats returned to the caller must match what was actually skipped")
 
 	require.Equal(t, "0", nativeStore.Stats()["putsExist"], "the pre-existing object must never reach SaveItem")
 
@@ -140,6 +143,34 @@ func TestSaveFreshNativeCache_SkipsObjectsServerAlreadyHas(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(commitBody), "ab/shared-dep\n", "skipped-but-existing path must still be merged into the manifest")
 	require.Contains(t, string(commitBody), "cd/genuinely-new\n")
+}
+
+// TestSaveFreshNativeCache_LogsSkippedLargeFiles covers the actual reported gap: a file excluded
+// for exceeding -max-file-bytes is dropped before it's even considered a save candidate
+// (CollectFilesToSave), so it never showed up anywhere in the logs -- looking identical to
+// "there was nothing new to save" even though real content was silently left uncached. The log
+// line must call out both how many objects were excluded this way and their total size.
+func TestSaveFreshNativeCache_LogsSkippedLargeFiles(t *testing.T) {
+	srv := newFallbackTestServer(t)
+	client, err := cachehttp.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	cacheDir := t.TempDir()
+	writeCacheFile(t, cacheDir, "ab/small", "ok", time.Now())
+	writeCacheFile(t, cacheDir, "cd/too-big", strings.Repeat("x", 100), time.Now())
+
+	var buf bytes.Buffer
+	origOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOutput)
+
+	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
+	stats, skipStats, err := SaveFreshNativeCache(cacheDir, client, req, 10, time.Time{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Files, "only the file within -max-file-bytes should be uploaded")
+	require.Equal(t, gocache.SkippedLargeFiles{Count: 1, Bytes: 100}, skipStats.LargeSkipped, "the large-file skip stats returned to the caller must match the log line")
+
+	require.Contains(t, buf.String(), "1 large objects (100 B total) excluded")
 }
 
 // TestSaveFreshNativeCache_ManifestIncludesRestoredPathsNotJustNewOnes covers a real production
@@ -181,7 +212,7 @@ func TestSaveFreshNativeCache_ManifestIncludesRestoredPathsNotJustNewOnes(t *tes
 
 	writeCacheFile(t, cacheDir, "ab/new-file", "genuinely new this job", time.Now())
 
-	stats, err := SaveFreshNativeCache(cacheDir, client, req, 0, time.Time{}, nil)
+	stats, _, err := SaveFreshNativeCache(cacheDir, client, req, 0, time.Time{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Files, "only the genuinely new file should be uploaded")
 
@@ -201,7 +232,7 @@ func TestInitLocalGocacheMode_FallbackRemoteRestoresWhenCold(t *testing.T) {
 
 	seedDir := t.TempDir()
 	writeCacheFile(t, seedDir, "ab/seed", "preexisting remote content", time.Now())
-	seedBatch, err := gocache.CollectFreshFiles(seedDir, 0)
+	seedBatch, _, err := gocache.CollectFreshFiles(seedDir, 0)
 	require.NoError(t, err)
 
 	req := gocache.Request{Commit: "commit123", BuildType: "owner-repo-unit"}

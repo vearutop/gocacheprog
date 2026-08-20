@@ -304,7 +304,7 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallback
 		FallbackAuthToken: fallbackAuthToken,
 		MaxDiskBytes:      maxDiskBytes,
 		PreloadLimit:      preloadLimit,
-		SessionsCSVPath:   filepath.Join(dir, "sessions.csv"),
+		SessionsJSONLPath: filepath.Join(dir, "sessions.jsonl"),
 	})
 }
 
@@ -367,7 +367,7 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 		since = marker
 	}
 
-	_, err = local.SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
+	_, _, err = local.SaveFreshNativeCache(cacheDir, client, req, maxFileBytes, since, nil)
 	return err
 }
 

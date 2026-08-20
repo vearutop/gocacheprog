@@ -138,6 +138,18 @@ func RestoreNativeCache(cacheDir string, client *cachehttp.Client, req gocache.R
 	return stats, gocache.WriteJobStartMarker(cacheDir, startedAt)
 }
 
+// SaveSkipStats summarizes why SaveFreshNativeCache didn't upload something it found locally,
+// for a caller that wants to report on it (see -github-actions-done's session-done extras)
+// instead of it only ever reaching a log line. ExistingSkipped/Considered are the same numbers
+// as logSaveCacheSkips' "skipping N/M objects the server already has"; LargeSkipped is
+// CollectFilesToSave's count/bytes of files excluded for exceeding -max-file-bytes before ever
+// being considered a candidate at all.
+type SaveSkipStats struct {
+	ExistingSkipped int
+	Considered      int
+	LargeSkipped    gocache.SkippedLargeFiles
+}
+
 // SaveFreshNativeCache uploads regular files under cacheDir that are not already accounted for by
 // a prior restore into the same dir (gocache.WriteRestoredPaths) and not matched by exclude. A
 // zero since uploads all such files — the classic gocache-mode assumption of a fresh, starts-empty
@@ -147,15 +159,15 @@ func RestoreNativeCache(cacheDir string, client *cachehttp.Client, req gocache.R
 // cross-build-type dir that didn't start empty, so restoredPaths exclusion alone would sweep up
 // everything else ever written to it; exclude is also how that mode keeps its own lock/stats
 // bookkeeping files out of the upload.
-func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Request, maxFileBytes int64, since time.Time, exclude func(name string) bool) (gocache.TransferStats, error) {
+func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache.Request, maxFileBytes int64, since time.Time, exclude func(name string) bool) (gocache.TransferStats, SaveSkipStats, error) {
 	restoredPaths, err := gocache.ReadRestoredPaths(cacheDir)
 	if err != nil && !os.IsNotExist(err) {
-		return gocache.TransferStats{}, err
+		return gocache.TransferStats{}, SaveSkipStats{}, err
 	}
 
-	batch, err := gocache.CollectFilesToSave(cacheDir, restoredPaths, maxFileBytes)
+	batch, skippedLarge, err := gocache.CollectFilesToSave(cacheDir, restoredPaths, maxFileBytes)
 	if err != nil {
-		return gocache.TransferStats{}, err
+		return gocache.TransferStats{}, SaveSkipStats{}, err
 	}
 
 	fresh := batch.Items[:0]
@@ -170,7 +182,10 @@ func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache
 	}
 	batch.Items = fresh
 
-	batch = reportExistingAndDedupe(client, req, restoredPaths, batch)
+	consideredCount := len(batch.Items)
+	batch, existingSkipped := reportExistingAndDedupe(client, req, restoredPaths, batch)
+	logSaveCacheSkips(existingSkipped, consideredCount, skippedLarge)
+	skipStats := SaveSkipStats{ExistingSkipped: existingSkipped, Considered: consideredCount, LargeSkipped: skippedLarge}
 
 	if len(batch.Items) == 0 {
 		log.Printf(
@@ -181,12 +196,12 @@ func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache
 			req.BaseCommit,
 			req.ParentCommit,
 		)
-		return gocache.TransferStats{}, nil
+		return gocache.TransferStats{}, skipStats, nil
 	}
 
 	stats, err := client.SaveCache(req, batch)
 	if err != nil {
-		return gocache.TransferStats{}, err
+		return gocache.TransferStats{}, skipStats, err
 	}
 	saveTotalTime := client.LastSaveTiming()
 	log.Printf(
@@ -202,11 +217,13 @@ func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache
 		req.BaseCommit,
 		req.ParentCommit,
 	)
-	return stats, nil
+	return stats, skipStats, nil
 }
 
 // reportExistingAndDedupe checks which of restoredPaths and batch's paths the server already
-// has, and filters anything already-known out of batch so it isn't re-uploaded.
+// has, and filters anything already-known out of batch so it isn't re-uploaded. Returns how many
+// of batch's own items were skipped this way (for logSaveCacheSkips), not counting restoredPaths
+// -- those were never candidates for upload in the first place.
 //
 // restoredPaths ride along in this same call even though none of them are ever uploaded:
 // restoring them didn't record them against this exact commit/changes-id (Store.Restore is
@@ -220,9 +237,9 @@ func SaveFreshNativeCache(cacheDir string, client *cachehttp.Client, req gocache
 // Errors here are non-fatal, same reasoning as everywhere else in this file: caching is an
 // optimization, not a build dependency, so fall back to uploading everything rather than failing
 // the job.
-func reportExistingAndDedupe(client *cachehttp.Client, req gocache.Request, restoredPaths map[string]struct{}, batch gocache.Batch) gocache.Batch {
+func reportExistingAndDedupe(client *cachehttp.Client, req gocache.Request, restoredPaths map[string]struct{}, batch gocache.Batch) (gocache.Batch, int) {
 	if len(batch.Items) == 0 && len(restoredPaths) == 0 {
-		return batch
+		return batch, 0
 	}
 
 	paths := make([]string, 0, len(restoredPaths)+len(batch.Items))
@@ -236,10 +253,10 @@ func reportExistingAndDedupe(client *cachehttp.Client, req gocache.Request, rest
 	existing, err := client.ExistingPaths(req, paths)
 	if err != nil {
 		log.Printf("save-cache: check existing objects failed, uploading everything: %s", err.Error())
-		return batch
+		return batch, 0
 	}
 	if len(existing) == 0 {
-		return batch
+		return batch, 0
 	}
 
 	existingSet := make(map[string]struct{}, len(existing))
@@ -254,10 +271,32 @@ func reportExistingAndDedupe(client *cachehttp.Client, req gocache.Request, rest
 		}
 		deduped = append(deduped, item)
 	}
-	log.Printf("save-cache: skipping %d/%d objects the server already has", len(batch.Items)-len(deduped), len(batch.Items))
+	skipped := len(batch.Items) - len(deduped)
 	batch.Items = deduped
 
-	return batch
+	return batch, skipped
+}
+
+// logSaveCacheSkips reports, in one line, the two ways a local file that could otherwise have
+// been uploaded ended up not being: the server already had it (existingSkipped, out of
+// consideredCount candidates), or it exceeded -max-file-bytes before it was ever considered at
+// all (skippedLarge). Either category alone looks identical to "there was nothing new to save"
+// without this -- silent, especially for the large-file case, since CollectFilesToSave excludes
+// those before this function's caller (SaveFreshNativeCache) even sees them. A no-op if neither
+// happened.
+func logSaveCacheSkips(existingSkipped, consideredCount int, skippedLarge gocache.SkippedLargeFiles) {
+	var parts []string
+	if existingSkipped > 0 {
+		parts = append(parts, fmt.Sprintf("skipping %d/%d objects the server already has", existingSkipped, consideredCount))
+	}
+	if skippedLarge.Count > 0 {
+		parts = append(parts, fmt.Sprintf("%d large objects (%s total) excluded", skippedLarge.Count, humanBytesBinary(skippedLarge.Bytes)))
+	}
+	if len(parts) == 0 {
+		return
+	}
+
+	log.Printf("save-cache: %s", strings.Join(parts, ", "))
 }
 
 func humanBytesBinary(v int64) string {

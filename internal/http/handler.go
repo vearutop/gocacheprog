@@ -1,6 +1,7 @@
 package http
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -37,7 +38,7 @@ type Handler struct {
 	lastPanicMessage     string
 	lastPanicStack       string
 	lastPanicAt          time.Time
-	sessionsCSVPath      string
+	sessionsJSONLPath    string
 }
 
 // HandlerOption configures optional Handler behavior not covered by NewHandlerWithPreloadLimit's
@@ -51,11 +52,11 @@ func WithMaxDiskBytes(n int64) HandlerOption {
 	return func(h *Handler) { h.combinedMaxDiskBytes = n }
 }
 
-// WithSessionsCSV appends a row to path every time a session starts and every time it's marked
-// done (see appendSessionsCSV), for offline analysis of cache performance over time. Empty
-// (the default) disables it.
-func WithSessionsCSV(path string) HandlerOption {
-	return func(h *Handler) { h.sessionsCSVPath = path }
+// WithSessionsJSONL appends a line to path every time a session starts and every time it's
+// marked done (see appendSessionsJSONL), for offline analysis of cache performance over time.
+// Empty (the default) disables it.
+func WithSessionsJSONL(path string) HandlerOption {
+	return func(h *Handler) { h.sessionsJSONLPath = path }
 }
 
 // clientSession tracks the most recent request seen from one client process (identified by its
@@ -75,6 +76,11 @@ type clientSession struct {
 	FirstSeen     time.Time
 	LastSeen      time.Time
 	DoneAt        time.Time
+	// Extra holds whatever markSessionDone's caller reported alongside going done (see
+	// MarkSessionDone), merged as additional top-level fields into this session's "done" line in
+	// sessions.jsonl -- e.g. -github-actions-done's save-cache skip counts and report_<name>
+	// file contents. Never shown on the status page, only in sessions.jsonl.
+	Extra map[string]any
 }
 
 // sessionIdleTimeout is how long a session is still shown as "in progress" after its last
@@ -239,13 +245,13 @@ func (h *Handler) touchSession(r *http.Request) {
 	}
 
 	// Snapshotted (a plain struct copy) while still under the lock, then appended to
-	// sessions.csv after releasing it -- file I/O has no business blocking every other
+	// sessions.jsonl after releasing it -- file I/O has no business blocking every other
 	// session's bookkeeping.
 	snapshot := *cs
 	h.clientSessionsMu.Unlock()
 
 	if isNew {
-		h.appendSessionsCSV("started", sid, snapshot)
+		h.appendSessionsJSONL("started", sid, snapshot)
 	}
 }
 
@@ -288,8 +294,9 @@ func (h *Handler) recordSessionFinalize(r *http.Request, wireBytes int64, dur ti
 }
 
 // markSessionDone flags the request's session as finished, e.g. once -github-actions-done
-// completes. Done sessions are dropped from the status page after doneSessionRetention.
-func (h *Handler) markSessionDone(r *http.Request) {
+// completes. Done sessions are dropped from the status page after doneSessionRetention. extra
+// (see MarkSessionDone) is attached to the session before it's appended to sessions.jsonl.
+func (h *Handler) markSessionDone(r *http.Request, extra map[string]any) {
 	sid := r.Header.Get(headerSessionID)
 	if sid == "" {
 		return
@@ -302,12 +309,13 @@ func (h *Handler) markSessionDone(r *http.Request) {
 	if found {
 		cs.Done = true
 		cs.DoneAt = time.Now()
+		cs.Extra = extra
 		snapshot = *cs
 	}
 	h.clientSessionsMu.Unlock()
 
 	if found {
-		h.appendSessionsCSV("done", sid, snapshot)
+		h.appendSessionsJSONL("done", sid, snapshot)
 	}
 }
 
@@ -417,8 +425,21 @@ func (h *Handler) serveVersion(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveSessionDone accepts an optional JSON object body (see Client.MarkSessionDone) with extra
+// fields to attach to this session's sessions.jsonl "done" line. A missing/empty body is the
+// common case (most callers have nothing extra to report) and isn't an error.
 func (h *Handler) serveSessionDone(rw http.ResponseWriter, r *http.Request) {
-	h.markSessionDone(r)
+	defer closeRequestBody(r)
+
+	var extra map[string]any
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&extra); err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	h.markSessionDone(r, extra)
 	rw.WriteHeader(http.StatusNoContent)
 }
 
@@ -462,8 +483,8 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	// Basic-Auth-gated like "/", not Bearer-gated like the routes below: both are meant for a
 	// human hitting the URL directly (browser or curl -u), not the cache protocol client.
-	if r.URL.Path == "/sessions.csv" {
-		h.SessionsCSV(rw, r)
+	if r.URL.Path == "/sessions.jsonl" {
+		h.SessionsJSONL(rw, r)
 		return
 	}
 
