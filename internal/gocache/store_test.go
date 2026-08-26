@@ -1865,3 +1865,73 @@ func saveWithModTimeForTest(t *testing.T, store *Store, path string, size int, m
 	store.evictHeap.push(path, store.entryStoredSize(ie), ie.ModTimeMicro)
 	store.mu.Unlock()
 }
+
+func TestStore_InspectKeys(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	req := Request{Commit: "commit123"}
+
+	// In manifest and present on disk: the "genuinely warm" case.
+	saveItemForTest(t, store, req, "aa/both-a", "body")
+
+	// In manifest only: recorded as used, but the object itself is gone (e.g. evicted) --
+	// distinguishes "restore-selection dropped it" from "never existed at all".
+	require.NoError(t, store.MergeSavedPaths(req, []string{"bb/manifest-only-a"}))
+
+	// Present on disk only: SaveItem alone never merges into any manifest.
+	item := FileItem{Path: "cc/disk-only-a", Size: int64(len("body")), WireSize: int64(len("body"))}
+	item.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader([]byte("body"))), nil
+	})
+	require.NoError(t, store.SaveItem(item))
+
+	results, err := store.InspectKeys(req, []string{
+		"aa/both-a",
+		"bb/manifest-only-a",
+		"cc/disk-only-a",
+		"dd/neither-a",
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 4)
+
+	byKey := map[string]KeyInspection{}
+	for _, r := range results {
+		byKey[r.Key] = r
+	}
+
+	both := byKey["aa/both-a"]
+	require.True(t, both.InManifest)
+	require.True(t, both.ExistsRemote)
+	require.Equal(t, int64(len("body")), both.Size)
+	require.GreaterOrEqual(t, both.AgeSeconds, 0.0)
+
+	manifestOnly := byKey["bb/manifest-only-a"]
+	require.True(t, manifestOnly.InManifest)
+	require.False(t, manifestOnly.ExistsRemote)
+	require.Zero(t, manifestOnly.Size)
+
+	diskOnly := byKey["cc/disk-only-a"]
+	require.False(t, diskOnly.InManifest)
+	require.True(t, diskOnly.ExistsRemote)
+	require.Equal(t, int64(len("body")), diskOnly.Size)
+
+	neither := byKey["dd/neither-a"]
+	require.False(t, neither.InManifest)
+	require.False(t, neither.ExistsRemote)
+}
+
+func TestStore_InspectKeys_UnresolvableScopeIsNotAnError(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := NewStore(dir, WithCompression())
+	require.NoError(t, err)
+
+	results, err := store.InspectKeys(Request{}, []string{"aa/whatever-a"})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.False(t, results[0].InManifest)
+	require.False(t, results[0].ExistsRemote)
+}

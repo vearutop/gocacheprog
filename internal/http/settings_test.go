@@ -75,6 +75,31 @@ func TestTrimToPreloadBudget_DropsMultipleLargestUntilItFits(t *testing.T) {
 	require.Equal(t, "keep", got[0].ActionID)
 }
 
+// TestTrimToPreloadBudget_PrefersRecentBucketOverSizeWithinOlderBucket covers the point of the
+// bucketing added on top of the plain "biggest first" rule: an old-but-small item is dropped
+// before a same-bucket comparison ever reaches a new-but-huge item, because the old item's whole
+// (older) time bucket is ranked for removal ahead of the current bucket entirely.
+func TestTrimToPreloadBudget_PrefersRecentBucketOverSizeWithinOlderBucket(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+
+	oldSmall := responseItemForTest("old-small", "12")       // 2 bytes, old bucket
+	newHuge := responseItemForTest("new-huge", "1234567890") // 10 bytes, current bucket
+	newSmall := responseItemForTest("new-small", "34")       // 2 bytes, current bucket
+	oldSmall.Time = &old
+	newHuge.Time = &now
+	newSmall.Time = &now
+
+	// Total 14 > budget 10: dropping just "new-huge" (the plain-size-desc pick) would already
+	// fit (14-10=4<=10) and keep "old-small". Bucketing should drop "old-small" first instead
+	// (older bucket ranked ahead of the current one), then still need to drop "new-huge" too
+	// (14-2-10=2<=10) since removing the 2-byte old item alone isn't enough.
+	got := trimToPreloadBudget([]cache.ResponseItem{oldSmall, newHuge, newSmall}, 10)
+
+	require.Len(t, got, 1)
+	require.Equal(t, "new-small", got[0].ActionID)
+}
+
 func TestTrimToPreloadBudget_FallsBackToSizeWhenWireSizeUnset(t *testing.T) {
 	big := cache.ResponseItem{ActionID: "big", Size: 100}
 	small := cache.ResponseItem{ActionID: "small", Size: 5}

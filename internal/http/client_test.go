@@ -313,6 +313,43 @@ func TestClient_ExistingPaths(t *testing.T) {
 	require.Equal(t, "ab/present\n", readManifestBodyForTest(t, commitManifestPath))
 }
 
+func TestClient_InspectKeys(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir)
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"))
+	require.NoError(t, err)
+
+	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
+
+	present := gocache.FileItem{Path: "ab/present", Size: 5, WireSize: 5}
+	present.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString("hello")), nil
+	})
+	require.NoError(t, nativeStore.Save(req, gocache.Batch{Items: []gocache.FileItem{present}}))
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	results, err := client.InspectKeys(req, []string{"ab/present", "cd/missing"})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+
+	byKey := map[string]gocache.KeyInspection{}
+	for _, r := range results {
+		byKey[r.Key] = r
+	}
+
+	require.True(t, byKey["ab/present"].InManifest)
+	require.True(t, byKey["ab/present"].ExistsRemote)
+	require.False(t, byKey["cd/missing"].InManifest)
+	require.False(t, byKey["cd/missing"].ExistsRemote)
+}
+
 func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {
 	serverDir := t.TempDir()
 	localStore, err := local.NewStore(serverDir, local.WithCompression())

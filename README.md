@@ -121,6 +121,7 @@ Only the base URL is required; everything else has a default.
 | `skip_preload`             | `false`            | skip the explicit preload pass entirely (direct/shim only)               |
 | `max_cache_bytes`          | `0` (unlimited)    | `local-gocache` mode only; total cache dir size limit, enforced by evicting the oldest files on `-github-actions-done` |
 | `fallback_remote`          | `false`            | `local-gocache` mode only; fall back to the remote when this build type's local cache is cold — see [`mode=local-gocache`](#modelocal-gocache) |
+| `report_<name>=<path>`     | (none)             | any number of these; `-github-actions-done` reads back that local file and attaches its content to the job's session in `sessions.jsonl` under the key `<name>` — see [ADVANCED.md](ADVANCED.md#status-page) |
 
 Timestamp canonicalization runs against the repo root by default, since fresh CI checkouts almost
 always need it for stable cache keys (see [ADVANCED.md](ADVANCED.md#timestamp-canonicalization)
@@ -140,7 +141,8 @@ runner has a remote server to talk to at all:
 ### `mode=direct`
 
 One `gocacheprog` helper per `go` invocation, talking to the remote server directly. No background
-process, nothing to tear down beyond the (no-op) `-github-actions-done` call.
+process to stop, but `-github-actions-done` still aggregates each invocation's stats and reports
+the job done (see below).
 
 Use this for jobs with a single Go invocation per step, e.g. one `go test ./...` or `go build ./...`
 step and nothing else.

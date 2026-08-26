@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,62 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vearutop/gocacheprog/internal/gocache"
+	cachehttp "github.com/vearutop/gocacheprog/internal/http"
 )
+
+// newSessionTrackingTestServer stands up a real gocache-backed HTTP server with sessions.jsonl
+// enabled, for asserting that a done*Mode function actually reported its session as finished
+// (see MarkSessionDone) rather than just logging locally.
+func newSessionTrackingTestServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+
+	localStore, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	jsonlPath := filepath.Join(t.TempDir(), "sessions.jsonl")
+	srv := httptest.NewServer(cachehttp.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, cachehttp.WithSessionsJSONL(jsonlPath)))
+	t.Cleanup(srv.Close)
+
+	return srv, jsonlPath
+}
+
+func TestInvestigateTestcacheKeys_LogsPerKeyForensics(t *testing.T) {
+	srv := newFallbackTestServer(t)
+	client, err := cachehttp.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	cacheDir := t.TempDir()
+	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
+
+	writeCacheFile(t, cacheDir, "ab/savedkey-a", "cached test output", time.Now())
+	_, _, err = SaveFreshNativeCache(cacheDir, client, req, 0, time.Time{}, nil)
+	require.NoError(t, err)
+
+	keysPath := filepath.Join(t.TempDir(), "keys.json")
+	require.NoError(t, os.WriteFile(keysPath, []byte(`{
+		"pkg/found": {"misses": ["ab/savedkey-a"]},
+		"pkg/missing": {"misses": ["cd/nosuchkey-a"]},
+		"pkg/hit": {"hits": ["ef/hitkey-a", "gh/hitkey2-a"]}
+	}`), 0o600))
+	t.Setenv(envGHATestcacheKeys, keysPath)
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	investigateTestcacheKeys(client, req)
+
+	out := buf.String()
+	require.Contains(t, out, "pkg/found: ab/savedkey-a in_manifest=true exists_remote=true")
+	require.Contains(t, out, "pkg/missing: cd/nosuchkey-a in_manifest=false exists_remote=false")
+	require.Contains(t, out, "testcache-keys: 2 hit keys captured, not yet used")
+}
+
+func TestInvestigateTestcacheKeys_NoEnvVarIsNoop(t *testing.T) {
+	t.Setenv(envGHATestcacheKeys, "")
+	investigateTestcacheKeys(nil, gocache.Request{})
+}
 
 func TestGithubActionsJobURL(t *testing.T) {
 	t.Setenv("GITHUB_SERVER_URL", "https://github.com")
@@ -75,6 +131,12 @@ func TestParseGithubActionsDSN_InvalidSkipCanonicalizeTimestamps(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestParseGithubActionsDSN_TestcacheKeys(t *testing.T) {
+	cfg, err := parseGithubActionsDSN("https://gocache.example.com?testcache_keys=%2Ftmp%2Fmisses.json")
+	require.NoError(t, err)
+	require.Equal(t, "/tmp/misses.json", cfg.testcacheKeys)
+}
+
 func TestParseGithubActionsDSN_InvalidPreloadSize(t *testing.T) {
 	_, err := parseGithubActionsDSN("https://gocache.example.com?preload_size=not-a-number")
 	require.Error(t, err)
@@ -119,7 +181,7 @@ func TestInitLocalGocacheMode_SetsGocacheAndModeEnv(t *testing.T) {
 	t.Setenv("GITHUB_ENV", githubEnv)
 
 	cfg := githubActionsConfig{cacheDir: cacheDir}
-	require.NoError(t, initLocalGocacheMode(cfg, "", "", "", time.Now()))
+	require.NoError(t, initLocalGocacheMode(cfg, "", "", "", "session-1", time.Now()))
 
 	_, err := os.Stat(cacheDir)
 	require.NoError(t, err, "cache dir should be created")
@@ -200,18 +262,19 @@ func TestGithubContext_PullRequestMissingEventPath(t *testing.T) {
 
 func TestCommonScopeArgs(t *testing.T) {
 	cfg := githubActionsConfig{authToken: "tok", buildType: "unit"}
-	args := commonScopeArgs(cfg, "commit-sha", "base-sha", "changes-id")
+	args := commonScopeArgs(cfg, "commit-sha", "base-sha", "changes-id", "session-1")
 	require.Equal(t, []string{
 		"-auth-token", "tok",
 		"-commit", "commit-sha",
 		"-changes-id", "changes-id",
 		"-build-type", "unit",
 		"-base-commit", "base-sha",
+		"-session-id", "session-1",
 	}, args)
 }
 
 func TestCommonScopeArgs_OmitsEmptyFields(t *testing.T) {
-	require.Empty(t, commonScopeArgs(githubActionsConfig{}, "", "", ""))
+	require.Empty(t, commonScopeArgs(githubActionsConfig{}, "", "", "", ""))
 }
 
 func TestShellJoin(t *testing.T) {
@@ -275,6 +338,59 @@ func TestDoneDirectMode_MultipleInvocationsAggregatesCounts(t *testing.T) {
 	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 5, Misses: 1, Puts: 2}))
 
 	require.NoError(t, doneDirectMode())
+}
+
+func TestDoneDirectMode_ReportsSessionDone(t *testing.T) {
+	srv, jsonlPath := newSessionTrackingTestServer(t)
+
+	dir := t.TempDir()
+	t.Setenv(envGHACacheDir, dir)
+	t.Setenv(envGHARemoteURL, srv.URL)
+	t.Setenv(envGHASessionID, "direct-session-1")
+	require.NoError(t, AppendQuietRunStats(dir, StatsSummary{Hits: 3, Misses: 1, Puts: 1}))
+
+	require.NoError(t, doneDirectMode())
+
+	data, err := os.ReadFile(jsonlPath)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"event":"done"`)
+	require.Contains(t, string(data), `"session_id":"direct-session-1"`)
+	require.Contains(t, string(data), `"mode":"direct"`)
+	require.Contains(t, string(data), `"hits":3`)
+}
+
+func TestDoneShimMode_ReportsSessionDoneOnStopFailure(t *testing.T) {
+	srv, jsonlPath := newSessionTrackingTestServer(t)
+
+	// No daemon is listening on this socket, so StopShimServer fails fast (connection
+	// refused) -- doneShimMode's fallback branch should still best-effort report the session
+	// done rather than leaving it to look abandoned on the status page.
+	t.Setenv(envGHASocket, filepath.Join(t.TempDir(), "no-daemon.sock"))
+	t.Setenv(envGHARemoteURL, srv.URL)
+	t.Setenv(envGHASessionID, "shim-session-1")
+
+	require.NoError(t, doneShimMode())
+
+	data, err := os.ReadFile(jsonlPath)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"event":"done"`)
+	require.Contains(t, string(data), `"session_id":"shim-session-1"`)
+	require.Contains(t, string(data), `"mode":"shim"`)
+}
+
+func TestDoneDirectMode_ReportsSessionDoneEvenWithoutRunStats(t *testing.T) {
+	srv, jsonlPath := newSessionTrackingTestServer(t)
+
+	t.Setenv(envGHACacheDir, t.TempDir())
+	t.Setenv(envGHARemoteURL, srv.URL)
+	t.Setenv(envGHASessionID, "direct-session-2")
+
+	require.NoError(t, doneDirectMode())
+
+	data, err := os.ReadFile(jsonlPath)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"session_id":"direct-session-2"`)
+	require.Contains(t, string(data), `"event":"done"`)
 }
 
 func TestAppendQuietRunStats_RecordsParentPID(t *testing.T) {

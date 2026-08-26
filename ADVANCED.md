@@ -620,13 +620,19 @@ curl -u "x:secret-token" https://cache.example.com/sessions.jsonl -o sessions.js
 
 A session-done call can optionally carry a JSON object body, merged as additional top-level
 fields into that session's "done" line (a field colliding with one of the fixed ones above is
-dropped rather than overwriting it). `-github-actions-done` (gocache mode) always attaches its
-save-cache skip counts this way (`save_skipped_existing`, `save_considered`,
-`save_skipped_large_count`, `save_skipped_large_bytes` — the same numbers as the
-`save-cache: skipping N/M objects the server already has` log line), plus, for every
-`report_<name>=<path>` DSN query parameter (see `internal/local/github_actions.go`'s DSN format),
-that local file's content under the key `<name>` — inlined as JSON if the content parses as
-JSON, otherwise reported as a literal string.
+dropped rather than overwriting it). `-github-actions-done` calls it in every mode except
+local-gocache's fully-local case (which never talks to a remote at all, so has no session to mark
+done), always attaching `"mode"` (`direct`, `shim`, `gocache`, or `local-gocache`) plus
+mode-specific counts (gocache mode's save-cache skip counts —
+`save_skipped_existing`/`save_considered`/`save_skipped_large_count`/`save_skipped_large_bytes`,
+the same numbers as the `save-cache: skipping N/M objects the server already has` log line; direct
+and shim modes' own hit/miss/put `StatsSummary`; local-gocache's `local_cache_files`/
+`local_cache_bytes` when `fallback_remote` talked to the remote this run) — plus, in every mode,
+for every `report_<name>=<path>` DSN query parameter (see `internal/local/github_actions.go`'s DSN
+format), that local file's content under the key `<name>` — inlined as JSON if the content parses
+as JSON, otherwise reported as a literal string. This is how a tool like `teststat`'s
+`-metrics-json` attaches its own report to a session: point `report_teststat=<path>` at the same
+path `-metrics-json` writes to during the job.
 
 ## Authentication
 

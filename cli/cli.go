@@ -72,6 +72,7 @@ func Main(options ...func(o *Options)) error {
 	githubActionsInit := flag.String("github-actions-init", "", "set up caching for a GitHub Actions job from a single DSN; see internal/local/github_actions.go for the DSN format")
 	githubActionsDone := flag.Bool("github-actions-done", false, "finalize caching started by -github-actions-init in an always() step")
 	quiet := flag.Bool("quiet", false, "suppress informational logging, keeping only fatal errors; used for GOCACHEPROG helper instances started via -github-actions-init so they don't clutter go build/test output")
+	sessionID := flag.String("session-id", "", "internal: shared session ID used by -github-actions-init-spawned helpers so multiple invocations across one job report as one session; safe to ignore for standalone use")
 	ver := flag.Bool("version", false, "print version and exit")
 
 	flag.Parse()
@@ -160,7 +161,7 @@ func Main(options ...func(o *Options)) error {
 			return errors.New("-https and -https-host are only supported in store server mode without -remote-url")
 		}
 
-		return runDaemon(*httpListen, *dir, *remoteURL, *authToken, *maxDiskBytes, *params)
+		return runDaemon(*httpListen, *dir, *remoteURL, *authToken, *sessionID, *maxDiskBytes, *params)
 	}
 
 	if !*quiet {
@@ -192,8 +193,12 @@ func Main(options ...func(o *Options)) error {
 
 	if *remoteURL != "" {
 		sessionStartedAt := time.Now().UTC()
+		sid := *sessionID
+		if sid == "" {
+			sid = fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano())
+		}
 		upstream, err = http.NewClientWithSession(*remoteURL, *authToken, &http.SessionInfo{
-			SessionID: fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano()),
+			SessionID: sid,
 			StartedAt: sessionStartedAt,
 			PID:       os.Getpid(),
 			CacheDir:  *dir,
@@ -372,8 +377,8 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 	return err
 }
 
-func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, params local.ProxyParams) error {
-	upstream, err := newUpstreamClient(remoteURL, authToken, dir, params)
+func runDaemon(listen, dir, remoteURL, authToken, sessionID string, maxDiskBytes int64, params local.ProxyParams) error {
+	upstream, err := newUpstreamClient(remoteURL, authToken, dir, sessionID, params)
 	if err != nil {
 		return fmt.Errorf("remote client: %w", err)
 	}
@@ -465,10 +470,14 @@ func (r *recentLogf) Lines() []string {
 	return append([]string(nil), r.lines...)
 }
 
-func newUpstreamClient(remoteURL, authToken, cacheDir string, params local.ProxyParams) (cache.Store, error) {
+func newUpstreamClient(remoteURL, authToken, cacheDir, sessionID string, params local.ProxyParams) (cache.Store, error) {
 	sessionStartedAt := time.Now().UTC()
+	sid := sessionID
+	if sid == "" {
+		sid = fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano())
+	}
 	return http.NewClientWithSession(remoteURL, authToken, &http.SessionInfo{
-		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano()),
+		SessionID: sid,
 		StartedAt: sessionStartedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,

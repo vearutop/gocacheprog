@@ -634,6 +634,44 @@ func (c *Client) ExistingPaths(req gocache.Request, paths []string) ([]string, e
 	return existing, nil
 }
 
+// InspectKeys asks the server to check a batch of GOCACHE object keys against its store and the
+// manifest(s) resolved for req's scope -- see gocache.Store.InspectKeys for what each result
+// field means. Built for post-mortem cache-miss forensics, not the regular cache protocol path.
+func (c *Client) InspectKeys(req gocache.Request, keys []string) ([]gocache.KeyInspection, error) {
+	body, err := json.Marshal(keys)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := http.NewRequest(http.MethodPost, c.baseURL+"/inspect-keys?"+gocacheQuery(req).Encode(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	r.Header.Set("Content-Type", "application/json")
+	c.setSessionAuthHeaders(r)
+
+	res, err := c.roundTrip(r)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close inspect-keys body: %s", err.Error())
+		}
+	}()
+
+	if err := checkStatus(res, http.StatusOK, "inspect-keys"); err != nil {
+		return nil, err
+	}
+
+	var result []gocache.KeyInspection
+	if err := json.NewDecoder(res.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
 // startSaveCache begins a save-cache upload session and returns the server's
 // configured single-file size limit (0 if the server has no limit), so the
 // client can skip oversized files before spending time compressing and

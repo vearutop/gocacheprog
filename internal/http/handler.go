@@ -418,6 +418,7 @@ var routes = map[string]func(*Handler, http.ResponseWriter, *http.Request){
 	"/restore-cache":                (*Handler).RestoreCache,
 	"/clear":                        (*Handler).ClearCache,
 	"/inspect":                      (*Handler).InspectCache,
+	"/inspect-keys":                 (*Handler).InspectKeys,
 	"/integrity-check":              (*Handler).IntegrityCheck,
 	"/save-cache-has":               (*Handler).SaveCacheHas,
 	"/save-cache":                   (*Handler).SaveCache,

@@ -36,6 +36,25 @@ func newFallbackTestServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// newFallbackTestServerWithSessions is newFallbackTestServer plus sessions.jsonl enabled, for
+// tests that need to assert a done*Mode function actually reported its session as finished.
+func newFallbackTestServerWithSessions(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+
+	serverDir := t.TempDir()
+	localStore, err := NewStore(serverDir, WithCompression())
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"), gocache.WithCompression())
+	require.NoError(t, err)
+
+	jsonlPath := filepath.Join(t.TempDir(), "sessions.jsonl")
+	srv := httptest.NewServer(cachehttp.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2, cachehttp.WithSessionsJSONL(jsonlPath)))
+	t.Cleanup(srv.Close)
+
+	return srv, jsonlPath
+}
+
 func writeCacheFile(t *testing.T, cacheDir, relPath, content string, modTime time.Time) {
 	t.Helper()
 
@@ -249,7 +268,7 @@ func TestInitLocalGocacheMode_FallbackRemoteRestoresWhenCold(t *testing.T) {
 		remoteURL:      srv.URL,
 		fallbackRemote: true,
 	}
-	require.NoError(t, initLocalGocacheMode(cfg, "commit123", "", "", time.Now()))
+	require.NoError(t, initLocalGocacheMode(cfg, "commit123", "", "", "session-1", time.Now()))
 
 	body, err := os.ReadFile(filepath.Join(cacheDir, "ab", "seed"))
 	require.NoError(t, err)
@@ -260,6 +279,44 @@ func TestInitLocalGocacheMode_FallbackRemoteRestoresWhenCold(t *testing.T) {
 	require.Contains(t, string(env), envGHALocalFallback+"=1")
 	require.Contains(t, string(env), envGHARemoteURL+"="+srv.URL)
 	require.Contains(t, string(env), envGHACommit+"=commit123")
+}
+
+func TestLocalGocacheMode_ReportsSessionDoneWhenFallbackRestored(t *testing.T) {
+	srv, jsonlPath := newFallbackTestServerWithSessions(t)
+
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	githubEnv := filepath.Join(t.TempDir(), "github_env")
+	t.Setenv("GITHUB_ENV", githubEnv)
+
+	cfg := githubActionsConfig{
+		cacheDir:       cacheDir,
+		buildType:      "owner-repo-unit",
+		remoteURL:      srv.URL,
+		fallbackRemote: true,
+	}
+	require.NoError(t, initLocalGocacheMode(cfg, "commit123", "", "", "local-session-1", time.Now()))
+
+	env, err := os.ReadFile(githubEnv)
+	require.NoError(t, err)
+	require.Contains(t, string(env), envGHASessionID+"=local-session-1")
+
+	// initLocalGocacheMode wrote GITHUB_ENV as its own process would see it via `export
+	// FOO=bar` lines; doneLocalGocacheMode reads back through os.Getenv, so apply what it
+	// exported the same way -github-actions-done's own process would pick it up.
+	t.Setenv(envGHACacheDir, cacheDir)
+	t.Setenv(envGHARemoteURL, srv.URL)
+	t.Setenv(envGHAAuth, "")
+	t.Setenv(envGHASessionID, "local-session-1")
+	t.Setenv(envGHALocalFallback, "1")
+
+	require.NoError(t, doneLocalGocacheMode())
+
+	data, err := os.ReadFile(jsonlPath)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"event":"done"`)
+	require.Contains(t, string(data), `"session_id":"local-session-1"`)
+	require.Contains(t, string(data), `"mode":"local-gocache"`)
+	require.Contains(t, string(data), `"local_cache_files"`)
 }
 
 func TestInitLocalGocacheMode_FallbackRemoteSkipsRestoreWhenWarm(t *testing.T) {
@@ -277,7 +334,7 @@ func TestInitLocalGocacheMode_FallbackRemoteSkipsRestoreWhenWarm(t *testing.T) {
 		remoteURL:      "http://127.0.0.1:1", // unreachable; a restore attempt would fail the call
 		fallbackRemote: true,
 	}
-	require.NoError(t, initLocalGocacheMode(cfg, "commit123", "", "", time.Now()))
+	require.NoError(t, initLocalGocacheMode(cfg, "commit123", "", "", "session-1", time.Now()))
 
 	env, err := os.ReadFile(githubEnv)
 	require.NoError(t, err)
@@ -294,7 +351,7 @@ func TestInitLocalGocacheMode_FallbackRemoteColdWithoutRemoteURLErrors(t *testin
 		buildType:      "owner-repo-unit",
 		fallbackRemote: true,
 	}
-	err := initLocalGocacheMode(cfg, "commit123", "", "", time.Now())
+	err := initLocalGocacheMode(cfg, "commit123", "", "", "session-1", time.Now())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "fallback_remote requires a remote URL")
 }

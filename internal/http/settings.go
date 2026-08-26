@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vearutop/gocacheprog/internal/cache"
 )
@@ -160,13 +161,19 @@ func (h *Handler) PreloadLimitBytesSettings(rw http.ResponseWriter, r *http.Requ
 	}
 }
 
-// trimToPreloadBudget drops items from a preload response's most expensive entries first --
-// largest wire size first -- until the remaining total fits within limitBytes, preserving the
-// original relative order of whatever survives. limitBytes <= 0 disables trimming (returns items
-// unchanged). Unlike gocache.Store's own RestoreLimitBytes selection (which prioritizes recency
-// over size), this is the GOCACHEPROG /preload path's only total-size control today, with no
-// existing behavior to stay compatible with -- so it implements the simpler, literal "biggest
-// goes first" policy instead.
+// preloadTrimBucket buckets items by save time before ranking them for trimming (see
+// trimToPreloadBudget), matching the granularity gocache.Store's own eviction heap defaults to
+// (see WithEvictionBucket) -- kept as a separate constant rather than sharing that one directly
+// since this is a different store's budget, not a reason to couple the two.
+const preloadTrimBucket = time.Hour
+
+// trimToPreloadBudget drops items from a preload response until the remaining total fits within
+// limitBytes, preserving the original relative order of whatever survives. limitBytes <= 0
+// disables trimming (returns items unchanged). Ranking mirrors gocache.Store's own eviction
+// ordering (see moreEvictable): items are bucketed by save time (preloadTrimBucket-wide), the
+// oldest bucket is dropped from first, and within a bucket the largest item goes first -- so one
+// large-but-not-meaningfully-newer item can't crowd out many smaller items from about the same
+// time window the way a pure "biggest first" or pure "oldest first" rule each would.
 func trimToPreloadBudget(items []cache.ResponseItem, limitBytes int64) []cache.ResponseItem {
 	if limitBytes <= 0 || len(items) == 0 {
 		return items
@@ -187,12 +194,23 @@ func trimToPreloadBudget(items []cache.ResponseItem, limitBytes int64) []cache.R
 		return items
 	}
 
+	bucketOf := func(item cache.ResponseItem) int64 {
+		if item.Time == nil {
+			return 0
+		}
+		return item.Time.UnixMicro() / preloadTrimBucket.Microseconds()
+	}
+
 	order := make([]int, len(items))
 	for i := range order {
 		order[i] = i
 	}
 	sort.Slice(order, func(a, b int) bool {
-		return sizeOf(items[order[a]]) > sizeOf(items[order[b]])
+		ia, ib := items[order[a]], items[order[b]]
+		if ba, bb := bucketOf(ia), bucketOf(ib); ba != bb {
+			return ba < bb
+		}
+		return sizeOf(ia) > sizeOf(ib)
 	})
 
 	drop := make(map[int]struct{}, len(items))
