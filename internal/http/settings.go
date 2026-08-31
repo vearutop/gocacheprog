@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vearutop/gocacheprog/internal/cache"
 )
@@ -19,11 +21,19 @@ import (
 // Deliberately a single open struct even though it holds one field today: the file (and this
 // type) is meant to grow other server-side settings the same way, not be re-designed for each one.
 type serverSettings struct {
-	// PreloadLimitBytesByBuildType caps the total wire bytes a single preload/restore-cache
+	// MaxPreloadTotalBytesByBuildType caps the total wire bytes a single preload/restore-cache
 	// response for a build type may return, applied only when the request itself didn't already
-	// specify a limit (see preloadLimitBytesFor's callers in restore_cache.go/preload.go) --
+	// specify a limit (see maxPreloadTotalBytesFor's callers in restore_cache.go/preload.go) --
 	// a request-supplied limit always wins over this server-side default.
-	PreloadLimitBytesByBuildType map[string]int64 `json:"preload_limit_bytes_by_build_type,omitempty"`
+	MaxPreloadTotalBytesByBuildType map[string]int64 `json:"max_preload_bytes_by_build_type,omitempty"`
+
+	// MaxFileBytesByBuildType caps the size of any single object a build type will
+	// restore/preload, applied only when the request itself didn't already specify one (see
+	// maxFileBytesFor's callers) -- a request-supplied value always wins over this server-side
+	// default. This is also the value -github-actions-init falls back to querying (via
+	// max_file_bytes) when its own DSN doesn't set one, so an operator can retune the
+	// default for a build type without touching every workflow file that uses it.
+	MaxFileBytesByBuildType map[string]int64 `json:"max_file_bytes_by_build_type,omitempty"`
 }
 
 // loadSettings reads h.settingsPath once at startup (see WithSettingsPath); a missing file is
@@ -52,31 +62,64 @@ func (h *Handler) loadSettings() {
 	h.settingsMu.Unlock()
 }
 
-// preloadLimitBytesFor returns the server-configured preload/restore byte budget for buildType,
-// or 0 (disabled) if none is set.
-func (h *Handler) preloadLimitBytesFor(buildType string) int64 {
-	h.settingsMu.Lock()
-	defer h.settingsMu.Unlock()
+// copyInt64Map returns a defensive copy of m, or nil if empty. Every reader of
+// serverSettings' maps (the JSON GET handlers, the status page) must go through a snapshot
+// method built on this rather than keep the live map past settingsMu.Unlock(): setMaxPreloadTotalBytes
+// /setMaxFileBytes mutate that same map in place under their own lock, so holding an unlocked
+// reference to it while e.g. json.Encode iterates it is a real data race, not just a staleness
+// risk.
+func copyInt64Map(m map[string]int64) map[string]int64 {
+	if len(m) == 0 {
+		return nil
+	}
 
-	return h.settings.PreloadLimitBytesByBuildType[buildType]
+	out := make(map[string]int64, len(m))
+	maps.Copy(out, m)
+
+	return out
 }
 
-// setPreloadLimitBytes sets buildType's preload/restore byte budget, or clears it entirely when
-// bytes <= 0 -- matching the 0-means-disabled convention already used throughout this codebase
-// (MaxFileBytes, RestoreLimitBytes, max_cache_bytes). Persists to h.settingsPath if configured;
-// with no path configured, the change still takes effect for this process, it just won't survive
-// a restart.
-func (h *Handler) setPreloadLimitBytes(buildType string, bytes int64) error {
+// maxPreloadTotalBytesSnapshot returns a defensive copy of MaxPreloadTotalBytesByBuildType (see
+// copyInt64Map).
+func (h *Handler) maxPreloadTotalBytesSnapshot() map[string]int64 {
 	h.settingsMu.Lock()
 	defer h.settingsMu.Unlock()
 
+	return copyInt64Map(h.settings.MaxPreloadTotalBytesByBuildType)
+}
+
+// maxFileBytesSnapshot returns a defensive copy of MaxFileBytesByBuildType (see copyInt64Map).
+func (h *Handler) maxFileBytesSnapshot() map[string]int64 {
+	h.settingsMu.Lock()
+	defer h.settingsMu.Unlock()
+
+	return copyInt64Map(h.settings.MaxFileBytesByBuildType)
+}
+
+// maxPreloadTotalBytesFor returns the server-configured preload/restore byte budget for buildType,
+// or 0 (disabled) if none is set.
+func (h *Handler) maxPreloadTotalBytesFor(buildType string) int64 {
+	h.settingsMu.Lock()
+	defer h.settingsMu.Unlock()
+
+	return h.settings.MaxPreloadTotalBytesByBuildType[buildType]
+}
+
+// setBuildTypeInt64 sets buildType's value in *m to bytes, or clears it entirely when bytes <= 0
+// -- matching the 0-means-disabled convention already used throughout this codebase (MaxFileBytes,
+// MaxPreloadTotalBytes, max_cache_bytes). Persists h.settings as a whole to h.settingsPath if
+// configured; with no path configured, the change still takes effect for this process, it just
+// won't survive a restart. Shared by setMaxPreloadTotalBytes/setMaxFileBytes so their persistence
+// logic can't drift apart -- must be called with h.settingsMu held.
+func (h *Handler) setBuildTypeInt64(m *map[string]int64, buildType string, bytes int64) error {
 	if bytes <= 0 {
-		delete(h.settings.PreloadLimitBytesByBuildType, buildType)
+		delete(*m, buildType)
 	} else {
-		if h.settings.PreloadLimitBytesByBuildType == nil {
-			h.settings.PreloadLimitBytesByBuildType = make(map[string]int64)
+		if *m == nil {
+			*m = make(map[string]int64)
 		}
-		h.settings.PreloadLimitBytesByBuildType[buildType] = bytes
+
+		(*m)[buildType] = bytes
 	}
 
 	if h.settingsPath == "" {
@@ -89,6 +132,31 @@ func (h *Handler) setPreloadLimitBytes(buildType string, bytes int64) error {
 	}
 
 	return writeFileAtomic(h.settingsPath, data, 0o600)
+}
+
+// setMaxPreloadTotalBytes sets buildType's preload/restore byte budget (see setBuildTypeInt64).
+func (h *Handler) setMaxPreloadTotalBytes(buildType string, bytes int64) error {
+	h.settingsMu.Lock()
+	defer h.settingsMu.Unlock()
+
+	return h.setBuildTypeInt64(&h.settings.MaxPreloadTotalBytesByBuildType, buildType, bytes)
+}
+
+// maxFileBytesFor returns the server-configured max-file-bytes default for buildType, or 0
+// (disabled) if none is set.
+func (h *Handler) maxFileBytesFor(buildType string) int64 {
+	h.settingsMu.Lock()
+	defer h.settingsMu.Unlock()
+
+	return h.settings.MaxFileBytesByBuildType[buildType]
+}
+
+// setMaxFileBytes sets buildType's max-file-bytes default (see setBuildTypeInt64).
+func (h *Handler) setMaxFileBytes(buildType string, bytes int64) error {
+	h.settingsMu.Lock()
+	defer h.settingsMu.Unlock()
+
+	return h.setBuildTypeInt64(&h.settings.MaxFileBytesByBuildType, buildType, bytes)
 }
 
 // writeFileAtomic writes data to path via a temp-file-then-rename, so a reader (or a crash
@@ -113,24 +181,17 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
-// PreloadLimitBytesSettings views (GET) or changes (POST) the server-side per-build-type preload
-// budget (see serverSettings.PreloadLimitBytesByBuildType). Bearer-gated like the other admin
-// endpoints (/clear, /inspect), not Basic-Auth-gated like the status page.
-//
-// GET returns the full current map as JSON.
-//
-// POST requires a build-type query param and sets that build type's budget to the bytes query
-// param's value; bytes=0 (or omitted) clears the override for that build type instead.
-func (h *Handler) PreloadLimitBytesSettings(rw http.ResponseWriter, r *http.Request) {
+// buildTypeInt64Settings implements the shared GET/POST shape for a per-build-type int64
+// setting: GET returns the full current map as JSON; POST requires a build-type query param and
+// sets that build type's value to the bytes query param, or clears it (bytes=0 or omitted).
+// Shared by MaxPreloadTotalBytesSettings/MaxFileBytesSettings so the two endpoints' request handling
+// can't drift apart -- logName only affects the encode-failure log line.
+func (h *Handler) buildTypeInt64Settings(rw http.ResponseWriter, r *http.Request, logName string, snapshot func() map[string]int64, set func(buildType string, bytes int64) error) {
 	switch r.Method {
 	case http.MethodGet:
-		h.settingsMu.Lock()
-		limits := h.settings.PreloadLimitBytesByBuildType
-		h.settingsMu.Unlock()
-
 		rw.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(rw).Encode(limits); err != nil {
-			log.Printf("encode preload-limit-bytes settings: %s", err.Error())
+		if err := json.NewEncoder(rw).Encode(snapshot()); err != nil {
+			log.Printf("encode %s settings: %s", logName, err.Error())
 		}
 	case http.MethodPost:
 		buildType := strings.TrimSpace(r.URL.Query().Get("build-type"))
@@ -149,7 +210,7 @@ func (h *Handler) PreloadLimitBytesSettings(rw http.ResponseWriter, r *http.Requ
 			bytes = n
 		}
 
-		if err := h.setPreloadLimitBytes(buildType, bytes); err != nil {
+		if err := set(buildType, bytes); err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -160,13 +221,33 @@ func (h *Handler) PreloadLimitBytesSettings(rw http.ResponseWriter, r *http.Requ
 	}
 }
 
-// trimToPreloadBudget drops items from a preload response's most expensive entries first --
-// largest wire size first -- until the remaining total fits within limitBytes, preserving the
-// original relative order of whatever survives. limitBytes <= 0 disables trimming (returns items
-// unchanged). Unlike gocache.Store's own RestoreLimitBytes selection (which prioritizes recency
-// over size), this is the GOCACHEPROG /preload path's only total-size control today, with no
-// existing behavior to stay compatible with -- so it implements the simpler, literal "biggest
-// goes first" policy instead.
+// MaxPreloadTotalBytesSettings views (GET) or changes (POST) the server-side per-build-type preload
+// budget (see serverSettings.MaxPreloadTotalBytesByBuildType). Bearer-gated like the other admin
+// endpoints (/clear, /inspect), not Basic-Auth-gated like the status page.
+func (h *Handler) MaxPreloadTotalBytesSettings(rw http.ResponseWriter, r *http.Request) {
+	h.buildTypeInt64Settings(rw, r, "max-preload-total-bytes", h.maxPreloadTotalBytesSnapshot, h.setMaxPreloadTotalBytes)
+}
+
+// MaxFileBytesSettings views (GET) or changes (POST) the server-side per-build-type
+// max-file-bytes default (see serverSettings.MaxFileBytesByBuildType). Same shape as
+// MaxPreloadTotalBytesSettings.
+func (h *Handler) MaxFileBytesSettings(rw http.ResponseWriter, r *http.Request) {
+	h.buildTypeInt64Settings(rw, r, "max-file-bytes", h.maxFileBytesSnapshot, h.setMaxFileBytes)
+}
+
+// preloadTrimBucket buckets items by save time before ranking them for trimming (see
+// trimToPreloadBudget), matching the granularity gocache.Store's own eviction heap defaults to
+// (see WithEvictionBucket) -- kept as a separate constant rather than sharing that one directly
+// since this is a different store's budget, not a reason to couple the two.
+const preloadTrimBucket = time.Hour
+
+// trimToPreloadBudget drops items from a preload response until the remaining total fits within
+// limitBytes, preserving the original relative order of whatever survives. limitBytes <= 0
+// disables trimming (returns items unchanged). Ranking mirrors gocache.Store's own eviction
+// ordering (see moreEvictable): items are bucketed by save time (preloadTrimBucket-wide), the
+// oldest bucket is dropped from first, and within a bucket the largest item goes first -- so one
+// large-but-not-meaningfully-newer item can't crowd out many smaller items from about the same
+// time window the way a pure "biggest first" or pure "oldest first" rule each would.
 func trimToPreloadBudget(items []cache.ResponseItem, limitBytes int64) []cache.ResponseItem {
 	if limitBytes <= 0 || len(items) == 0 {
 		return items
@@ -187,12 +268,23 @@ func trimToPreloadBudget(items []cache.ResponseItem, limitBytes int64) []cache.R
 		return items
 	}
 
+	bucketOf := func(item cache.ResponseItem) int64 {
+		if item.Time == nil {
+			return 0
+		}
+		return item.Time.UnixMicro() / preloadTrimBucket.Microseconds()
+	}
+
 	order := make([]int, len(items))
 	for i := range order {
 		order[i] = i
 	}
 	sort.Slice(order, func(a, b int) bool {
-		return sizeOf(items[order[a]]) > sizeOf(items[order[b]])
+		ia, ib := items[order[a]], items[order[b]]
+		if ba, bb := bucketOf(ia), bucketOf(ib); ba != bb {
+			return ba < bb
+		}
+		return sizeOf(ia) > sizeOf(ib)
 	})
 
 	drop := make(map[int]struct{}, len(items))

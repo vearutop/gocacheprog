@@ -48,13 +48,13 @@ const manifestExt = ".zst"
 const manifestPrefixLen = 1
 
 type Request struct {
-	Commit            string
-	ChangesID         string
-	BuildType         string
-	BaseCommit        string
-	ParentCommit      string
-	MaxFileBytes      int64
-	RestoreLimitBytes int64
+	Commit               string
+	ChangesID            string
+	BuildType            string
+	BaseCommit           string
+	ParentCommit         string
+	MaxFileBytes         int64
+	MaxPreloadTotalBytes int64
 }
 
 type FileItem struct {
@@ -99,6 +99,17 @@ type InspectStats struct {
 	MaxBandFilesCount        int   `json:"max_band_files_count"`
 	MaxBandCompressedBytes   int64 `json:"max_band_compressed_bytes"`
 	MaxBandUncompressedBytes int64 `json:"max_band_uncompressed_bytes"`
+}
+
+// KeyInspection is one requested object key's forensic result from Store.InspectKeys: was it
+// recorded as used in the resolved manifest(s) for this scope, does this store currently have
+// it, and (if so) how big and how old is it.
+type KeyInspection struct {
+	Key          string  `json:"key"`
+	InManifest   bool    `json:"in_manifest"`
+	ExistsRemote bool    `json:"exists_remote"`
+	Size         int64   `json:"size,omitempty"`
+	AgeSeconds   float64 `json:"age_seconds,omitempty"`
 }
 
 type Store struct {
@@ -795,6 +806,7 @@ func (s *Store) Restore(req Request, cb func(FileItem)) ([]string, error) {
 	}
 
 	entries := make([]restoreEntry, 0, len(paths))
+	missingFromIndex := 0
 
 	// Deliberately read-only: a restore doesn't prove the object was actually used by the
 	// build that requested it (a manifest lists everything that build type might need, not
@@ -804,12 +816,24 @@ func (s *Store) Restore(req Request, cb func(FileItem)) ([]string, error) {
 	for _, relPath := range paths {
 		ie, ok := s.index[relPath]
 		if !ok {
+			missingFromIndex++
+
 			continue
 		}
 
 		entries = append(entries, restoreEntry{path: relPath, ie: ie})
 	}
 	s.mu.Unlock()
+
+	// Previously silent, and a genuinely separate check from restorePaths/loadManifest's own
+	// index-membership self-heal (which already logs its own drops): loadManifest confirms each
+	// path is in the index while holding s.mu, returns, and only then does this second lock+check
+	// run -- so a path can be present for the first check and gone by the second (e.g. an eviction
+	// landing in between), a case loadManifest's own log can never catch since it never saw it
+	// missing.
+	if missingFromIndex > 0 {
+		log.Printf("restore: %d/%d resolved path(s) not in the index at restore time (build_type=%q commit=%q changes_id=%q)", missingFromIndex, len(paths), req.BuildType, req.Commit, req.ChangesID)
+	}
 
 	entries = s.selectRestoreEntries(req, entries)
 
@@ -999,6 +1023,58 @@ func (s *Store) Inspect(req Request) (InspectStats, error) {
 	}
 
 	return stats, nil
+}
+
+// InspectKeys checks a specific set of GOCACHE object keys (this store's own on-disk relative
+// object path convention, e.g. "xx/hash-a" -- see objectPath) against this store: is each one
+// recorded as used in the manifest(s) resolved for req's scope, does this store currently have
+// it, and if so its size and age. Built for post-mortem cache-miss forensics (see teststat's
+// -testcache-keys): distinguishing "never seen before" (neither flag set) from "in the
+// manifest but not here anymore, e.g. evicted" (InManifest only) from "here, but somehow wasn't
+// restored -- a restore-selection bug, not an absence" (ExistsRemote only) from "genuinely warm"
+// (both). Unlike Inspect, an unresolvable scope (e.g. no build-type/commit/changes-id at all) is
+// not an error: ExistsRemote/Size/AgeSeconds are still meaningful without any manifest context,
+// only InManifest would be.
+func (s *Store) InspectKeys(req Request, keys []string) ([]KeyInspection, error) {
+	targetManifests, err := s.targetManifestPaths(req)
+	if err != nil {
+		return nil, err
+	}
+
+	inManifest := make(map[string]bool, len(keys))
+
+	for _, manifestPath := range targetManifests {
+		paths, err := readManifestPaths(manifestPath)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+
+		for _, relPath := range paths {
+			inManifest[relPath] = true
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result := make([]KeyInspection, len(keys))
+
+	for i, key := range keys {
+		ki := KeyInspection{Key: key, InManifest: inManifest[key]}
+
+		if ie, ok := s.index[key]; ok && s.objectExistsLocked(key) {
+			ki.ExistsRemote = true
+			ki.Size = ie.Size
+
+			if ie.ModTimeMicro != 0 {
+				ki.AgeSeconds = time.Since(time.UnixMicro(ie.ModTimeMicro)).Seconds()
+			}
+		}
+
+		result[i] = ki
+	}
+
+	return result, nil
 }
 
 func (s *Store) AppendUploadPaths(uploadID string, paths []string) error {
@@ -1332,8 +1408,8 @@ func (s *Store) selectRestoreEntries(req Request, entries []restoreEntry) []rest
 		filtered = append(filtered, entry)
 	}
 
-	if req.RestoreLimitBytes <= 0 || len(filtered) < 2 {
-		if req.RestoreLimitBytes > 0 && len(filtered) == 1 && s.entryStoredSize(filtered[0].ie) > req.RestoreLimitBytes {
+	if req.MaxPreloadTotalBytes <= 0 || len(filtered) < 2 {
+		if req.MaxPreloadTotalBytes > 0 && len(filtered) == 1 && s.entryStoredSize(filtered[0].ie) > req.MaxPreloadTotalBytes {
 			return filtered[:0]
 		}
 		return filtered
@@ -1353,7 +1429,7 @@ func (s *Store) selectRestoreEntries(req Request, entries []restoreEntry) []rest
 	limit := 0
 	for _, entry := range filtered {
 		size := s.entryStoredSize(entry.ie)
-		if total+size > req.RestoreLimitBytes {
+		if total+size > req.MaxPreloadTotalBytes {
 			break
 		}
 		total += size
@@ -1744,15 +1820,28 @@ func (s *Store) loadManifest(manifestPath string) ([]string, bool, error) {
 	// them, one at a time, before any header could be sent, was slow enough by itself to blow a
 	// client's response-header timeout.
 	res := make([]string, 0, len(candidates))
+	droppedMissingIndex := 0
+
 	s.mu.Lock()
 	for _, relPath := range candidates {
 		if _, ok := s.index[relPath]; !ok {
 			changed = true
+			droppedMissingIndex++
+
 			continue
 		}
 		res = append(res, relPath)
 	}
 	s.mu.Unlock()
+
+	// Previously silent: this self-heal prune (see the caller's write-back) is expected to fire
+	// for genuinely evicted objects, but it's indistinguishable from a bug (e.g. a key format
+	// mismatch between what got written into the index vs. the manifest) without a log line --
+	// see restorePaths' caller, whose forensics (/inspect-keys) checks index membership by the
+	// exact same key and can disagree with what this just dropped.
+	if droppedMissingIndex > 0 {
+		log.Printf("manifest self-heal: %s: dropping %d/%d listed path(s) no longer in the index", manifestPath, droppedMissingIndex, len(candidates))
+	}
 
 	return res, changed, nil
 }
@@ -2584,6 +2673,59 @@ func CollectFreshFiles(cacheDir string, maxFileSize int64) (Batch, SkippedLargeF
 	return CollectFilesToSave(cacheDir, restoredPaths, maxFileSize)
 }
 
+// debugWatchRestorePaths: TEMPORARY, see the log call in CollectFilesToSave below. Empty by
+// default; populated per-run by SetDebugWatchRestorePaths from this run's own captured miss keys
+// (see investigateTestcacheKeys) rather than a hardcoded, stale snapshot -- covers every miss
+// that got a key this run, not just whichever ones a past run happened to have. Remove both
+// alongside the rest of this investigation's instrumentation once resolved.
+var debugWatchRestorePaths = map[string]bool{}
+
+// SetDebugWatchRestorePaths is TEMPORARY, paired with debugWatchRestorePaths above.
+func SetDebugWatchRestorePaths(keys []string) {
+	m := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		m[k] = true
+	}
+	debugWatchRestorePaths = m
+}
+
+// debugLogWatchedPath is TEMPORARY, for a specific, reproducible investigation: a handful of
+// test-result ActionID keys (adjust/backend's analytics/networks/csv_uploader/kafka packages)
+// keep missing cache on every run without their remote copy ever refreshing. A prior round ruled
+// out "restored then rewritten but excluded": these -a files restore with a valid mtime that's
+// never touched again, so go never rewrites them. That points at the -d output blob the -a
+// record's own bytes reference (go's on-disk entry format is "v1 " + 64-hex ActionID + " " +
+// 64-hex OutputID + " " + size + " " + time + "\n") being the actual missing half -- extract it
+// and check it directly, rather than waiting for CollectFilesToSave's own walk to reach it (which
+// may never log it at all if -max-file-bytes skips it first). Remove alongside
+// debugWatchRestorePaths once confirmed/fixed.
+func debugLogWatchedPath(cacheDir, relPath, path string, info os.FileInfo, wasRestored bool) {
+	outputIDHex := ""
+
+	raw, rerr := os.ReadFile(path) //nolint:gosec // path comes from our own cacheDir walk, not user input.
+	if rerr == nil && len(raw) >= 132 && bytes.HasPrefix(raw, []byte("v1 ")) {
+		outputIDHex = string(raw[68:132])
+	}
+
+	log.Printf("DEBUG watch: %s found on disk mtime=%s size=%d restored_this_job=%v output_id=%s", relPath, info.ModTime().Format(time.RFC3339Nano), info.Size(), wasRestored, outputIDHex)
+
+	if outputIDHex == "" {
+		return
+	}
+
+	dRelPath := outputIDHex[:2] + "/" + outputIDHex + "-d"
+	dPath := filepath.Join(cacheDir, outputIDHex[:2], outputIDHex+"-d")
+
+	dInfo, derr := os.Stat(dPath) //nolint:gosec // outputIDHex is parsed from our own cacheDir walk, not user input.
+	if derr != nil {
+		log.Printf("DEBUG watch: %s -d output blob not on local disk: %s", dRelPath, derr.Error())
+
+		return
+	}
+
+	log.Printf("DEBUG watch: %s -d output blob on local disk mtime=%s size=%d", dRelPath, dInfo.ModTime().Format(time.RFC3339Nano), dInfo.Size())
+}
+
 func CollectFilesToSave(cacheDir string, restoredPaths map[string]struct{}, maxFileSize int64) (Batch, SkippedLargeFiles, error) {
 	batch := Batch{}
 	var skippedLarge SkippedLargeFiles
@@ -2622,6 +2764,14 @@ func CollectFilesToSave(cacheDir string, restoredPaths map[string]struct{}, maxF
 		if err != nil {
 			return err
 		}
+
+		// TEMPORARY debug instrumentation, see debugLogWatchedPath's doc comment. Remove both
+		// once the analytics/networks/csv_uploader/kafka investigation is confirmed/fixed.
+		if debugWatchRestorePaths[relPath] {
+			_, wasRestored := restoredPaths[relPath]
+			debugLogWatchedPath(cacheDir, relPath, path, info, wasRestored)
+		}
+
 		if _, ok := restoredPaths[relPath]; ok {
 			return nil
 		}

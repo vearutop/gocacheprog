@@ -134,7 +134,7 @@ Usage of ./bin/gocacheprog:
         remote HTTP server cache source, e.g. https://example.com:8080
   -restore-cache
         restore native GOCACHE files into -cache-dir and exit
-  -restore-limit-bytes int
+  -max-preload-total-bytes int
         maximum total compressed bytes to download during native -restore-cache after -max-file-bytes filtering; 0 disables the limit
   -save-cache
         save freshly created native GOCACHE files from -cache-dir and exit
@@ -309,8 +309,8 @@ How it works:
 - restore streams matching files from the remote server and materializes native cache files locally
 - local restore preserves file contents and executable permission bits, but intentionally does not restore historical mtimes
 - `-max-file-bytes` can skip pathological large single cache files during both native restore and native save
-- `-restore-limit-bytes` caps total compressed native restore download after `-max-file-bytes` filtering; eligible files are ordered by timestamp descending, then size ascending, and only the leading prefix that fits is restored
-- the server can also set a default total-size budget per build type (see [Server settings](#server-settings) below), applied to both native `-restore-cache` and `GOCACHEPROG` `/preload` -- a client-supplied `-restore-limit-bytes` always takes precedence over it when present
+- `-max-preload-total-bytes` caps total compressed native restore download after `-max-file-bytes` filtering; eligible files are ordered by timestamp descending, then size ascending, and only the leading prefix that fits is restored
+- the server can also set a default total-size budget per build type (see [Server settings](#server-settings) below), applied to both native `-restore-cache` and `GOCACHEPROG` `/preload` -- a client-supplied `-max-preload-total-bytes` always takes precedence over it when present
 - restore writes local bookkeeping files so save can distinguish restored files from freshly created ones
 - save walks the local `GOCACHE` tree, skips files that were already restored in this job, skips helper bookkeeping files, compresses payloads client-side, and streams them to the server
 - the server stores compressed file objects and merges uploaded file paths into the relevant manifests; when the server also runs with `-max-file-bytes`, oversized objects are silently skipped on save and treated as misses on restore
@@ -620,13 +620,19 @@ curl -u "x:secret-token" https://cache.example.com/sessions.jsonl -o sessions.js
 
 A session-done call can optionally carry a JSON object body, merged as additional top-level
 fields into that session's "done" line (a field colliding with one of the fixed ones above is
-dropped rather than overwriting it). `-github-actions-done` (gocache mode) always attaches its
-save-cache skip counts this way (`save_skipped_existing`, `save_considered`,
-`save_skipped_large_count`, `save_skipped_large_bytes` — the same numbers as the
-`save-cache: skipping N/M objects the server already has` log line), plus, for every
-`report_<name>=<path>` DSN query parameter (see `internal/local/github_actions.go`'s DSN format),
-that local file's content under the key `<name>` — inlined as JSON if the content parses as
-JSON, otherwise reported as a literal string.
+dropped rather than overwriting it). `-github-actions-done` calls it in every mode except
+local-gocache's fully-local case (which never talks to a remote at all, so has no session to mark
+done), always attaching `"mode"` (`direct`, `shim`, `gocache`, or `local-gocache`) plus
+mode-specific counts (gocache mode's save-cache skip counts —
+`save_skipped_existing`/`save_considered`/`save_skipped_large_count`/`save_skipped_large_bytes`,
+the same numbers as the `save-cache: skipping N/M objects the server already has` log line; direct
+and shim modes' own hit/miss/put `StatsSummary`; local-gocache's `local_cache_files`/
+`local_cache_bytes` when `fallback_remote` talked to the remote this run) — plus, in every mode,
+for every `report_<name>=<path>` DSN query parameter (see `internal/local/github_actions.go`'s DSN
+format), that local file's content under the key `<name>` — inlined as JSON if the content parses
+as JSON, otherwise reported as a literal string. This is how a tool like `teststat`'s
+`-metrics-json` attaches its own report to a session: point `report_teststat=<path>` at the same
+path `-metrics-json` writes to during the job.
 
 ## Authentication
 
@@ -776,33 +782,55 @@ Examples:
 
 ### Server settings
 
-`/settings/preload-limit-bytes` views or changes a per-build-type default total-size budget for
-preload/restore responses — the server-side counterpart to `-restore-limit-bytes`, for build
+Two per-build-type defaults are settable at runtime, both named `-max-<scope>-bytes` so the only
+thing that changes between them is what's being capped: `-max-preload-total-bytes` caps the whole
+preload/restore response, `-max-file-bytes` caps any single object within it.
+
+`/settings/max-preload-total-bytes` views or changes a per-build-type default total-size budget for
+preload/restore responses — the server-side counterpart to `-max-preload-total-bytes`, for build
 types whose CI jobs don't (or can't) set a client-side limit of their own. Applied to both native
-`-restore-cache` and `GOCACHEPROG` `/preload`; a client-supplied `-restore-limit-bytes` always
+`-restore-cache` and `GOCACHEPROG` `/preload`; a client-supplied `-max-preload-total-bytes` always
 takes precedence over it when present (see [Native `GOCACHE` Batch Mode](#native-gocache-batch-mode) above). `/preload` has
 no client-side limit of its own at all today, so this is currently the only control over its
 total response size.
 
-`GET` returns the full current map of build type to byte budget as JSON:
+`/settings/max-file-bytes` views or changes a per-build-type default for the largest single
+object a build type will restore, preload, or save — the server-side counterpart to
+`-max-file-bytes`/the GitHub Actions DSN's `max_file_bytes`. A GitHub Actions job whose
+DSN doesn't set `max_file_bytes` queries this at `-github-actions-init` time and uses it
+if set, before falling back to a hardcoded default — so retuning it here takes effect for every
+such job without editing a single workflow file.
+
+Both endpoints share the same shape. `GET` returns the full current map of build type to bytes
+as JSON:
 
 ```bash
-curl -H "Authorization: Bearer secret-token" https://cache.example.com/settings/preload-limit-bytes
+curl -H "Authorization: Bearer secret-token" https://cache.example.com/settings/max-preload-total-bytes
+curl -H "Authorization: Bearer secret-token" https://cache.example.com/settings/max-file-bytes
 ```
 
-`POST` sets (or clears) one build type's budget — `bytes=0` (or omitting it) clears the override
+`POST` sets (or clears) one build type's value — `bytes=0` (or omitting it) clears the override
 for that build type, matching the 0-means-disabled convention used everywhere else in this
 codebase:
 
 ```bash
 curl -X POST -H "Authorization: Bearer secret-token" \
-  "https://cache.example.com/settings/preload-limit-bytes?build-type=owner-repo-unit&bytes=500000000"
+  "https://cache.example.com/settings/max-preload-total-bytes?build-type=owner-repo-unit&bytes=500000000"
+curl -X POST -H "Authorization: Bearer secret-token" \
+  "https://cache.example.com/settings/max-file-bytes?build-type=owner-repo-unit&bytes=30000000"
 ```
 
-Selection within the budget follows whichever mechanism already applies to that path — native
-`-restore-cache` orders by timestamp descending then size ascending (see above); `/preload`, with
-no existing client-side mechanism of its own to stay compatible with, simply drops the largest
-items first until what's left fits.
+The Basic-Auth-gated status page (`/`) shows every currently-active override for both settings in
+a "Build-type overrides" table, with a small form under it to set either one directly from a
+browser — no `curl`/Bearer token needed for routine retuning.
+
+Selection within the max-preload-total-bytes budget follows whichever mechanism already applies to
+that path — native `-restore-cache` orders by timestamp descending then size ascending (see
+above); `/preload`, with no existing client-side mechanism of its own to stay compatible with,
+buckets items by save time and drops the oldest bucket first, largest-within-a-bucket first (see
+[`moreEvictable`](#eviction), the same ranking `gocache.Store`'s own eviction already uses) — so
+one large-but-not-meaningfully-newer item can't crowd out many smaller items from about the same
+time window.
 
 Settings are held in memory and, if the server was started with a cache directory (server mode
 always sets one), persisted to `<cache-dir>/settings.json` on every change and reloaded from it

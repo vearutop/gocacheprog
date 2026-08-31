@@ -282,6 +282,58 @@ func TestClient_SaveCache_SkipsFilesExceedingServerMaxFileBytesWithoutClientFlag
 	require.Equal(t, "ab/small\n", readManifestBodyForTest(t, commitManifestPath))
 }
 
+// TestClient_RestoreCache_UsesServerMaxFileBytesDefaultWhenRequestOmitsIt covers the
+// max_file_bytes remote-override path: a request with no MaxFileBytes of its own must
+// fall back to whatever the server has configured for that build type (see
+// Handler.MaxFileBytesSettings), the same way MaxPreloadTotalBytes already does for
+// max-preload-total-bytes.
+func TestClient_RestoreCache_UsesServerMaxFileBytesDefaultWhenRequestOmitsIt(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir)
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"))
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	cacheDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "ab"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "small"), []byte(strings.Repeat("a", 10)), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "ab", "large"), []byte(strings.Repeat("b", 40)), 0o600))
+
+	batch, _, err := gocache.CollectFreshFiles(cacheDir, 0)
+	require.NoError(t, err)
+	require.Len(t, batch.Items, 2)
+
+	req := gocache.Request{Commit: "commit123", ChangesID: "repo/pr-123", BuildType: "unit"}
+	saveStats, err := client.SaveCache(req, batch)
+	require.NoError(t, err)
+	require.Equal(t, 2, saveStats.Files, "no max-file-bytes configured anywhere yet, both files save fine")
+
+	// Set the server's per-build-type default the same way the status page form (or a direct
+	// POST) would -- no client-side MaxFileBytes involved at all.
+	resp, err := nethttp.Post(srv.URL+"/settings/max-file-bytes?build-type=unit&bytes=20", "", nil)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, nethttp.StatusNoContent, resp.StatusCode)
+
+	restoreDir := t.TempDir()
+
+	var restoredPaths []string
+
+	_, err = client.RestoreCache(req, func(item gocache.FileItem, body io.Reader) error {
+		restoredPaths = append(restoredPaths, item.Path)
+		return gocache.RestoreToDir(restoreDir, item, body)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"ab/small"}, restoredPaths, "server's max-file-bytes default must apply since the request itself didn't set one")
+}
+
 func TestClient_ExistingPaths(t *testing.T) {
 	serverDir := t.TempDir()
 	localStore, err := local.NewStore(serverDir)
@@ -311,6 +363,67 @@ func TestClient_ExistingPaths(t *testing.T) {
 	// won't find it even though the object is sitting right there on the server.
 	commitManifestPath := filepath.Join(serverDir, "native", "manifests", "buildtype-unit", "c", "commit123.zst")
 	require.Equal(t, "ab/present\n", readManifestBodyForTest(t, commitManifestPath))
+}
+
+func TestClient_InspectKeys(t *testing.T) {
+	serverDir := t.TempDir()
+	localStore, err := local.NewStore(serverDir)
+	require.NoError(t, err)
+
+	nativeStore, err := gocache.NewStore(filepath.Join(serverDir, "native"))
+	require.NoError(t, err)
+
+	req := gocache.Request{Commit: "commit123", BuildType: "unit"}
+
+	present := gocache.FileItem{Path: "ab/present", Size: 5, WireSize: 5}
+	present.SetBodyReader(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString("hello")), nil
+	})
+	require.NoError(t, nativeStore.Save(req, gocache.Batch{Items: []gocache.FileItem{present}}))
+
+	srv := httptest.NewServer(http.NewHandlerWithPreloadLimit(localStore, nativeStore, "", "", 2))
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	results, err := client.InspectKeys(req, []string{"ab/present", "cd/missing"})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+
+	byKey := map[string]gocache.KeyInspection{}
+	for _, r := range results {
+		byKey[r.Key] = r
+	}
+
+	require.True(t, byKey["ab/present"].InManifest)
+	require.True(t, byKey["ab/present"].ExistsRemote)
+	require.False(t, byKey["cd/missing"].InManifest)
+	require.False(t, byKey["cd/missing"].ExistsRemote)
+}
+
+func TestClient_MaxFileBytesFor(t *testing.T) {
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.NewHandler(localStore, ""))
+	t.Cleanup(srv.Close)
+
+	client, err := http.NewClient(srv.URL, "")
+	require.NoError(t, err)
+
+	got, err := client.MaxFileBytesFor("unit")
+	require.NoError(t, err)
+	require.Equal(t, int64(0), got, "nothing configured for this build type yet")
+
+	resp, err := nethttp.Post(srv.URL+"/settings/max-file-bytes?build-type=unit&bytes=42", "", nil)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, nethttp.StatusNoContent, resp.StatusCode)
+
+	got, err = client.MaxFileBytesFor("unit")
+	require.NoError(t, err)
+	require.Equal(t, int64(42), got)
 }
 
 func TestSaveCacheFinalize_TruncatedUploadErrorIncludesContext(t *testing.T) {

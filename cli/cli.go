@@ -64,7 +64,7 @@ func Main(options ...func(o *Options)) error {
 	restoreCache := flag.Bool("restore-cache", false, "restore native GOCACHE files into -cache-dir and exit")
 	saveCache := flag.Bool("save-cache", false, "save freshly created native GOCACHE files from -cache-dir and exit")
 	maxFileBytes := flag.Int64("max-file-bytes", 0, "maximum single file size in bytes for remote cache storage, preload item wire size, and native -restore-cache/-save-cache; 0 disables the limit except preload defaults to 1000000")
-	restoreLimitBytes := flag.Int64("restore-limit-bytes", 0, "maximum total compressed bytes to download during native -restore-cache after -max-file-bytes filtering; 0 disables the limit")
+	maxPreloadTotalBytes := flag.Int64("max-preload-total-bytes", 0, "maximum total compressed bytes to download during native -restore-cache after -max-file-bytes filtering; 0 disables the limit")
 	saveCacheMaxFileBytes := flag.Int64("save-cache-max-file-bytes", 0, "deprecated alias for -max-file-bytes")
 	saveCacheChunkBytes := flag.Int64("save-cache-chunk-bytes", http.DefaultSaveCacheChunkBytes, "maximum size in bytes for a single native -save-cache HTTP chunk request body")
 	jobStartUnix := flag.Int64("job-start-unix", 0, "job start Unix timestamp in nanoseconds for -save-cache; when empty, read the marker written by -restore-cache")
@@ -72,6 +72,7 @@ func Main(options ...func(o *Options)) error {
 	githubActionsInit := flag.String("github-actions-init", "", "set up caching for a GitHub Actions job from a single DSN; see internal/local/github_actions.go for the DSN format")
 	githubActionsDone := flag.Bool("github-actions-done", false, "finalize caching started by -github-actions-init in an always() step")
 	quiet := flag.Bool("quiet", false, "suppress informational logging, keeping only fatal errors; used for GOCACHEPROG helper instances started via -github-actions-init so they don't clutter go build/test output")
+	sessionID := flag.String("session-id", "", "internal: shared session ID used by -github-actions-init-spawned helpers so multiple invocations across one job report as one session; safe to ignore for standalone use")
 	ver := flag.Bool("version", false, "print version and exit")
 
 	flag.Parse()
@@ -114,7 +115,7 @@ func Main(options ...func(o *Options)) error {
 		if *maxFileBytes == 0 && *saveCacheMaxFileBytes != 0 {
 			*maxFileBytes = *saveCacheMaxFileBytes
 		}
-		return runNativeGOCACHEMode(*dir, *httpListen, *remoteURL, *authToken, *restoreCache, *saveCache, *maxFileBytes, *restoreLimitBytes, *saveCacheChunkBytes, *jobStartUnix, startedAt, params)
+		return runNativeGOCACHEMode(*dir, *httpListen, *remoteURL, *authToken, *restoreCache, *saveCache, *maxFileBytes, *maxPreloadTotalBytes, *saveCacheChunkBytes, *jobStartUnix, startedAt, params)
 	}
 
 	params.MaxFileBytes = *maxFileBytes
@@ -160,7 +161,7 @@ func Main(options ...func(o *Options)) error {
 			return errors.New("-https and -https-host are only supported in store server mode without -remote-url")
 		}
 
-		return runDaemon(*httpListen, *dir, *remoteURL, *authToken, *maxDiskBytes, *params)
+		return runDaemon(*httpListen, *dir, *remoteURL, *authToken, *sessionID, *maxDiskBytes, *params)
 	}
 
 	if !*quiet {
@@ -192,8 +193,12 @@ func Main(options ...func(o *Options)) error {
 
 	if *remoteURL != "" {
 		sessionStartedAt := time.Now().UTC()
+		sid := *sessionID
+		if sid == "" {
+			sid = fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano())
+		}
 		upstream, err = http.NewClientWithSession(*remoteURL, *authToken, &http.SessionInfo{
-			SessionID: fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano()),
+			SessionID: sid,
 			StartedAt: sessionStartedAt,
 			PID:       os.Getpid(),
 			CacheDir:  *dir,
@@ -309,7 +314,7 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallback
 	})
 }
 
-func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, restoreLimitBytes, saveCacheChunkBytes, jobStartUnixNanos int64, startedAt time.Time, params *local.ProxyParams) error {
+func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, maxPreloadTotalBytes, saveCacheChunkBytes, jobStartUnixNanos int64, startedAt time.Time, params *local.ProxyParams) error {
 	if restoreCache && saveCache {
 		return errors.New("-restore-cache and -save-cache are mutually exclusive")
 	}
@@ -342,13 +347,13 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 	client.SetSaveCacheChunkBytes(saveCacheChunkBytes)
 
 	req := gocache.Request{
-		Commit:            params.Commit,
-		ChangesID:         params.ChangesID,
-		BuildType:         params.BuildType,
-		BaseCommit:        params.BaseCommit,
-		ParentCommit:      params.ParentCommit,
-		MaxFileBytes:      maxFileBytes,
-		RestoreLimitBytes: restoreLimitBytes,
+		Commit:               params.Commit,
+		ChangesID:            params.ChangesID,
+		BuildType:            params.BuildType,
+		BaseCommit:           params.BaseCommit,
+		ParentCommit:         params.ParentCommit,
+		MaxFileBytes:         maxFileBytes,
+		MaxPreloadTotalBytes: maxPreloadTotalBytes,
 	}
 
 	if restoreCache {
@@ -372,8 +377,8 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 	return err
 }
 
-func runDaemon(listen, dir, remoteURL, authToken string, maxDiskBytes int64, params local.ProxyParams) error {
-	upstream, err := newUpstreamClient(remoteURL, authToken, dir, params)
+func runDaemon(listen, dir, remoteURL, authToken, sessionID string, maxDiskBytes int64, params local.ProxyParams) error {
+	upstream, err := newUpstreamClient(remoteURL, authToken, dir, sessionID, params)
 	if err != nil {
 		return fmt.Errorf("remote client: %w", err)
 	}
@@ -465,10 +470,14 @@ func (r *recentLogf) Lines() []string {
 	return append([]string(nil), r.lines...)
 }
 
-func newUpstreamClient(remoteURL, authToken, cacheDir string, params local.ProxyParams) (cache.Store, error) {
+func newUpstreamClient(remoteURL, authToken, cacheDir, sessionID string, params local.ProxyParams) (cache.Store, error) {
 	sessionStartedAt := time.Now().UTC()
+	sid := sessionID
+	if sid == "" {
+		sid = fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano())
+	}
 	return http.NewClientWithSession(remoteURL, authToken, &http.SessionInfo{
-		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), sessionStartedAt.UnixNano()),
+		SessionID: sid,
 		StartedAt: sessionStartedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,

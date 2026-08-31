@@ -5,14 +5,18 @@
 //
 // DSN format for -github-actions-init:
 //
-//	<remote-url>?auth=<token>&cache_dir=<dir>&preload_size=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>&max_cache_bytes=<bytes>&report_<name>=<path>
+//	<remote-url>?auth=<token>&cache_dir=<dir>&max_file_bytes=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>&max_cache_bytes=<bytes>&report_<name>=<path>
 //
 // Only the remote URL is required; every query parameter is optional:
 //
 //   - auth: bearer token for the remote server and (in shim mode) the local daemon socket
 //   - cache_dir: local cache/GOCACHE directory; empty picks gocacheprog's own default; a
 //     leading "~/" is resolved against the user's home directory
-//   - preload_size: maps to -max-file-bytes (default 3,000,000)
+//   - max_file_bytes: maps to -max-file-bytes, the largest single object this job's
+//     preload/restore or save will transfer. When absent, falls back to the server's own
+//     max-file-bytes default for this build type (see Handler.MaxFileBytesSettings, retunable
+//     without touching this DSN), and only if the server has none configured either, to a
+//     hardcoded 3,000,000. A DSN value always wins over the server default when both are set.
 //   - build_type: maps to -build-type, e.g. "unit" or "race"; always prefixed with
 //     $GITHUB_REPOSITORY (e.g. "owner-repo-unit") so manifests and the /inspect and /clear
 //     admin endpoints stay isolated per repository when multiple repos share one server
@@ -36,13 +40,24 @@
 //     done so, uploads back on -github-actions-done only the files created since init (not the
 //     rest of cache_dir, which may hold unrelated build types); false (default) never touches a
 //     remote in local-gocache mode
-//   - report_<name>=<path>: gocache mode only; any number of these, each naming a local file
-//     to read on -github-actions-done and attach to that session's sessions.jsonl line under
-//     the key "<name>" -- if the file's content parses as JSON it's inlined as that value,
-//     otherwise it's reported as a literal string (the file's own extension plays no part in
-//     that choice). Read at done time, not init, since the file (e.g. a coverage summary) is
-//     typically produced during the job itself. A missing/unreadable file is logged and
-//     skipped, same as every other cache-is-optional failure path in this file.
+//   - report_<name>=<path>: any number of these, each naming a local file to read on
+//     -github-actions-done and attach to that session's sessions.jsonl line under the key
+//     "<name>" -- if the file's content parses as JSON it's inlined as that value, otherwise
+//     it's reported as a literal string (the file's own extension plays no part in that
+//     choice). Read at done time, not init, since the file (e.g. a coverage summary, or
+//     teststat's -metrics-json) is typically produced during the job itself. A missing/unreadable
+//     file is logged and skipped, same as every other cache-is-optional failure path in this
+//     file. Works in every mode except local-gocache's fully-local (no fallback_remote) case,
+//     which never talks to a remote at all and so has no session to attach a report to.
+//   - testcache_keys=<path>: gocache mode only. Names a local JSON file (produced during the
+//     job, e.g. by teststat's -testcache-keys) of {package: {hits: [...], misses: [...]}}
+//     GOCACHE object keys. On -github-actions-done, each distinct miss key is checked against
+//     the remote via /inspect-keys and logged per-package: whether it's in the resolved
+//     manifest(s), exists on the remote, and its size/age -- forensics for "why did this package
+//     miss its test cache" (never saved vs. saved-but-not-restored vs. restored-but-stale). Hit
+//     keys are read and kept alongside but not yet acted on (see investigateTestcacheKeys) --
+//     reserved for a future priority-restore manifest built from known-good keys, so that feature
+//     won't need a second DSN param/file on top of this one.
 //
 // Commit, changes-id, and base-commit are derived automatically from GitHub Actions'
 // own environment instead of being passed in: pull_request(_target) events use
@@ -60,6 +75,14 @@
 // cache is cold; otherwise init just points GOCACHE at cache_dir. Either way, both init and done
 // report the cache dir's file count/size plus its per-build-type usage stats (see
 // localGocacheStats), and done additionally enforces max_cache_bytes by eviction if set.
+//
+// -github-actions-init generates one session ID for the whole job (see GithubActionsInit) and
+// threads it into every process it spawns (via -session-id, see commonScopeArgs) so every
+// request across the job -- preload, per-invocation helpers, the shim daemon -- reports as one
+// session rather than each spawned process touching its own. -github-actions-done calls
+// MarkSessionDone in every mode except local-gocache's fully-local case (see above), which flags
+// that session done on the remote and attaches the extras above; server-side session time
+// (first touch to done) and report_<name> extras then work identically regardless of mode.
 //
 // Direct mode's per-invocation records also carry best-effort parent process context (PID and,
 // on Linux, the parent's command line read from /proc) purely for diagnosing an unexpectedly
@@ -93,8 +116,13 @@ import (
 
 const (
 	defaultGithubActionsPreloadSize int64 = 3_000_000
-	githubActionsShimSocketWait           = 10 * time.Second
-	githubActionsLogTailBytes       int64 = 8_000
+	// maxFileBytesUnset marks a githubActionsConfig fresh out of parseGithubActionsDSN as not
+	// having an explicit max_file_bytes -- resolveMaxFileBytesDefault replaces it with
+	// the server's own configured default, or defaultGithubActionsPreloadSize if the server has
+	// none either.
+	maxFileBytesUnset           int64 = -1
+	githubActionsShimSocketWait       = 10 * time.Second
+	githubActionsLogTailBytes   int64 = 8_000
 
 	remoteClientMaxRetries = 3
 	remoteClientRetryDelay = 5 * time.Second
@@ -117,6 +145,7 @@ const (
 	envGHALocalFallback = "GOCACHEPROG_GHA_LOCAL_FALLBACK"
 	envGHASessionID     = "GOCACHEPROG_GHA_SESSION_ID"
 	envGHAReportFiles   = "GOCACHEPROG_GHA_REPORT_FILES"
+	envGHATestcacheKeys = "GOCACHEPROG_GHA_TESTCACHE_KEYS"
 )
 
 type githubActionsConfig struct {
@@ -135,6 +164,10 @@ type githubActionsConfig struct {
 	// since a report file (e.g. a coverage summary) is typically produced during the job itself
 	// and wouldn't exist yet when -github-actions-init runs.
 	reportFiles map[string]string
+	// testcacheKeys is the "testcache_keys" DSN param: a local path (produced during the job,
+	// e.g. by teststat's -testcache-keys) to a {package: {hits: [...], misses: [...]}} JSON file.
+	// gocache mode only -- see doneGocacheMode's investigateTestcacheKeys.
+	testcacheKeys string
 }
 
 // GithubActionsInit sets up caching for a GitHub Actions job from a single DSN. See the
@@ -149,7 +182,11 @@ func GithubActionsInit(dsn string) error {
 
 	cfg.buildType = repoScopedBuildType(cfg.buildType)
 
-	log.Printf("github-actions-init: mode=%q remote_url=%q cache_dir=%q build_type=%q preload_size=%d skip_preload=%t max_cache_bytes=%d fallback_remote=%t",
+	if cfg.maxFileBytes == maxFileBytesUnset {
+		cfg.maxFileBytes = resolveMaxFileBytesDefault(cfg.remoteURL, cfg.authToken, cfg.buildType)
+	}
+
+	log.Printf("github-actions-init: mode=%q remote_url=%q cache_dir=%q build_type=%q max_file_bytes=%d skip_preload=%t max_cache_bytes=%d fallback_remote=%t",
 		cfg.mode, cfg.remoteURL, cfg.cacheDir, cfg.buildType, cfg.maxFileBytes, cfg.skipPreload, cfg.maxCacheBytes, cfg.fallbackRemote)
 
 	if cfg.canonicalize != "" {
@@ -170,15 +207,21 @@ func GithubActionsInit(dsn string) error {
 		return fmt.Errorf("github-actions-init: resolve gocacheprog executable: %w", err)
 	}
 
+	// One session ID for the whole job, shared by every process this init spawns (and, in
+	// gocache mode, this process itself) -- see MarkSessionDone and the package doc's "done"
+	// paragraph. Without a shared ID, each spawned process would touch its own random session,
+	// leaving -github-actions-done with nothing stable to mark done later.
+	sessionID := fmt.Sprintf("%d-%d", os.Getpid(), initStartedAt.UnixNano())
+
 	switch cfg.mode {
 	case "direct":
-		return initDirectMode(self, cfg, commit, baseCommit, changesID, initStartedAt)
+		return initDirectMode(self, cfg, commit, baseCommit, changesID, sessionID, initStartedAt)
 	case "shim":
-		return initShimMode(self, cfg, commit, baseCommit, changesID, initStartedAt)
+		return initShimMode(self, cfg, commit, baseCommit, changesID, sessionID, initStartedAt)
 	case "gocache":
-		return initGocacheMode(cfg, commit, baseCommit, changesID, initStartedAt)
+		return initGocacheMode(cfg, commit, baseCommit, changesID, sessionID, initStartedAt)
 	case "local-gocache":
-		return initLocalGocacheMode(cfg, commit, baseCommit, changesID, initStartedAt)
+		return initLocalGocacheMode(cfg, commit, baseCommit, changesID, sessionID, initStartedAt)
 	default:
 		return fmt.Errorf("github-actions-init: unsupported mode %q (expected direct, shim, gocache, or local-gocache)", cfg.mode)
 	}
@@ -217,11 +260,14 @@ func parseGithubActionsDSN(dsn string) (githubActionsConfig, error) {
 	q := u.Query()
 
 	cfg := githubActionsConfig{
-		authToken:    q.Get("auth"),
-		cacheDir:     q.Get("cache_dir"),
-		buildType:    q.Get("build_type"),
-		mode:         q.Get("mode"),
-		maxFileBytes: defaultGithubActionsPreloadSize,
+		authToken: q.Get("auth"),
+		cacheDir:  q.Get("cache_dir"),
+		buildType: q.Get("build_type"),
+		mode:      q.Get("mode"),
+		// maxFileBytesUnset until proven otherwise: resolveMaxFileBytesDefault (called once
+		// buildType is fully scoped) fills this in from the server's own default, and only then
+		// the hardcoded fallback, so a bare -1 here must never reach a mode's own init function.
+		maxFileBytes: maxFileBytesUnset,
 		canonicalize: ".",
 	}
 
@@ -229,10 +275,10 @@ func parseGithubActionsDSN(dsn string) (githubActionsConfig, error) {
 		cfg.mode = "shim"
 	}
 
-	if v := q.Get("preload_size"); v != "" {
+	if v := q.Get("max_file_bytes"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
-			return githubActionsConfig{}, fmt.Errorf("invalid preload_size %q: %w", v, err)
+			return githubActionsConfig{}, fmt.Errorf("invalid max_file_bytes %q: %w", v, err)
 		}
 		cfg.maxFileBytes = n
 	}
@@ -279,6 +325,7 @@ func parseGithubActionsDSN(dsn string) (githubActionsConfig, error) {
 	}
 
 	cfg.reportFiles = parseReportFileParams(q)
+	cfg.testcacheKeys = q.Get("testcache_keys")
 
 	u.RawQuery = ""
 	cfg.remoteURL = u.String()
@@ -320,6 +367,32 @@ func repoScopedBuildType(buildType string) string {
 	}
 
 	return repo + "-" + buildType
+}
+
+// resolveMaxFileBytesDefault fills in max_file_bytes' default when the DSN didn't set one
+// (see maxFileBytesUnset): the server's own configured default for buildType (see
+// Handler.MaxFileBytesSettings), and only if the server has none either, the hardcoded
+// defaultGithubActionsPreloadSize. An unreachable server just falls back to the hardcoded value
+// too -- this is an optimization, not a build dependency, same reasoning as every other
+// best-effort remote call in this file.
+func resolveMaxFileBytesDefault(remoteURL, authToken, buildType string) int64 {
+	client, err := cachehttp.NewClient(remoteURL, authToken)
+	if err != nil {
+		log.Printf("github-actions-init: WARNING: resolve max-file-bytes default: %s; using hardcoded default", err.Error())
+		return defaultGithubActionsPreloadSize
+	}
+
+	bytes, err := client.MaxFileBytesFor(buildType)
+	if err != nil {
+		log.Printf("github-actions-init: WARNING: resolve max-file-bytes default: %s; using hardcoded default", err.Error())
+		return defaultGithubActionsPreloadSize
+	}
+
+	if bytes <= 0 {
+		return defaultGithubActionsPreloadSize
+	}
+
+	return bytes
 }
 
 type ghPullRequestEvent struct {
@@ -372,7 +445,7 @@ func githubContext() (commit, baseCommit, changesID string, err error) {
 	return event.PullRequest.Head.SHA, event.PullRequest.Base.SHA, changesID, nil
 }
 
-func commonScopeArgs(cfg githubActionsConfig, commit, baseCommit, changesID string) []string {
+func commonScopeArgs(cfg githubActionsConfig, commit, baseCommit, changesID, sessionID string) []string {
 	var args []string
 
 	if cfg.authToken != "" {
@@ -390,8 +463,30 @@ func commonScopeArgs(cfg githubActionsConfig, commit, baseCommit, changesID stri
 	if baseCommit != "" {
 		args = append(args, "-base-commit", baseCommit)
 	}
+	if sessionID != "" {
+		args = append(args, "-session-id", sessionID)
+	}
 
 	return args
+}
+
+// setReportFilesEnv marshals reportFiles (see the "report_" DSN query params) into env under
+// envGHAReportFiles, for -github-actions-done's collectReportExtras to read back later. A no-op
+// if reportFiles is empty. Marshal failure is logged and swallowed rather than failing init over
+// it -- reportFiles is always map[string]string, which can't actually fail to marshal, but
+// swallowing keeps this consistent with every other "reporting is optional" path in this file.
+func setReportFilesEnv(env map[string]string, reportFiles map[string]string) {
+	if len(reportFiles) == 0 {
+		return
+	}
+
+	reportFilesJSON, err := json.Marshal(reportFiles)
+	if err != nil {
+		log.Printf("github-actions-init: marshal report files: %s", err.Error())
+		return
+	}
+
+	env[envGHAReportFiles] = string(reportFilesJSON)
 }
 
 func resolveHelperCacheDir(dir string) (string, error) {
@@ -410,7 +505,7 @@ func resolveHelperCacheDir(dir string) (string, error) {
 // runPreloadOnly runs a synchronous -preload-only pass against cacheDir so that the
 // daemon/direct invocation that follows can safely pass -skip-preload. Failures are
 // logged and swallowed: a cold cache is slower, not incorrect.
-func runPreloadOnly(self, cacheDir string, cfg githubActionsConfig, commit, baseCommit, changesID string) {
+func runPreloadOnly(self, cacheDir string, cfg githubActionsConfig, commit, baseCommit, changesID, sessionID string) {
 	if cfg.skipPreload {
 		log.Printf("github-actions-init: skip_preload is set, not preloading %s", cacheDir)
 		return
@@ -422,7 +517,7 @@ func runPreloadOnly(self, cacheDir string, cfg githubActionsConfig, commit, base
 		"-preload-only",
 		"-max-file-bytes", strconv.FormatInt(cfg.maxFileBytes, 10),
 	}
-	args = append(args, commonScopeArgs(cfg, commit, baseCommit, changesID)...)
+	args = append(args, commonScopeArgs(cfg, commit, baseCommit, changesID, sessionID)...)
 
 	log.Printf("github-actions-init: preloading %s: %s", cacheDir, shellJoin(self, args))
 
@@ -439,7 +534,7 @@ func runPreloadOnly(self, cacheDir string, cfg githubActionsConfig, commit, base
 	log.Printf("github-actions-init: preload finished in %s", time.Since(startedAt))
 }
 
-func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
+func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, changesID, sessionID string, initStartedAt time.Time) error {
 	cacheDir, err := resolveHelperCacheDir(cfg.cacheDir)
 	if err != nil {
 		return err
@@ -448,7 +543,7 @@ func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, ch
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
 
-	runPreloadOnly(self, cacheDir, cfg, commit, baseCommit, changesID)
+	runPreloadOnly(self, cacheDir, cfg, commit, baseCommit, changesID, sessionID)
 
 	args := []string{
 		"-cache-dir", cacheDir,
@@ -457,21 +552,25 @@ func initDirectMode(self string, cfg githubActionsConfig, commit, baseCommit, ch
 		"-quiet",
 		"-max-file-bytes", strconv.FormatInt(cfg.maxFileBytes, 10),
 	}
-	args = append(args, commonScopeArgs(cfg, commit, baseCommit, changesID)...)
+	args = append(args, commonScopeArgs(cfg, commit, baseCommit, changesID, sessionID)...)
 
 	env := map[string]string{
-		"GOCACHEPROG":  shellJoin(self, args),
-		envGHAMode:     "direct",
-		envGHACacheDir: cacheDir,
-		envGHAInitTime: initStartedAt.Format(time.RFC3339Nano),
+		"GOCACHEPROG":   shellJoin(self, args),
+		envGHAMode:      "direct",
+		envGHACacheDir:  cacheDir,
+		envGHARemoteURL: cfg.remoteURL,
+		envGHAAuth:      cfg.authToken,
+		envGHASessionID: sessionID,
+		envGHAInitTime:  initStartedAt.Format(time.RFC3339Nano),
 	}
+	setReportFilesEnv(env, cfg.reportFiles)
 
 	log.Printf("github-actions-init: direct mode ready, GOCACHEPROG=%q", env["GOCACHEPROG"])
 
 	return setGitHubEnv(env)
 }
 
-func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
+func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, changesID, sessionID string, initStartedAt time.Time) error {
 	cacheDir, err := resolveHelperCacheDir(cfg.cacheDir)
 	if err != nil {
 		return err
@@ -480,7 +579,7 @@ func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, chan
 		return fmt.Errorf("ensure cache dir: %w", err)
 	}
 
-	runPreloadOnly(self, cacheDir, cfg, commit, baseCommit, changesID)
+	runPreloadOnly(self, cacheDir, cfg, commit, baseCommit, changesID, sessionID)
 
 	socket := filepath.Join(os.TempDir(), "gocacheprog.sock")
 	pidFile := filepath.Join(os.TempDir(), "gocacheprog.pid")
@@ -493,7 +592,7 @@ func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, chan
 		"-skip-preload",
 		"-max-file-bytes", strconv.FormatInt(cfg.maxFileBytes, 10),
 	}
-	daemonArgs = append(daemonArgs, commonScopeArgs(cfg, commit, baseCommit, changesID)...)
+	daemonArgs = append(daemonArgs, commonScopeArgs(cfg, commit, baseCommit, changesID, sessionID)...)
 
 	logOut, err := os.Create(logFile) //nolint:gosec // logFile is a fixed path under os.TempDir().
 	if err != nil {
@@ -533,14 +632,17 @@ func initShimMode(self string, cfg githubActionsConfig, commit, baseCommit, chan
 	}
 
 	env := map[string]string{
-		"GOCACHEPROG":  shellJoin(self, clientArgs),
-		envGHAMode:     "shim",
-		envGHASocket:   socket,
-		envGHAAuth:     cfg.authToken,
-		envGHAPIDFile:  pidFile,
-		envGHALogFile:  logFile,
-		envGHAInitTime: initStartedAt.Format(time.RFC3339Nano),
+		"GOCACHEPROG":   shellJoin(self, clientArgs),
+		envGHAMode:      "shim",
+		envGHASocket:    socket,
+		envGHAAuth:      cfg.authToken,
+		envGHAPIDFile:   pidFile,
+		envGHALogFile:   logFile,
+		envGHARemoteURL: cfg.remoteURL,
+		envGHASessionID: sessionID,
+		envGHAInitTime:  initStartedAt.Format(time.RFC3339Nano),
 	}
+	setReportFilesEnv(env, cfg.reportFiles)
 
 	log.Printf("github-actions-init: shim mode ready, GOCACHEPROG=%q", env["GOCACHEPROG"])
 
@@ -570,7 +672,7 @@ func newRemoteClientWithRetry(remoteURL, authToken string, sessionInfo *cachehtt
 	return nil, lastErr
 }
 
-func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
+func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID, sessionID string, initStartedAt time.Time) error {
 	cacheDir, err := ResolveNativeCacheDir(cfg.cacheDir)
 	if err != nil {
 		return err
@@ -580,7 +682,6 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 	}
 
 	startedAt := time.Now().UTC()
-	sessionID := fmt.Sprintf("%d-%d", os.Getpid(), startedAt.UnixNano())
 	client, err := newRemoteClientWithRetry(cfg.remoteURL, cfg.authToken, &cachehttp.SessionInfo{
 		SessionID: sessionID,
 		StartedAt: startedAt,
@@ -638,14 +739,10 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 		envGHAInitTime:     initStartedAt.Format(time.RFC3339Nano),
 		envGHASessionID:    sessionID,
 	}
-
-	if len(cfg.reportFiles) > 0 {
-		reportFilesJSON, err := json.Marshal(cfg.reportFiles)
-		if err != nil {
-			return fmt.Errorf("marshal report files: %w", err)
-		}
-		env[envGHAReportFiles] = string(reportFilesJSON)
+	if cfg.testcacheKeys != "" {
+		env[envGHATestcacheKeys] = cfg.testcacheKeys
 	}
+	setReportFilesEnv(env, cfg.reportFiles)
 
 	log.Printf("github-actions-init: gocache mode ready, GOCACHE=%q", cacheDir)
 
@@ -663,7 +760,7 @@ func initGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID stri
 // got rotated out and back in with an empty disk — it restores from the remote once here, and
 // leaves a marker in $GITHUB_ENV so -github-actions-done knows to upload back only what this job
 // actually produced (see doneLocalGocacheFallbackUpload).
-func initLocalGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID string, initStartedAt time.Time) error {
+func initLocalGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID, sessionID string, initStartedAt time.Time) error {
 	cacheDir, err := ResolveNativeCacheDir(cfg.cacheDir)
 	if err != nil {
 		return err
@@ -693,8 +790,15 @@ func initLocalGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID
 		env[envGHAMaxCacheBytes] = strconv.FormatInt(cfg.maxCacheBytes, 10)
 	}
 
+	// Session/report tracking for local-gocache mode only piggybacks on fallback_remote's own
+	// restore call (see initLocalGocacheFallbackRestore), never as an unconditional extra
+	// network touch: this mode's whole point in the common (warm, no-fallback) case is
+	// avoiding the remote entirely, and unconditionally constructing a session client here
+	// would undermine that -- including retrying for several seconds against an address that
+	// was never going to work when remoteURL is empty (a legitimate, fully-local setup) or
+	// unreachable.
 	if cfg.fallbackRemote {
-		if err := initLocalGocacheFallbackRestore(cfg, commit, baseCommit, changesID, cacheDir, stats, initStartedAt, env); err != nil {
+		if err := initLocalGocacheFallbackRestore(cfg, commit, baseCommit, changesID, sessionID, cacheDir, stats, initStartedAt, env); err != nil {
 			return err
 		}
 	}
@@ -706,9 +810,14 @@ func initLocalGocacheMode(cfg githubActionsConfig, commit, baseCommit, changesID
 
 // initLocalGocacheFallbackRestore is fallback_remote's cold-start path, split out of
 // initLocalGocacheMode to keep that function flat: if build_type already has recorded usage, it's
-// a no-op; otherwise it restores from the remote into cacheDir and fills env with everything
-// doneLocalGocacheFallbackUpload will need later to upload back what this job produces.
-func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit, changesID, cacheDir string, stats localGocacheStats, initStartedAt time.Time, env map[string]string) error {
+// a no-op (no network touched at all, preserving local-gocache mode's core promise); otherwise it
+// restores from the remote into cacheDir and fills env with everything doneLocalGocacheFallbackUpload
+// will need later to upload back what this job produces. The same client this restore uses is also
+// what makes this session trackable/reportable at -github-actions-done time (see MarkSessionDone):
+// its construction alone (a /version handshake carrying session headers) starts the session, no
+// separate touch needed. sessionID is shared with the rest of the job (see GithubActionsInit) so
+// the restore and the later done-time MarkSessionDone call land on the same session.
+func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit, changesID, sessionID, cacheDir string, stats localGocacheStats, initStartedAt time.Time, env map[string]string) error {
 	if _, warm := stats.BuildTypes[localGocacheStatsBuildTypeKey(cfg.buildType)]; warm {
 		log.Printf("github-actions-init: fallback_remote is set but build_type=%q already has recorded usage, skipping remote restore", cfg.buildType)
 		return nil
@@ -721,7 +830,7 @@ func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit
 	log.Printf("github-actions-init: fallback_remote is set and build_type=%q has no recorded usage, restoring from %s into %s", cfg.buildType, cfg.remoteURL, cacheDir)
 
 	client, err := newRemoteClientWithRetry(cfg.remoteURL, cfg.authToken, &cachehttp.SessionInfo{
-		SessionID: fmt.Sprintf("%d-%d", os.Getpid(), initStartedAt.UnixNano()),
+		SessionID: sessionID,
 		StartedAt: initStartedAt,
 		PID:       os.Getpid(),
 		CacheDir:  cacheDir,
@@ -759,10 +868,12 @@ func initLocalGocacheFallbackRestore(cfg githubActionsConfig, commit, baseCommit
 	env[envGHALocalFallback] = "1"
 	env[envGHARemoteURL] = cfg.remoteURL
 	env[envGHAAuth] = cfg.authToken
+	env[envGHASessionID] = sessionID
 	env[envGHACommit] = commit
 	env[envGHAChangesID] = changesID
 	env[envGHABaseCommit] = baseCommit
 	env[envGHAMaxFileBytes] = strconv.FormatInt(cfg.maxFileBytes, 10)
+	setReportFilesEnv(env, cfg.reportFiles)
 
 	return nil
 }
@@ -821,6 +932,8 @@ func doneShimMode() error {
 	auth := os.Getenv(envGHAAuth)
 	logFile := os.Getenv(envGHALogFile)
 	pidFile := os.Getenv(envGHAPIDFile)
+	remoteURL := os.Getenv(envGHARemoteURL)
+	sessionID := os.Getenv(envGHASessionID)
 
 	if socket == "" {
 		return fmt.Errorf("github-actions-done: %s is not set; did -github-actions-init run in shim mode earlier in this job?", envGHASocket)
@@ -837,6 +950,10 @@ func doneShimMode() error {
 		if logFile != "" {
 			log.Printf("github-actions-done: daemon log tail (%s):\n%s", logFile, tailFile(logFile, githubActionsLogTailBytes))
 		}
+		// Best-effort even on a failed stop: whatever report_<name> files exist are still
+		// worth attaching, and the session shouldn't look permanently abandoned on the status
+		// page just because the graceful stop didn't work.
+		markRemoteSessionDone(remoteURL, auth, sessionID, sessionExtras("shim", StatsSummary{}))
 		return nil
 	}
 
@@ -848,6 +965,8 @@ func doneShimMode() error {
 		stats.TotalTime = elapsed.String()
 	}
 	log.Printf("github-actions-done: cache summary: %s", stats.String())
+
+	markRemoteSessionDone(remoteURL, auth, sessionID, sessionExtras("shim", stats))
 
 	return nil
 }
@@ -905,6 +1024,12 @@ func doneGocacheMode() error {
 		MaxFileBytes: maxFileBytes,
 	}
 
+	// Inspect testcache misses before saving: SaveFreshNativeCache below is about to upload this
+	// run's own freshly-computed results, and a miss's key is very often exactly what this run
+	// just produced -- inspecting after that upload would show exists_remote=true for a key that
+	// was genuinely absent at restore time, the opposite of what this forensics is for.
+	investigateTestcacheKeys(client, req)
+
 	var since time.Time
 	if raw := os.Getenv(envGHAInitTime); raw != "" {
 		if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
@@ -946,6 +1071,7 @@ func doneGocacheMode() error {
 	log.Printf("github-actions-done: cache summary: %s", summary)
 
 	extra := map[string]any{
+		"mode": "gocache",
 		// Same numbers as logSaveCacheSkips' "skipping N/M objects the server already has" log
 		// line, so a sessions.jsonl consumer doesn't have to scrape logs to get them.
 		"save_skipped_existing":    skipStats.ExistingSkipped,
@@ -960,6 +1086,140 @@ func doneGocacheMode() error {
 	}
 
 	return nil
+}
+
+// testcachePkgKeys mirrors teststat's -testcache-keys output for one package: Hits are keys
+// go's own cache actually matched, Misses are keys it went looking for and didn't find. Only
+// Misses are inspected today (see investigateTestcacheKeys below); Hits are decoded and counted
+// so a future priority-restore manifest built from known-good keys can reuse this same
+// file/DSN param rather than needing a second one.
+type testcachePkgKeys struct {
+	Hits   []string `json:"hits,omitempty"`
+	Misses []string `json:"misses,omitempty"`
+}
+
+// investigateTestcacheKeys is the testcache_keys DSN param's done-time half (see the package
+// doc comment): reads back the {package: {hits, misses}} file named at init time, checks every
+// distinct miss key against the remote in one batched /inspect-keys call, and logs one line per
+// (package, key) with what was found -- e.g. in_manifest=true exists_remote=false (never saved)
+// vs. exists_remote=true (saved, but Go's own cache still missed it locally) -- forensics for a
+// test-result cache miss, not a build dependency, so any failure here is logged and swallowed
+// rather than propagated. Must run before this run's own SaveFreshNativeCache upload (see the
+// caller): a miss's key is very often exactly what this run just computed and is about to save,
+// so checking after that upload would report exists_remote=true for a key that was genuinely
+// absent at restore time -- the one case this forensics exists to catch.
+func investigateTestcacheKeys(client *cachehttp.Client, req gocache.Request) {
+	path := os.Getenv(envGHATestcacheKeys)
+	if path == "" {
+		return
+	}
+
+	// TEMPORARY: see the analytics/networks/dupchecker investigation. A confirmed-restored,
+	// confirmed-correctly-sized, confirmed-in-manifest entry (dupchecker) still misses locally --
+	// ruling out size limits, restore selection, and manifest scoping. The remaining candidate is
+	// go's own testexpire.txt mechanism (go clean -testcache writes an expiry time there; any
+	// cached entry older than it is ignored regardless of validity). Remove once confirmed/ruled
+	// out.
+	debugLogTestExpire(os.Getenv(envGHACacheDir))
+
+	data, err := os.ReadFile(path) //nolint:gosec // path comes from our own DSN config, not user input.
+	if err != nil {
+		log.Printf("github-actions-done: read testcache keys file %s: %s", path, err.Error())
+		return
+	}
+
+	var pkgKeys map[string]testcachePkgKeys
+	if err := json.Unmarshal(data, &pkgKeys); err != nil {
+		log.Printf("github-actions-done: parse testcache keys file %s: %s", path, err.Error())
+		return
+	}
+
+	hitCount := 0
+	seen := map[string]bool{}
+	var missKeys []string
+	for _, pk := range pkgKeys {
+		hitCount += len(pk.Hits)
+		for _, k := range pk.Misses {
+			if !seen[k] {
+				seen[k] = true
+				missKeys = append(missKeys, k)
+			}
+		}
+	}
+	if hitCount > 0 {
+		// Not acted on yet -- reserved for a future priority-restore manifest (see
+		// testcachePkgKeys' doc comment) -- just surfaced so it's visible the data exists.
+		log.Printf("github-actions-done: testcache-keys: %d hit keys captured, not yet used", hitCount)
+	}
+	if len(missKeys) == 0 {
+		return
+	}
+
+	// TEMPORARY: see debugWatchRestorePaths' doc comment. Must run before SaveFreshNativeCache
+	// (which it already does -- see doneGocacheMode) so CollectFilesToSave's walk picks these up.
+	// Logged unconditionally, not just when CollectFilesToSave's walk finds one on disk: a watched
+	// key never appearing in a later "DEBUG watch:" line is itself informative -- it means this
+	// run's cacheDir never had that exact relPath at all, a different question than "had it but
+	// excluded it."
+	gocache.SetDebugWatchRestorePaths(missKeys)
+	log.Printf("DEBUG watch: tracking %d miss key(s) this run: %s", len(missKeys), strings.Join(missKeys, ", "))
+
+	results, err := client.InspectKeys(req, missKeys)
+	if err != nil {
+		log.Printf("github-actions-done: inspect testcache misses: %s", err.Error())
+		return
+	}
+
+	byKey := make(map[string]gocache.KeyInspection, len(results))
+	for _, r := range results {
+		byKey[r.Key] = r
+	}
+
+	pkgs := make([]string, 0, len(pkgKeys))
+	for pkg := range pkgKeys {
+		pkgs = append(pkgs, pkg)
+	}
+	sort.Strings(pkgs)
+
+	for _, pkg := range pkgs {
+		for _, k := range pkgKeys[pkg].Misses {
+			ki, ok := byKey[k]
+			if !ok {
+				continue
+			}
+			age := time.Duration(ki.AgeSeconds * float64(time.Second)).Round(time.Second)
+			log.Printf("github-actions-done: testcache-misses %s: %s in_manifest=%t exists_remote=%t size=%d age=%s",
+				pkg, k, ki.InManifest, ki.ExistsRemote, ki.Size, age)
+		}
+	}
+}
+
+// debugLogTestExpire is TEMPORARY, see investigateTestcacheKeys' call site. go writes this file's
+// content (a raw UnixNano timestamp) via "go clean -testcache"; any cached entry whose own
+// encoded time predates it is treated as expired regardless of otherwise being valid. cacheDir is
+// empty or the file absent in the overwhelmingly common case, logged plainly either way so a
+// "why did dupchecker still miss with everything else confirmed fine" report doesn't need to
+// guess. Remove alongside the rest of this investigation's instrumentation.
+func debugLogTestExpire(cacheDir string) {
+	if cacheDir == "" {
+		return
+	}
+
+	data, err := os.ReadFile(filepath.Join(cacheDir, "testexpire.txt")) //nolint:gosec // cacheDir comes from our own DSN config, not user input.
+	if err != nil {
+		log.Printf("DEBUG watch: testexpire.txt: %s", err.Error())
+		return
+	}
+
+	raw := strings.TrimSpace(string(data))
+
+	nanos, perr := strconv.ParseInt(raw, 10, 64)
+	if perr != nil {
+		log.Printf("DEBUG watch: testexpire.txt: unparseable content %q: %s", raw, perr.Error())
+		return
+	}
+
+	log.Printf("DEBUG watch: testexpire.txt: expire_before=%s", time.Unix(0, nanos).UTC().Format(time.RFC3339Nano))
 }
 
 // collectReportExtras reads back the report_<name>=<path> files named at -github-actions-init
@@ -1006,6 +1266,48 @@ func reportFileValue(data []byte) any {
 	return string(data)
 }
 
+// sessionExtras assembles the "extra" map passed to MarkSessionDone: statsSummary (its own
+// json-tagged fields, flattened -- marshal of a fixed struct never fails) merged with
+// collectReportExtras' report_<name> file contents, plus "mode" for telling sessions.jsonl lines
+// apart when multiple modes' sessions are analyzed together.
+func sessionExtras(mode string, statsSummary StatsSummary) map[string]any {
+	extra := map[string]any{"mode": mode}
+
+	if data, err := json.Marshal(statsSummary); err != nil {
+		log.Printf("github-actions-done: marshal stats summary: %s", err.Error())
+	} else {
+		var flat map[string]any
+		if err := json.Unmarshal(data, &flat); err == nil {
+			maps.Copy(extra, flat)
+		}
+	}
+
+	maps.Copy(extra, collectReportExtras())
+
+	return extra
+}
+
+// markRemoteSessionDone opens a throwaway session-tagged client purely to call MarkSessionDone --
+// used by done*Mode functions that don't otherwise need a live remote connection at done time
+// (direct, shim, local-gocache's fallback path). Best-effort: a client that can't be built or a
+// call that fails is logged and swallowed, same "reporting is optional" reasoning as everywhere
+// else in this file -- the job already finished by this point either way.
+func markRemoteSessionDone(remoteURL, auth, sessionID string, extra map[string]any) {
+	if remoteURL == "" || sessionID == "" {
+		return
+	}
+
+	client, err := cachehttp.NewClientWithSession(remoteURL, auth, &cachehttp.SessionInfo{SessionID: sessionID})
+	if err != nil {
+		log.Printf("github-actions-done: WARNING: session client: %s; skipping session-done report", err.Error())
+		return
+	}
+
+	if err := client.MarkSessionDone(extra); err != nil {
+		log.Printf("github-actions-done: WARNING: mark session done: %s", err.Error())
+	}
+}
+
 // doneLocalGocacheMode has no remote state to finalize in the common case: local-gocache mode's
 // whole point is letting the persistent cache dir accumulate across jobs on the runner's own
 // disk, so by default it just reports the cache dir's final file count/size so the effect of a
@@ -1026,21 +1328,25 @@ func doneLocalGocacheMode() error {
 		logLocalGocacheStats("github-actions-done", stats)
 	}
 
-	if os.Getenv(envGHALocalFallback) == "1" {
+	fallback := os.Getenv(envGHALocalFallback) == "1"
+	if fallback {
 		doneLocalGocacheFallbackUpload(cacheDir, buildType)
 	}
 
-	// Scanned once here and reused for both the size log below and eviction, rather than
-	// scanning cache_dir a second time regardless of whether max_cache_bytes is even set.
+	// Scanned once here and reused for the size log below, eviction, and (if fallback_remote
+	// talked to a remote this run) the session-done report, rather than scanning cache_dir
+	// multiple times.
+	var localCacheFiles int
+	var localCacheBytes int64
 	entries, err := scanCacheDir(cacheDir)
 	if err != nil {
 		log.Printf("github-actions-done: stat cache dir %s: %s", cacheDir, err.Error())
 	} else {
-		var size int64
+		localCacheFiles = len(entries)
 		for _, e := range entries {
-			size += e.size
+			localCacheBytes += e.size
 		}
-		log.Printf("github-actions-done: cache dir %s currently has %d file(s), %s", cacheDir, len(entries), humanBytesBinary(size))
+		log.Printf("github-actions-done: cache dir %s currently has %d file(s), %s", cacheDir, localCacheFiles, humanBytesBinary(localCacheBytes))
 
 		if maxCacheBytes, err := strconv.ParseInt(os.Getenv(envGHAMaxCacheBytes), 10, 64); err == nil && maxCacheBytes > 0 {
 			evictOldestUntilFits(cacheDir, entries, maxCacheBytes)
@@ -1049,6 +1355,16 @@ func doneLocalGocacheMode() error {
 
 	if elapsed, ok := elapsedSinceInit(); ok {
 		log.Printf("github-actions-done: total_time=%s", elapsed)
+	}
+
+	// Session/report tracking only exists for this run if fallback_remote's own restore
+	// already talked to the remote (see initLocalGocacheFallbackRestore) -- the common,
+	// fully-local case never touches the network here either, consistent with init.
+	if fallback {
+		extra := sessionExtras("local-gocache", StatsSummary{})
+		extra["local_cache_files"] = localCacheFiles
+		extra["local_cache_bytes"] = localCacheBytes
+		markRemoteSessionDone(os.Getenv(envGHARemoteURL), os.Getenv(envGHAAuth), os.Getenv(envGHASessionID), extra)
 	}
 
 	return nil
@@ -1295,11 +1611,18 @@ func doneDirectMode() error {
 		return nil
 	}
 
+	remoteURL := os.Getenv(envGHARemoteURL)
+	auth := os.Getenv(envGHAAuth)
+	sessionID := os.Getenv(envGHASessionID)
+
 	statsPath := filepath.Join(cacheDir, quietRunStatsFilename)
 	data, err := os.ReadFile(statsPath) //nolint:gosec // statsPath is derived from the configured cache dir.
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("github-actions-done: no run stats recorded at %s", statsPath)
+			// No go invocations happened, but the session/report_<name> files are still worth
+			// reporting -- their value doesn't depend on any cache activity having occurred.
+			markRemoteSessionDone(remoteURL, auth, sessionID, sessionExtras("direct", StatsSummary{}))
 			return nil
 		}
 		return fmt.Errorf("read run stats: %w", err)
@@ -1320,6 +1643,7 @@ func doneDirectMode() error {
 
 	elapsed, haveElapsed := elapsedSinceInit()
 
+	var final StatsSummary
 	switch len(records) {
 	case 0:
 		log.Printf("github-actions-done: no run stats recorded at %s", statsPath)
@@ -1329,6 +1653,7 @@ func doneDirectMode() error {
 			stats.TotalTime = elapsed.String()
 		}
 		log.Printf("github-actions-done: cache summary: %s", stats.String())
+		final = stats
 	default:
 		summaries := make([]StatsSummary, len(records))
 		for i, r := range records {
@@ -1340,7 +1665,10 @@ func doneDirectMode() error {
 		}
 		log.Printf("github-actions-done: cache summary across %d go invocations: %s", len(records), total.String())
 		logParentCommandBreakdown(records)
+		final = total
 	}
+
+	markRemoteSessionDone(remoteURL, auth, sessionID, sessionExtras("direct", final))
 
 	if err := os.Remove(statsPath); err != nil && !os.IsNotExist(err) { //nolint:gosec // statsPath is derived from the configured cache dir.
 		log.Printf("github-actions-done: remove run stats file: %s", err.Error())
