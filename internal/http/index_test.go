@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	nethttp "net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -266,6 +267,60 @@ func TestIndex_SessionMarkedDone(t *testing.T) {
 	b, err := io.ReadAll(res.Body)
 	require.NoError(t, err)
 	require.Contains(t, string(b), `class="done"`)
+}
+
+// TestIndex_SetsBuildTypeOverridesViaForm covers the status page's two override forms end to
+// end: submitting each one must actually change the server setting (verified via the JSON
+// settings endpoints, not by scraping the rendered byte-size string), and the page itself must
+// then show the build type in its overrides table.
+func TestIndex_SetsBuildTypeOverridesViaForm(t *testing.T) {
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandler(localStore, "")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	postForm := func(values url.Values) {
+		res, err := nethttp.PostForm(srv.URL+"/", values)
+		require.NoError(t, err)
+		require.NoError(t, res.Body.Close())
+		require.Equal(t, nethttp.StatusOK, res.StatusCode) // redirect followed by default client
+	}
+
+	get := func(path string) string {
+		res, err := nethttp.Get(srv.URL + path)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, res.Body.Close()) }()
+		b, err := io.ReadAll(res.Body)
+		require.NoError(t, err)
+
+		return string(b)
+	}
+
+	postForm(url.Values{"action": {"set-max-preload-total-bytes"}, "build-type": {"unit"}, "bytes": {"123456"}})
+	postForm(url.Values{"action": {"set-max-file-bytes"}, "build-type": {"unit"}, "bytes": {"654321"}})
+
+	require.JSONEq(t, `{"unit":123456}`, get("/settings/max-preload-total-bytes"))
+	require.JSONEq(t, `{"unit":654321}`, get("/settings/max-file-bytes"))
+
+	body := get("/")
+	require.Contains(t, body, "Build-type overrides")
+	require.Contains(t, body, "unit")
+}
+
+func TestIndex_OverrideFormMissingBuildTypeIsBadRequest(t *testing.T) {
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandler(localStore, "")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	res, err := nethttp.PostForm(srv.URL+"/", url.Values{"action": {"set-max-preload-total-bytes"}, "bytes": {"123"}})
+	require.NoError(t, err)
+	require.NoError(t, res.Body.Close())
+	require.Equal(t, nethttp.StatusBadRequest, res.StatusCode)
 }
 
 // TestCombinedBudget_EvictsAcrossStores exercises the actual reported bug: a shared budget must

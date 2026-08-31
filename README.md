@@ -114,7 +114,7 @@ Only the base URL is required; everything else has a default.
 | `auth`                     | (none)             | bearer token for the remote server (and the local daemon socket in shim mode) |
 | `mode`                     | `shim`             | `direct`, `shim`, `gocache`, or `local-gocache` — see [Modes](#modes)    |
 | `cache_dir`                | automatic          | local cache / native `GOCACHE` directory; `~/foo` resolves against `$HOME` |
-| `preload_size`             | `3000000`          | maps to `-max-file-bytes`: max size of a single preloaded/cached file    |
+| `max_file_bytes`   | server default, else `3000000` | maps to `-max-file-bytes`: max size of a single preloaded/cached file — see `/settings/max-file-bytes` in [ADVANCED.md](ADVANCED.md) for the server-side override |
 | `build_type`               | (none)             | maps to `-build-type`, e.g. `unit`, `race`, `lint` — always prefixed with the repository name (see below) |
 | `canonicalize_timestamps`  | `.`                | repo root to canonicalize before anything else                          |
 | `skip_canonicalize_timestamps` | `false`        | skip timestamp canonicalization entirely                                |

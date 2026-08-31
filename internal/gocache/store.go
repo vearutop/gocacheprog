@@ -48,13 +48,13 @@ const manifestExt = ".zst"
 const manifestPrefixLen = 1
 
 type Request struct {
-	Commit            string
-	ChangesID         string
-	BuildType         string
-	BaseCommit        string
-	ParentCommit      string
-	MaxFileBytes      int64
-	RestoreLimitBytes int64
+	Commit               string
+	ChangesID            string
+	BuildType            string
+	BaseCommit           string
+	ParentCommit         string
+	MaxFileBytes         int64
+	MaxPreloadTotalBytes int64
 }
 
 type FileItem struct {
@@ -1408,8 +1408,8 @@ func (s *Store) selectRestoreEntries(req Request, entries []restoreEntry) []rest
 		filtered = append(filtered, entry)
 	}
 
-	if req.RestoreLimitBytes <= 0 || len(filtered) < 2 {
-		if req.RestoreLimitBytes > 0 && len(filtered) == 1 && s.entryStoredSize(filtered[0].ie) > req.RestoreLimitBytes {
+	if req.MaxPreloadTotalBytes <= 0 || len(filtered) < 2 {
+		if req.MaxPreloadTotalBytes > 0 && len(filtered) == 1 && s.entryStoredSize(filtered[0].ie) > req.MaxPreloadTotalBytes {
 			return filtered[:0]
 		}
 		return filtered
@@ -1429,7 +1429,7 @@ func (s *Store) selectRestoreEntries(req Request, entries []restoreEntry) []rest
 	limit := 0
 	for _, entry := range filtered {
 		size := s.entryStoredSize(entry.ie)
-		if total+size > req.RestoreLimitBytes {
+		if total+size > req.MaxPreloadTotalBytes {
 			break
 		}
 		total += size

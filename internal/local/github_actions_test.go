@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -80,7 +81,7 @@ func TestGithubActionsJobURL(t *testing.T) {
 }
 
 func TestParseGithubActionsDSN(t *testing.T) {
-	cfg, err := parseGithubActionsDSN("https://gocache.example.com?auth=secret&cache_dir=./build-cache&preload_size=42&build_type=unit&mode=gocache&canonicalize_timestamps=.&skip_preload=true")
+	cfg, err := parseGithubActionsDSN("https://gocache.example.com?auth=secret&cache_dir=./build-cache&max_file_bytes=42&build_type=unit&mode=gocache&canonicalize_timestamps=.&skip_preload=true")
 	require.NoError(t, err)
 	require.Equal(t, "https://gocache.example.com", cfg.remoteURL)
 	require.Equal(t, "secret", cfg.authToken)
@@ -97,7 +98,7 @@ func TestParseGithubActionsDSN_Defaults(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "https://gocache.example.com", cfg.remoteURL)
 	require.Equal(t, "shim", cfg.mode)
-	require.Equal(t, defaultGithubActionsPreloadSize, cfg.maxFileBytes)
+	require.Equal(t, maxFileBytesUnset, cfg.maxFileBytes, "parseGithubActionsDSN alone leaves this unresolved; GithubActionsInit resolves it")
 	require.Equal(t, ".", cfg.canonicalize)
 	require.False(t, cfg.skipPreload)
 }
@@ -137,8 +138,37 @@ func TestParseGithubActionsDSN_TestcacheKeys(t *testing.T) {
 	require.Equal(t, "/tmp/misses.json", cfg.testcacheKeys)
 }
 
+func TestResolveMaxFileBytesDefault_UsesServerConfiguredValue(t *testing.T) {
+	localStore, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(cachehttp.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/settings/max-file-bytes?build-type=unit&bytes=12345678", "", nil)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+	require.Equal(t, int64(12345678), resolveMaxFileBytesDefault(srv.URL, "", "unit"))
+}
+
+func TestResolveMaxFileBytesDefault_FallsBackWhenServerHasNoneConfigured(t *testing.T) {
+	localStore, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(cachehttp.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2))
+	t.Cleanup(srv.Close)
+
+	require.Equal(t, defaultGithubActionsPreloadSize, resolveMaxFileBytesDefault(srv.URL, "", "unit"))
+}
+
+func TestResolveMaxFileBytesDefault_FallsBackWhenServerUnreachable(t *testing.T) {
+	require.Equal(t, defaultGithubActionsPreloadSize, resolveMaxFileBytesDefault("http://127.0.0.1:1", "", "unit"))
+}
+
 func TestParseGithubActionsDSN_InvalidPreloadSize(t *testing.T) {
-	_, err := parseGithubActionsDSN("https://gocache.example.com?preload_size=not-a-number")
+	_, err := parseGithubActionsDSN("https://gocache.example.com?max_file_bytes=not-a-number")
 	require.Error(t, err)
 }
 

@@ -64,7 +64,7 @@ func Main(options ...func(o *Options)) error {
 	restoreCache := flag.Bool("restore-cache", false, "restore native GOCACHE files into -cache-dir and exit")
 	saveCache := flag.Bool("save-cache", false, "save freshly created native GOCACHE files from -cache-dir and exit")
 	maxFileBytes := flag.Int64("max-file-bytes", 0, "maximum single file size in bytes for remote cache storage, preload item wire size, and native -restore-cache/-save-cache; 0 disables the limit except preload defaults to 1000000")
-	restoreLimitBytes := flag.Int64("restore-limit-bytes", 0, "maximum total compressed bytes to download during native -restore-cache after -max-file-bytes filtering; 0 disables the limit")
+	maxPreloadTotalBytes := flag.Int64("max-preload-total-bytes", 0, "maximum total compressed bytes to download during native -restore-cache after -max-file-bytes filtering; 0 disables the limit")
 	saveCacheMaxFileBytes := flag.Int64("save-cache-max-file-bytes", 0, "deprecated alias for -max-file-bytes")
 	saveCacheChunkBytes := flag.Int64("save-cache-chunk-bytes", http.DefaultSaveCacheChunkBytes, "maximum size in bytes for a single native -save-cache HTTP chunk request body")
 	jobStartUnix := flag.Int64("job-start-unix", 0, "job start Unix timestamp in nanoseconds for -save-cache; when empty, read the marker written by -restore-cache")
@@ -115,7 +115,7 @@ func Main(options ...func(o *Options)) error {
 		if *maxFileBytes == 0 && *saveCacheMaxFileBytes != 0 {
 			*maxFileBytes = *saveCacheMaxFileBytes
 		}
-		return runNativeGOCACHEMode(*dir, *httpListen, *remoteURL, *authToken, *restoreCache, *saveCache, *maxFileBytes, *restoreLimitBytes, *saveCacheChunkBytes, *jobStartUnix, startedAt, params)
+		return runNativeGOCACHEMode(*dir, *httpListen, *remoteURL, *authToken, *restoreCache, *saveCache, *maxFileBytes, *maxPreloadTotalBytes, *saveCacheChunkBytes, *jobStartUnix, startedAt, params)
 	}
 
 	params.MaxFileBytes = *maxFileBytes
@@ -314,7 +314,7 @@ func runStoreServer(httpListen, httpsListen, httpsHost, dir, authToken, fallback
 	})
 }
 
-func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, restoreLimitBytes, saveCacheChunkBytes, jobStartUnixNanos int64, startedAt time.Time, params *local.ProxyParams) error {
+func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreCache, saveCache bool, maxFileBytes, maxPreloadTotalBytes, saveCacheChunkBytes, jobStartUnixNanos int64, startedAt time.Time, params *local.ProxyParams) error {
 	if restoreCache && saveCache {
 		return errors.New("-restore-cache and -save-cache are mutually exclusive")
 	}
@@ -347,13 +347,13 @@ func runNativeGOCACHEMode(dir, httpListen, remoteURL, authToken string, restoreC
 	client.SetSaveCacheChunkBytes(saveCacheChunkBytes)
 
 	req := gocache.Request{
-		Commit:            params.Commit,
-		ChangesID:         params.ChangesID,
-		BuildType:         params.BuildType,
-		BaseCommit:        params.BaseCommit,
-		ParentCommit:      params.ParentCommit,
-		MaxFileBytes:      maxFileBytes,
-		RestoreLimitBytes: restoreLimitBytes,
+		Commit:               params.Commit,
+		ChangesID:            params.ChangesID,
+		BuildType:            params.BuildType,
+		BaseCommit:           params.BaseCommit,
+		ParentCommit:         params.ParentCommit,
+		MaxFileBytes:         maxFileBytes,
+		MaxPreloadTotalBytes: maxPreloadTotalBytes,
 	}
 
 	if restoreCache {

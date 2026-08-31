@@ -5,14 +5,18 @@
 //
 // DSN format for -github-actions-init:
 //
-//	<remote-url>?auth=<token>&cache_dir=<dir>&preload_size=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>&max_cache_bytes=<bytes>&report_<name>=<path>
+//	<remote-url>?auth=<token>&cache_dir=<dir>&max_file_bytes=<bytes>&build_type=<type>&mode=direct|shim|gocache|local-gocache&canonicalize_timestamps=<path>&skip_canonicalize_timestamps=<bool>&skip_preload=<bool>&max_cache_bytes=<bytes>&report_<name>=<path>
 //
 // Only the remote URL is required; every query parameter is optional:
 //
 //   - auth: bearer token for the remote server and (in shim mode) the local daemon socket
 //   - cache_dir: local cache/GOCACHE directory; empty picks gocacheprog's own default; a
 //     leading "~/" is resolved against the user's home directory
-//   - preload_size: maps to -max-file-bytes (default 3,000,000)
+//   - max_file_bytes: maps to -max-file-bytes, the largest single object this job's
+//     preload/restore or save will transfer. When absent, falls back to the server's own
+//     max-file-bytes default for this build type (see Handler.MaxFileBytesSettings, retunable
+//     without touching this DSN), and only if the server has none configured either, to a
+//     hardcoded 3,000,000. A DSN value always wins over the server default when both are set.
 //   - build_type: maps to -build-type, e.g. "unit" or "race"; always prefixed with
 //     $GITHUB_REPOSITORY (e.g. "owner-repo-unit") so manifests and the /inspect and /clear
 //     admin endpoints stay isolated per repository when multiple repos share one server
@@ -112,8 +116,13 @@ import (
 
 const (
 	defaultGithubActionsPreloadSize int64 = 3_000_000
-	githubActionsShimSocketWait           = 10 * time.Second
-	githubActionsLogTailBytes       int64 = 8_000
+	// maxFileBytesUnset marks a githubActionsConfig fresh out of parseGithubActionsDSN as not
+	// having an explicit max_file_bytes -- resolveMaxFileBytesDefault replaces it with
+	// the server's own configured default, or defaultGithubActionsPreloadSize if the server has
+	// none either.
+	maxFileBytesUnset           int64 = -1
+	githubActionsShimSocketWait       = 10 * time.Second
+	githubActionsLogTailBytes   int64 = 8_000
 
 	remoteClientMaxRetries = 3
 	remoteClientRetryDelay = 5 * time.Second
@@ -173,7 +182,11 @@ func GithubActionsInit(dsn string) error {
 
 	cfg.buildType = repoScopedBuildType(cfg.buildType)
 
-	log.Printf("github-actions-init: mode=%q remote_url=%q cache_dir=%q build_type=%q preload_size=%d skip_preload=%t max_cache_bytes=%d fallback_remote=%t",
+	if cfg.maxFileBytes == maxFileBytesUnset {
+		cfg.maxFileBytes = resolveMaxFileBytesDefault(cfg.remoteURL, cfg.authToken, cfg.buildType)
+	}
+
+	log.Printf("github-actions-init: mode=%q remote_url=%q cache_dir=%q build_type=%q max_file_bytes=%d skip_preload=%t max_cache_bytes=%d fallback_remote=%t",
 		cfg.mode, cfg.remoteURL, cfg.cacheDir, cfg.buildType, cfg.maxFileBytes, cfg.skipPreload, cfg.maxCacheBytes, cfg.fallbackRemote)
 
 	if cfg.canonicalize != "" {
@@ -247,11 +260,14 @@ func parseGithubActionsDSN(dsn string) (githubActionsConfig, error) {
 	q := u.Query()
 
 	cfg := githubActionsConfig{
-		authToken:    q.Get("auth"),
-		cacheDir:     q.Get("cache_dir"),
-		buildType:    q.Get("build_type"),
-		mode:         q.Get("mode"),
-		maxFileBytes: defaultGithubActionsPreloadSize,
+		authToken: q.Get("auth"),
+		cacheDir:  q.Get("cache_dir"),
+		buildType: q.Get("build_type"),
+		mode:      q.Get("mode"),
+		// maxFileBytesUnset until proven otherwise: resolveMaxFileBytesDefault (called once
+		// buildType is fully scoped) fills this in from the server's own default, and only then
+		// the hardcoded fallback, so a bare -1 here must never reach a mode's own init function.
+		maxFileBytes: maxFileBytesUnset,
 		canonicalize: ".",
 	}
 
@@ -259,10 +275,10 @@ func parseGithubActionsDSN(dsn string) (githubActionsConfig, error) {
 		cfg.mode = "shim"
 	}
 
-	if v := q.Get("preload_size"); v != "" {
+	if v := q.Get("max_file_bytes"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
-			return githubActionsConfig{}, fmt.Errorf("invalid preload_size %q: %w", v, err)
+			return githubActionsConfig{}, fmt.Errorf("invalid max_file_bytes %q: %w", v, err)
 		}
 		cfg.maxFileBytes = n
 	}
@@ -351,6 +367,32 @@ func repoScopedBuildType(buildType string) string {
 	}
 
 	return repo + "-" + buildType
+}
+
+// resolveMaxFileBytesDefault fills in max_file_bytes' default when the DSN didn't set one
+// (see maxFileBytesUnset): the server's own configured default for buildType (see
+// Handler.MaxFileBytesSettings), and only if the server has none either, the hardcoded
+// defaultGithubActionsPreloadSize. An unreachable server just falls back to the hardcoded value
+// too -- this is an optimization, not a build dependency, same reasoning as every other
+// best-effort remote call in this file.
+func resolveMaxFileBytesDefault(remoteURL, authToken, buildType string) int64 {
+	client, err := cachehttp.NewClient(remoteURL, authToken)
+	if err != nil {
+		log.Printf("github-actions-init: WARNING: resolve max-file-bytes default: %s; using hardcoded default", err.Error())
+		return defaultGithubActionsPreloadSize
+	}
+
+	bytes, err := client.MaxFileBytesFor(buildType)
+	if err != nil {
+		log.Printf("github-actions-init: WARNING: resolve max-file-bytes default: %s; using hardcoded default", err.Error())
+		return defaultGithubActionsPreloadSize
+	}
+
+	if bytes <= 0 {
+		return defaultGithubActionsPreloadSize
+	}
+
+	return bytes
 }
 
 type ghPullRequestEvent struct {

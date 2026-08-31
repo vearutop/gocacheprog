@@ -24,11 +24,15 @@ func (h *Handler) RestoreCache(rw http.ResponseWriter, r *http.Request) {
 
 	startedAt := time.Now()
 	req := parseGOCACHERequest(r)
-	if req.RestoreLimitBytes <= 0 {
+	if req.MaxPreloadTotalBytes <= 0 {
 		// The client didn't ask for a budget of its own -- fall back to whatever the server has
 		// configured for this build type (see WithSettingsPath), if anything. A client-supplied
 		// value always wins when present; this is purely the default for when it isn't.
-		req.RestoreLimitBytes = h.preloadLimitBytesFor(req.BuildType)
+		req.MaxPreloadTotalBytes = h.maxPreloadTotalBytesFor(req.BuildType)
+	}
+	if req.MaxFileBytes <= 0 {
+		// Same reasoning as MaxPreloadTotalBytes above, for the per-object size cutoff.
+		req.MaxFileBytes = h.maxFileBytesFor(req.BuildType)
 	}
 	sources, err := h.gocacheStore.RestoreSources(req)
 	if err != nil {
@@ -104,20 +108,20 @@ func parseGOCACHERequest(r *http.Request) gocache.Request {
 			maxFileBytes = parsed
 		}
 	}
-	restoreLimitBytes := int64(0)
-	if raw := strings.TrimSpace(r.URL.Query().Get("restore-limit-bytes")); raw != "" {
+	maxPreloadTotalBytes := int64(0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("max-preload-total-bytes")); raw != "" {
 		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
-			restoreLimitBytes = parsed
+			maxPreloadTotalBytes = parsed
 		}
 	}
 
 	return gocache.Request{
-		Commit:            strings.TrimSpace(r.URL.Query().Get("commit")),
-		ChangesID:         strings.TrimSpace(r.URL.Query().Get("changes-id")),
-		BuildType:         strings.TrimSpace(r.URL.Query().Get("build-type")),
-		BaseCommit:        strings.TrimSpace(r.URL.Query().Get("base-commit")),
-		ParentCommit:      strings.TrimSpace(r.URL.Query().Get("parent-commit")),
-		MaxFileBytes:      maxFileBytes,
-		RestoreLimitBytes: restoreLimitBytes,
+		Commit:               strings.TrimSpace(r.URL.Query().Get("commit")),
+		ChangesID:            strings.TrimSpace(r.URL.Query().Get("changes-id")),
+		BuildType:            strings.TrimSpace(r.URL.Query().Get("build-type")),
+		BaseCommit:           strings.TrimSpace(r.URL.Query().Get("base-commit")),
+		ParentCommit:         strings.TrimSpace(r.URL.Query().Get("parent-commit")),
+		MaxFileBytes:         maxFileBytes,
+		MaxPreloadTotalBytes: maxPreloadTotalBytes,
 	}
 }

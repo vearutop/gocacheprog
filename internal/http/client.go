@@ -634,6 +634,40 @@ func (c *Client) ExistingPaths(req gocache.Request, paths []string) ([]string, e
 	return existing, nil
 }
 
+// MaxFileBytesFor fetches the server's configured max-file-bytes default for buildType (see
+// Handler.MaxFileBytesSettings), or 0 if the server has none configured for it. Used by
+// -github-actions-init to resolve max_file_bytes' default when the DSN doesn't set one
+// itself (see resolveMaxFileBytesDefault), so an operator can retune it server-side without
+// touching every workflow.
+func (c *Client) MaxFileBytesFor(buildType string) (int64, error) {
+	r, err := http.NewRequest(http.MethodGet, c.baseURL+"/settings/max-file-bytes", nil)
+	if err != nil {
+		return 0, err
+	}
+	c.setSessionAuthHeaders(r)
+
+	res, err := c.roundTrip(r)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			log.Printf("close max-file-bytes settings body: %s", err.Error())
+		}
+	}()
+
+	if err := checkStatus(res, http.StatusOK, "settings/max-file-bytes"); err != nil {
+		return 0, err
+	}
+
+	var limits map[string]int64
+	if err := json.NewDecoder(res.Body).Decode(&limits); err != nil {
+		return 0, err
+	}
+
+	return limits[buildType], nil
+}
+
 // InspectKeys asks the server to check a batch of GOCACHE object keys against its store and the
 // manifest(s) resolved for req's scope -- see gocache.Store.InspectKeys for what each result
 // field means. Built for post-mortem cache-miss forensics, not the regular cache protocol path.
@@ -821,8 +855,8 @@ func gocacheQuery(req gocache.Request) url.Values {
 	if req.MaxFileBytes > 0 {
 		v.Set("max-file-bytes", strconv.FormatInt(req.MaxFileBytes, 10))
 	}
-	if req.RestoreLimitBytes > 0 {
-		v.Set("restore-limit-bytes", strconv.FormatInt(req.RestoreLimitBytes, 10))
+	if req.MaxPreloadTotalBytes > 0 {
+		v.Set("max-preload-total-bytes", strconv.FormatInt(req.MaxPreloadTotalBytes, 10))
 	}
 	return v
 }

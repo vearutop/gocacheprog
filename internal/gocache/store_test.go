@@ -865,7 +865,7 @@ func TestRestore_RespectsMaxFileBytes(t *testing.T) {
 	require.Equal(t, []string{"small"}, restored)
 }
 
-func TestRestore_RespectsRestoreLimitBytesOrdering(t *testing.T) {
+func TestRestore_RespectsMaxPreloadTotalBytesOrdering(t *testing.T) {
 	dir := t.TempDir()
 
 	store, err := NewStore(dir, WithCompression())
@@ -909,7 +909,7 @@ func TestRestore_RespectsRestoreLimitBytesOrdering(t *testing.T) {
 	store.mu.Unlock()
 
 	var restored []string
-	sources, err := store.Restore(Request{Commit: "commit123", RestoreLimitBytes: 6}, func(item FileItem) {
+	sources, err := store.Restore(Request{Commit: "commit123", MaxPreloadTotalBytes: 6}, func(item FileItem) {
 		restored = append(restored, item.Path)
 	})
 	require.NoError(t, err)
@@ -917,7 +917,7 @@ func TestRestore_RespectsRestoreLimitBytesOrdering(t *testing.T) {
 	require.Equal(t, []string{"new-tiny", "new-small"}, restored)
 }
 
-func TestRestore_RespectsMaxFileBytesBeforeRestoreLimitBytes(t *testing.T) {
+func TestRestore_RespectsMaxFileBytesBeforeMaxPreloadTotalBytes(t *testing.T) {
 	dir := t.TempDir()
 
 	store, err := NewStore(dir, WithCompression())
@@ -955,7 +955,7 @@ func TestRestore_RespectsMaxFileBytesBeforeRestoreLimitBytes(t *testing.T) {
 	store.mu.Unlock()
 
 	var restored []string
-	_, err = store.Restore(Request{Commit: "commit123", MaxFileBytes: 5, RestoreLimitBytes: 6}, func(item FileItem) {
+	_, err = store.Restore(Request{Commit: "commit123", MaxFileBytes: 5, MaxPreloadTotalBytes: 6}, func(item FileItem) {
 		restored = append(restored, item.Path)
 	})
 	require.NoError(t, err)

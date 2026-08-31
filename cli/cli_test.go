@@ -101,8 +101,8 @@ func TestRunNativeGOCACHEMode_SendsSessionHeadersOnVersionProbe(t *testing.T) {
 
 func TestRunNativeGOCACHEMode_RestoreCachePassesMaxFileBytes(t *testing.T) {
 	var gotReq struct {
-		maxFileBytes      string
-		restoreLimitBytes string
+		maxFileBytes         string
+		maxPreloadTotalBytes string
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
@@ -112,7 +112,7 @@ func TestRunNativeGOCACHEMode_RestoreCachePassesMaxFileBytes(t *testing.T) {
 			require.NoError(t, err)
 		case "/restore-cache":
 			gotReq.maxFileBytes = r.URL.Query().Get("max-file-bytes")
-			gotReq.restoreLimitBytes = r.URL.Query().Get("restore-limit-bytes")
+			gotReq.maxPreloadTotalBytes = r.URL.Query().Get("max-preload-total-bytes")
 			rw.WriteHeader(http.StatusOK)
 			require.NoError(t, binary.Write(rw, binary.BigEndian, int32(0)))
 		default:
@@ -127,7 +127,7 @@ func TestRunNativeGOCACHEMode_RestoreCachePassesMaxFileBytes(t *testing.T) {
 	err := runNativeGOCACHEMode(cacheDir, "", srv.URL, "", true, false, 1234, 4321, 1024, 0, startedAt, &local.ProxyParams{})
 	require.NoError(t, err)
 	require.Equal(t, "1234", gotReq.maxFileBytes)
-	require.Equal(t, "4321", gotReq.restoreLimitBytes)
+	require.Equal(t, "4321", gotReq.maxPreloadTotalBytes)
 }
 
 func TestRunNativeGOCACHEMode_SaveCacheSkipsOversizedFilesBeforeUpload(t *testing.T) {

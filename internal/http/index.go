@@ -40,6 +40,24 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:.5rem;b
 {{end}}
 </table>
 {{end}}
+<h2>Build-type overrides</h2>
+<table>
+<tr><th>build type</th><th>max preload bytes</th><th>max file bytes</th></tr>
+{{range .Overrides}}<tr><td>{{.BuildType}}</td><td>{{.MaxPreloadTotalBytes}}</td><td>{{.MaxFileBytes}}</td></tr>
+{{end}}
+</table>
+<form method="post">
+<input type="hidden" name="action" value="set-max-preload-total-bytes">
+<input name="build-type" placeholder="build type" required>
+<input name="bytes" placeholder="bytes (blank clears)">
+<button type="submit">Set max preload bytes</button>
+</form>
+<form method="post">
+<input type="hidden" name="action" value="set-max-file-bytes">
+<input name="build-type" placeholder="build type" required>
+<input name="bytes" placeholder="bytes (blank clears)">
+<button type="submit">Set max file bytes</button>
+</form>
 <h2>Client sessions</h2>
 <table>
 <tr><th>status</th><th>version</th><th>ref</th><th>build type</th><th>started at</th><th>preload size</th><th>preload source</th><th>preload time</th><th>finalize size</th><th>finalize time</th><th>session time</th></tr>
@@ -59,6 +77,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:.5rem;b
 {{end}}
 </table>
 <form method="post">
+<input type="hidden" name="action" value="cleanup">
 <button type="submit">Run cleanup now</button>
 </form>
 {{if .Panics.Count}}<h2>Panics</h2>
@@ -83,6 +102,85 @@ type panicInfo struct {
 	Message string
 	Stack   string
 	At      string
+}
+
+type overrideRow struct {
+	BuildType            string
+	MaxPreloadTotalBytes string
+	MaxFileBytes         string
+}
+
+// buildOverrideRows merges preload's and maxFile's per-build-type overrides into one sorted,
+// display-ready list -- a build type configured in only one of the two still gets a row, with
+// "-" for whichever setting it doesn't have.
+func buildOverrideRows(preload, maxFile map[string]int64) []overrideRow {
+	buildTypes := make(map[string]struct{}, len(preload)+len(maxFile))
+	for bt := range preload {
+		buildTypes[bt] = struct{}{}
+	}
+
+	for bt := range maxFile {
+		buildTypes[bt] = struct{}{}
+	}
+
+	names := make([]string, 0, len(buildTypes))
+	for bt := range buildTypes {
+		names = append(names, bt)
+	}
+
+	sort.Strings(names)
+
+	rows := make([]overrideRow, 0, len(names))
+
+	for _, bt := range names {
+		row := overrideRow{BuildType: bt, MaxPreloadTotalBytes: "-", MaxFileBytes: "-"}
+		if v, ok := preload[bt]; ok {
+			row.MaxPreloadTotalBytes = byteSize(v)
+		}
+
+		if v, ok := maxFile[bt]; ok {
+			row.MaxFileBytes = byteSize(v)
+		}
+
+		rows = append(rows, row)
+	}
+
+	return rows
+}
+
+// applyOverrideForm handles a "set-max-preload-total-bytes"/"set-max-file-bytes" status-page form
+// submission: build-type is required, bytes is parsed if present (blank clears the override, same
+// convention as the JSON settings endpoints). Writes an error response and returns false on any
+// problem, so the caller knows not to redirect afterward.
+func (h *Handler) applyOverrideForm(rw http.ResponseWriter, r *http.Request, set func(buildType string, bytes int64) error) bool {
+	// Already wrapped by Index before dispatching here; repeated so this function is safe to
+	// call on its own too, and so gosec's per-function G120 check doesn't need to trust that.
+	r.Body = http.MaxBytesReader(rw, r.Body, 4096)
+
+	buildType := strings.TrimSpace(r.FormValue("build-type"))
+	if buildType == "" {
+		http.Error(rw, "build type is required", http.StatusBadRequest)
+		return false
+	}
+
+	var bytes int64
+
+	if raw := strings.TrimSpace(r.FormValue("bytes")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			http.Error(rw, "invalid bytes: "+err.Error(), http.StatusBadRequest)
+			return false
+		}
+
+		bytes = n
+	}
+
+	if err := set(buildType, bytes); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return false
+	}
+
+	return true
 }
 
 type sessionRow struct {
@@ -146,13 +244,29 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPost {
-		if e, ok := h.store.(interface{ EvictNow() }); ok {
-			e.EvictNow()
+		// This page's own forms are a handful of short fields -- cap well above anything they'd
+		// ever send, just so a POST here can't be used to exhaust memory via an oversized body.
+		r.Body = http.MaxBytesReader(rw, r.Body, 4096)
+
+		switch r.FormValue("action") {
+		case "set-max-preload-total-bytes":
+			if !h.applyOverrideForm(rw, r, h.setMaxPreloadTotalBytes) {
+				return
+			}
+		case "set-max-file-bytes":
+			if !h.applyOverrideForm(rw, r, h.setMaxFileBytes) {
+				return
+			}
+		default:
+			if e, ok := h.store.(interface{ EvictNow() }); ok {
+				e.EvictNow()
+			}
+			if h.gocacheStore != nil {
+				h.gocacheStore.EvictNow()
+			}
+			h.enforceCombinedBudget()
 		}
-		if h.gocacheStore != nil {
-			h.gocacheStore.EvictNow()
-		}
-		h.enforceCombinedBudget()
+
 		http.Redirect(rw, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -211,6 +325,7 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 		CombinedBudget string
 		Panics         panicInfo
 		Sections       []statSection
+		Overrides      []overrideRow
 		Sessions       []sessionRow
 	}{
 		ServerVersion:  version.Module("github.com/vearutop/gocacheprog").Version,
@@ -218,6 +333,7 @@ func (h *Handler) Index(rw http.ResponseWriter, r *http.Request) {
 		CombinedBudget: combinedBudget,
 		Panics:         panics,
 		Sections:       sections,
+		Overrides:      buildOverrideRows(h.maxPreloadTotalBytesSnapshot(), h.maxFileBytesSnapshot()),
 		Sessions:       sessions,
 	}
 
