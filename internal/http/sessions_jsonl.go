@@ -145,7 +145,7 @@ func (h *Handler) loadRecentSessions() {
 		return
 	}
 
-	f, err := os.Open(h.sessionsJSONLPath) //nolint:gosec // path is operator-configured, not request-derived.
+	f, err := os.Open(h.sessionsJSONLPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("load sessions.jsonl: %s", err.Error())
