@@ -1,8 +1,12 @@
 package http
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
+	"maps"
 	"math"
 	"net/http"
 	"os"
@@ -122,6 +126,112 @@ func appendJSONLLine(path string, v any, extra map[string]any) error {
 
 	_, err = f.Write(data)
 	return err
+}
+
+// sessionsJSONLTailBytes bounds how much of sessions.jsonl loadRecentSessions reads on startup --
+// the file can grow indefinitely, so it seeks this far back from the end instead of reading it
+// whole. Comfortably covers sessionRetention worth of history for any realistic session rate.
+const sessionsJSONLTailBytes = 500_000
+
+// loadRecentSessions best-effort repopulates h.clientSessions from the tail of sessionsJSONLPath
+// on startup, so the status page still shows recently active sessions across a restart instead of
+// going blank. Reads only the last sessionsJSONLTailBytes of the file (it can grow indefinitely)
+// starting at the next line boundary after the seek point, so a line split by the seek is skipped
+// rather than misparsed. Any error -- missing file, seek/read failure, a malformed line -- is
+// logged (or silently skipped, for a single bad line) and otherwise ignored: this is a
+// best-effort convenience, never a reason to fail startup.
+func (h *Handler) loadRecentSessions() {
+	if h.sessionsJSONLPath == "" {
+		return
+	}
+
+	f, err := os.Open(h.sessionsJSONLPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("load sessions.jsonl: %s", err.Error())
+		}
+		return
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			log.Printf("close sessions.jsonl: %s", closeErr.Error())
+		}
+	}()
+
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		log.Printf("load sessions.jsonl: %s", err.Error())
+		return
+	}
+
+	offset := int64(0)
+	if size > sessionsJSONLTailBytes {
+		offset = size - sessionsJSONLTailBytes
+	}
+
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		log.Printf("load sessions.jsonl: %s", err.Error())
+		return
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	if offset > 0 {
+		// The seek almost certainly landed mid-line; that first (partial) line is unparseable and
+		// must be discarded, not attributed to the wrong session.
+		scanner.Scan()
+	}
+
+	now := time.Now()
+	sessions := make(map[string]*clientSession)
+
+	for scanner.Scan() {
+		var rec sessionsJSONLRecord
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil || rec.SessionID == "" {
+			continue
+		}
+
+		cs := &clientSession{
+			Version:       rec.Version,
+			ChangesID:     rec.Ref,
+			BuildType:     rec.BuildType,
+			JobURL:        rec.JobURL,
+			PreloadBytes:  rec.PreloadBytes,
+			PreloadTime:   secondsToDuration(rec.PreloadTimeS),
+			PreloadSource: rec.PreloadSource,
+			FinalizeBytes: rec.FinalizeBytes,
+			FinalizeTime:  secondsToDuration(rec.FinalizeTimeS),
+			FirstSeen:     time.Unix(rec.StartedAt, 0),
+			LastSeen:      time.Unix(rec.Timestamp, 0),
+		}
+		if rec.Status == "done" {
+			cs.Done = true
+			cs.DoneAt = time.Unix(rec.Timestamp, 0)
+		}
+
+		sessions[rec.SessionID] = cs
+	}
+
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("load sessions.jsonl: %s", err.Error())
+	}
+
+	for id, cs := range sessions {
+		if sessionExpired(cs, now) {
+			delete(sessions, id)
+		}
+	}
+
+	h.clientSessionsMu.Lock()
+	maps.Copy(h.clientSessions, sessions)
+	h.clientSessionsMu.Unlock()
+}
+
+// secondsToDuration is the inverse of roundSeconds, for reconstructing a clientSession's
+// durations from a parsed sessions.jsonl record.
+func secondsToDuration(s float64) time.Duration {
+	return time.Duration(s * float64(time.Second))
 }
 
 // SessionsJSONL serves the raw sessions.jsonl file for download, Basic-Auth-gated the same way as

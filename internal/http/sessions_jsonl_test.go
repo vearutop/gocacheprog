@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/vearutop/gocacheprog/internal/cache"
@@ -239,6 +240,89 @@ func TestSessionsJSONL_DownloadRequiresBasicAuth(t *testing.T) {
 	b, err := io.ReadAll(res.Body)
 	require.NoError(t, err)
 	require.Contains(t, string(b), "session-x")
+}
+
+// jsonlLine renders fields as one JSON object, so tests can hand-write sessions.jsonl content
+// without depending on the package-private sessionsJSONLRecord type.
+func jsonlLine(t *testing.T, fields map[string]any) string {
+	t.Helper()
+
+	data, err := json.Marshal(fields)
+	require.NoError(t, err)
+
+	return string(data) + "\n"
+}
+
+// TestSessionsJSONL_ReloadedOnStartup covers the actual point of loading history on restart: a
+// recent session recorded by a previous process shows up on the status page of a brand new
+// Handler pointed at the same file, before that session ever makes another request.
+func TestSessionsJSONL_ReloadedOnStartup(t *testing.T) {
+	dir := t.TempDir()
+	jsonlPath := filepath.Join(dir, "sessions.jsonl")
+
+	now := time.Now()
+	content := jsonlLine(t, map[string]any{
+		"event": "started", "session_id": "restored-recent", "started_at": now.Unix(),
+		"timestamp": now.Unix(), "status": "in progress", "ref": "acme/widgets#99",
+	})
+	content += jsonlLine(t, map[string]any{
+		"event": "done", "session_id": "restored-expired", "started_at": now.Add(-48 * time.Hour).Unix(),
+		"timestamp": now.Add(-48 * time.Hour).Unix(), "status": "done", "ref": "acme/widgets#1",
+	})
+	require.NoError(t, os.WriteFile(jsonlPath, []byte(content), 0o600))
+
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, http.WithSessionsJSONL(jsonlPath))
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	res, err := nethttp.Get(srv.URL + "/")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, res.Body.Close()) }()
+	b, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+
+	require.Contains(t, string(b), "acme/widgets#99", "a recent session from a prior process must reappear after restart")
+	require.NotContains(t, string(b), "acme/widgets#1", "a session done more than doneSessionRetention ago must stay gone")
+}
+
+// TestSessionsJSONL_ReloadSeeksNearTail covers the "file can grow" part: loadRecentSessions must
+// not choke on -- or try to read -- a huge file, and the discarded partial first line after the
+// seek must not corrupt the next, real one.
+func TestSessionsJSONL_ReloadSeeksNearTail(t *testing.T) {
+	dir := t.TempDir()
+	jsonlPath := filepath.Join(dir, "sessions.jsonl")
+
+	now := time.Now()
+	// Padding comfortably past the tail window, so the seek lands inside it and its own
+	// (unparseable, truncated) session must never show up on the page.
+	padding := jsonlLine(t, map[string]any{
+		"event": "started", "session_id": "padding-session", "started_at": now.Unix(),
+		"timestamp": now.Unix(), "status": "in progress", "ref": strings.Repeat("x", 600_000),
+	})
+	tail := jsonlLine(t, map[string]any{
+		"event": "started", "session_id": "restored-after-padding", "started_at": now.Unix(),
+		"timestamp": now.Unix(), "status": "in progress", "ref": "acme/widgets#5",
+	})
+	require.NoError(t, os.WriteFile(jsonlPath, []byte(padding+tail), 0o600))
+
+	localStore, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	h := http.NewHandlerWithPreloadLimit(localStore, nil, "", "", 2, http.WithSessionsJSONL(jsonlPath))
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	res, err := nethttp.Get(srv.URL + "/")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, res.Body.Close()) }()
+	b, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+
+	require.Contains(t, string(b), "acme/widgets#5", "the line after the huge padding must still load")
+	require.NotContains(t, string(b), "padding-session", "the giant line the seek lands inside of must not appear")
 }
 
 func TestIndex_ShowsStartedAt(t *testing.T) {

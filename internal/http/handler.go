@@ -139,6 +139,7 @@ func NewHandlerWithPreloadLimit(store cache.Store, gocacheStore *gocache.Store, 
 		opt(h)
 	}
 	h.loadSettings()
+	h.loadRecentSessions()
 
 	return h
 }
